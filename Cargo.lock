@@ -1549,6 +1549,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lucina-ref"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "memmap2",
+ "rayon",
+]
+
+[[package]]
 name = "macro_rules_attribute"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,17 @@
+[package]
+name = "lucina-ref"
+description = "LucinaInference f64 reference forward for qwen35, independent of the engine (own GGUF reader and dequant)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+half.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+
+[[bin]]
+name = "lucina-ref-logits"
+path = "src/main.rs"
