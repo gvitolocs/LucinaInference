@@ -2353,7 +2353,14 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
         " [ubatch {}{}, kv {}, submit {}]",
         p.ubatch,
         if p.ubatch_pinned { " pinned" } else { "" },
-        if p.kv_q8 { "q8_0" } else { "f16" },
+        match p.kv_named {
+            Some((k, v)) => {
+                let name = |d: Option<infr_core::DType>| d.map_or("f16".to_string(), |d| format!("{d:?}").to_lowercase());
+                let (k, v) = (name(k), name(v));
+                if k == v { k } else { format!("{k}/{v}") }
+            }
+            None => (if p.kv_q8 { "q8_0" } else { "f16" }).to_string(),
+        },
         if p.submit_cap == 0 {
             "unlimited".to_string()
         } else {
@@ -4730,6 +4737,7 @@ mod tests {
             ubatch: 256,
             ubatch_pinned: true,
             kv_q8: true,
+            kv_named: None,
             submit_cap: 112,
         };
         for (name, line) in [
@@ -4790,6 +4798,7 @@ mod tests {
             ubatch: 1024,
             ubatch_pinned: false,
             kv_q8: false,
+            kv_named: None,
             submit_cap: 0,
         };
         let s = placement_note(Some(&base));
@@ -4798,6 +4807,7 @@ mod tests {
             ubatch: 256,
             ubatch_pinned: true,
             kv_q8: true,
+            kv_named: None,
             submit_cap: 112,
         };
         assert_eq!(
@@ -4805,5 +4815,10 @@ mod tests {
             " [ubatch 256 pinned, kv q8_0, submit split/112]"
         );
         assert_eq!(placement_note(None), "");
+        let named = infr_llama::BenchPlacement {
+            kv_named: Some((Some(infr_core::DType::Q4_0), Some(infr_core::DType::Q4_0))),
+            ..base
+        };
+        assert_eq!(placement_note(Some(&named)), " [ubatch 1024, kv q4_0, submit unlimited]");
     }
 }

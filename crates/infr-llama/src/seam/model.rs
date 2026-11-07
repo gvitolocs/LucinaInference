@@ -30,6 +30,9 @@ pub struct BenchPlacement {
     pub ubatch_pinned: bool,
     /// The placement ladder chose a q8_0 KV cache to keep the session resident.
     pub kv_q8: bool,
+    /// The K/V cache formats the user named (`kv.type_k` / `kv.type_v`), when named. These win over
+    /// the ladder, so the bench label must show them; before this field a q4_0 run printed "kv f16".
+    pub kv_named: Option<(Option<infr_core::DType>, Option<infr_core::DType>)>,
     /// Dispatches per submit; `0` = unlimited, one command buffer per forward (every healthy
     /// discrete GPU). Anything else means the submit splitter armed during this run.
     pub submit_cap: usize,
@@ -1456,6 +1459,8 @@ impl SeamModel {
                 ubatch: crate::seam::ubatch_rows(&self.ecfg),
                 ubatch_pinned: self.ecfg.device.ubatch_specified,
                 kv_q8: crate::seam::kv_auto_q8(),
+                kv_named: (self.ecfg.kv.type_k_specified || self.ecfg.kv.type_v_specified)
+                    .then_some((self.ecfg.kv.type_k, self.ecfg.kv.type_v)),
                 submit_cap: vk.submit_cap_now(),
             },
         ))
