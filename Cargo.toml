@@ -16,6 +16,7 @@ members = [
     "crates/infr-prof",
     "crates/infr-prof-rt",
     "crates/infr-testkit",
+    "crates/lucina-parity",
 ]
 
 [workspace.package]

@@ -1537,6 +1537,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
+name = "lucina-parity"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "infr-core",
+ "infr-llama",
+ "rayon",
+ "serde_json",
+]
+
+[[package]]
 name = "macro_rules_attribute"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,36 @@
+# LucinaInference upstreams (same keys as SecretaryIOS docs/upstreams.toml; copy these entries there on merge).
+# Porting rules: SecretaryIOS docs/porting-guidelines.md.
+
+[[upstream]]
+id = "infr"
+name = "infr (pure-Rust Vulkan LLM engine)"
+url = "https://github.com/kryptic-sh/infr"
+source = "github"
+repo = "kryptic-sh/infr"
+branch = "main"
+track = "commits"
+pin = "f2f89cb3a1e56fdfed98629e7e558027db79d8ba"
+pin_date = "2026-10-29"
+ours = [{ repo = "~/Projects/Lucina/LucinaInference", path = ".", base = "main" }]
+licence_upstream = "MIT"
+licence_ours = "MIT"
+relation = "fork"
+confidence = "confirmed"
+rely_on = ["qwen35 CPU and Vulkan forward", "GGUF loader and dequant", "Vulkan shaders (ash + glslc)", "OpenAI server"]
+notes = "LucinaInference is a fork (git remote 'upstream', push disabled). Merge, never rebase. Verdict and evidence: docs/lucina/survey.md."
+
+[[upstream]]
+id = "llama-cpp-inference-oracle"
+name = "llama.cpp (oracle for LucinaInference)"
+url = "https://github.com/ggml-org/llama.cpp"
+source = "git"
+local = "~/llama.cpp"
+branch = "vulkan-pr25592"
+track = "commits"
+pin = "3612199ed"
+licence_upstream = "MIT"
+licence_ours = "MIT"
+relation = "reference"
+confidence = "confirmed"
+rely_on = ["qwen35 forward (src/models/qwen35.cpp, delta-net-base.cpp)", "ggml CPU kernels", "ggml-vulkan shaders", "llama-server API, slots, checkpoints"]
+notes = "The production llama-server build on build-host. Source of truth for behaviour, logits and speed; oracle/ builds against it. MIT: kernels may be ported with the notice kept."

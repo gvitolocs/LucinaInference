@@ -1,0 +1,19 @@
+[package]
+name = "lucina-parity"
+description = "LucinaInference parity checks against the pinned llama.cpp oracle (logits, tokens)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+infr-llama.workspace = true
+infr-core.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "lucina-parity"
+path = "src/main.rs"
