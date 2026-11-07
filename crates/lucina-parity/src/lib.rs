@@ -57,6 +57,17 @@ pub fn read_tokens(path: &Path) -> Result<Vec<u32>> {
     s.split_whitespace().map(|t| t.parse::<u32>().with_context(|| format!("bad token id {t:?}"))).collect()
 }
 
+/// First index where two token-id sequences differ; `None` when they are equal. When one is a
+/// prefix of the other, the shorter length is the first difference.
+pub fn first_token_diff(a: &[u32], b: &[u32]) -> Option<usize> {
+    let n = a.len().min(b.len());
+    match (0..n).find(|&i| a[i] != b[i]) {
+        Some(i) => Some(i),
+        None if a.len() != b.len() => Some(n),
+        None => None,
+    }
+}
+
 /// Per-position comparison.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RowStats {
@@ -247,5 +258,31 @@ mod tests {
         let rep = Report::new(&r, &t).unwrap();
         let tol = Tolerance { kl_mean: 1e9, kl_max: 1e9, rel_rms_max: 1e9 };
         assert!(tol.check(&rep).is_err());
+    }
+
+    #[test]
+    fn first_token_diff_equal() {
+        assert_eq!(first_token_diff(&[1, 2, 3], &[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn first_token_diff_at_index_zero() {
+        assert_eq!(first_token_diff(&[9, 2, 3], &[1, 2, 3]), Some(0));
+    }
+
+    #[test]
+    fn first_token_diff_in_the_middle() {
+        assert_eq!(first_token_diff(&[1, 2, 3, 4], &[1, 2, 9, 4]), Some(2));
+    }
+
+    #[test]
+    fn first_token_diff_prefix_both_ways() {
+        assert_eq!(first_token_diff(&[1, 2], &[1, 2, 3]), Some(2));
+        assert_eq!(first_token_diff(&[1, 2, 3], &[1, 2]), Some(2));
+    }
+
+    #[test]
+    fn first_token_diff_both_empty() {
+        assert_eq!(first_token_diff(&[], &[]), None);
     }
 }

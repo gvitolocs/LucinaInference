@@ -1,0 +1,144 @@
+The quick brown fox jumps over the lazy dog.
+Hello, world! How are you today?
+She said, "It's not that simple," and walked away.
+Don't stop believing; hold on to that feeling.
+We'll see what happens, won't we?
+I'M SHOUTING NOW, okay?
+It's a well-known fact that 2 + 2 = 4.
+Questions? Answers! Exclamations!! Mixed... punctuation?!
+"Quotes inside quotes: 'nested' are tricky," he said.
+The dog's bone, the cat's toy, and the bird's nest.
+The rain in Spain stays mainly in the plain.
+To be or not to be, that is the question.
+All happy families are alike; each unhappy family is unhappy in its own way.
+Call me Ishmael.
+In the beginning was the Word.
+1
+12
+123
+1234
+12345678
+3.14159
+-42
+1e-6
+0x1F
+555-0199
+2026-11-07
+1,234,567.89 and 1 000 000
+Version 2.0.1 released on 2026-11-07 at 12:34:56.
+Prices: $5, €10, ¥1000, £3.50.
+Time: 12:00:00, date: 07/11/2026, ISO: 2026-11-07T12:00:00Z
+two  spaces
+three   spaces
+eight        spaces
+  leading spaces
+trailing spaces  
+tab\there
+\t\ttab-tab at start
+line one\n\n\nline four
+trailing spaces before newline \nnext line
+        
+mixed \t tab and  spaces \n end
+Multiple newlines:\n\n\n\nafter four
+Trailing newline case: end.\n
+\nleading newline
+Both: \n middle \n
+fn main() {\n    let x: u32 = 42;\n    println!("x = {}", x);\n}
+pub fn fib(n: u64) -> u64 {\n    let (mut a, mut b) = (0u64, 1u64);\n    for _ in 0..n {\n        (a, b) = (b, a + b);\n    }\n    a\n}
+def greet(name):\n    return f"Hello, {name}!"\n\nprint(greet("world"))
+class Foo:\n    def __init__(self):\n        self.x = 1\n\n    def bar(self):\n        return self.x * 2
+{"name": "Lucina", "version": 2, "tags": ["rust", "llm"], "nested": {"ok": true, "n": null}}
+{\n  "a": 1,\n  "b": [2, 3],\n  "c": {"d": "e"}\n}
+#!/bin/bash\nset -euo pipefail\necho "hello $USER"\nls -la | grep foo
+for i in 1 2 3; do echo $i; done
+#include <iostream>\nint main() {\n    std::cout << "hi" << std::endl;\n    return 0;\n}
+if (x > 0) {\n    y += x;\n} else {\n    y -= 1;\n}
+Run `cargo build --release` to compile.\nThen `cargo test`.
+path = "C:\\Users\\nez\\file.txt"
+Tabs in code:\tint x = 1;\tint y = 2;
+Hvad er klokken?
+Æble, øl og åbne døre i Århus.
+Jeg kan godt lide smørrebrød med æg og rejer.
+perché la città è bella?
+È già mezzogiorno a Città del Vaticano.
+Straße und Grüße aus München, übel nehmen.
+Der große Fuß und das Ü in Füßen.
+Où est la bibliothèque, s'il vous plaît?
+Élégance, français, à côté de la gare.
+¿Dónde está el baño, por favor?
+¡Qué sorpresa! El niño está en España.
+Η γρήγορη καφέ πηδάε πάνά απά τεμπέλη σκύλο.
+Αθήννα, Θεσσαλονκή, κα το Αιγαο πέλαγος.
+Привет, мир! Как дела?
+Москва — столица России, а Санкт-Петербург — культурная столица.
+مرحبا بالعالم، كيف حالك؟
+العربية لغة جميلة وغنية بالتاريخ.
+שלום עולם, מה שלומך?
+ירושלים היא עיר עתיקה וקדושה.
+नमस्ते दुनिया, आप कैसे हैं?
+यह एक हिंदी वाक्य है।
+สวัสดีชาวโลก อร่อยดีไหมครับ
+กรุงเทพมหานครเป็นเมืองหลวงของประเทศไทย
+你好，世界！今天天气怎么样？
+北京是中国的首都，上海是经济中心。
+こんにちは、世界！お元気ですか？
+日本語の文章です。漢字とひらがなとカタカナが混ざっています。
+안녕하세요, 세계! 반갑습니다.
+서울은 대한민국의 수도입니다.
+Family: 👨‍👩‍👧‍👦 together.
+Flag of Denmark: 🇩🇰 and Norway: 🇳🇴
+Thumbs up with skin tone: 👍🏽
+Combining mark: é (e + U+0301)
+Emoji mix: 🎉🚀🧠🔥💯
+ZWJ couple: 👩‍❤️‍👨 and handshake 🤝🏽
+🚀 launch at start
+Multiple ZWJ: 👨‍👩‍👧‍👦👨‍👩‍👧‍👦
+<|im_start|>user\nhi<|im_end|>
+<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
+<think>\n\n</think>
+<|endoftext|>
+<tool_call>
+<|im_star|>
+< |im_start| >
+<|im_start|>user\n<|im_star|> inside<|im_end|>
+<|endoftext|><|endoftext|>
+supercalifragilisticexpialidocious
+antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis
+https://example.com/path/to/page?q=1&r=2#frag
+http://localhost:8080/api/v1/users/42
+a.b@example.com
+user+tag@sub.domain.co.uk
+https://sub.domain.example.org/a/very/long/path/segment/that/keeps/going/and/going/and/going?with=query&params=1
+| Name | Age | City |\n|------|-----|------|\n| Alice | 30 | Paris |\n| Bob | 25 | København |
+| a | b |\n|---|---|\n| 1 | 2 |
+The formula is \\frac{a}{b} + \\sqrt{x^2 + y^2}.
+\\int_0^1 x^2 \\, dx = \\frac{1}{3}
+Inline math: $x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$
+aaaaaaaaaaaaaaaa
+!!!!!!!!
+----------
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Mixed repeats: aaa!!!bbb---ccc
+CamelCase and snake_case and kebab-case and PascalCase
+snake_case_identifiers_are_long_but_clear
+JSON-ish: {"key": "value", "n": 123}
+A sentence with an ellipsis... and a dash — and an em dash — done.
+Quote mix: "double" 'single' `backtick` and <angle>
+Angle brackets: <div class="x">text</div>
+HTML: <p>Hello <b>world</b></p>
+Markdown: **bold** _italic_ `code` ~~strike~~
+Markdown link: [example](https://example.com)
+# Title\n## Section\n### Subsection
+Numbered list:\n1. one\n2. two\n3. three
+Bullet list:\n- alpha\n- beta\n- gamma
+Code block:\n```rust\nfn main() {}\n```
+Temperature: 21.5°C and wind 5 m/s from NW.
+Currency: 100 USD = 92 EUR approx.
+Roman numerals: I II III IV V VI VII VIII IX X
+Greek letters: α β γ δ ε ζ η θ
+Math: ∀x ∃y: x + y = y + x, ∑, ∏, √, ∞, ≠, ≤, ≥
+Arrows: → ← ↑ ↓ ⇒ ⇐
+Box drawing: ┌─┬─┐ │ │ └─┴─┘
+Mixed script: English + 中文 + 日本語 + 한글 + Ελληνικ + Русский + العربية + עברית
+Emoji + text + numbers: 🎉 2026-11-07 👍🏽 done!
+Mixed: English with numbers 123 and symbols #@$%

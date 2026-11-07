@@ -4,9 +4,10 @@
 //!   lucina-parity compare --n-vocab V --ref work/ref/x.logits.f32 --test work/infr/x.logits.f32
 //!   lucina-parity gate --n-vocab V --ref R --self S1,S2,.. --test T [--k 2]
 //!   lucina-parity tokenize --model M.gguf --lines corpus.txt --out work/infr/tok
-use anyhow::{Context, Result};
+//!   lucina-parity tokens-diff --ref R.tokens.txt --test T.tokens.txt [--lines corpus.txt]
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use lucina_parity::{read_tokens, Logits, Report, Tolerance};
+use lucina_parity::{first_token_diff, read_tokens, Logits, Report, Tolerance};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -61,6 +62,16 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Compare two tokenized-corpus files line by line (one line per corpus line, ids space-separated).
+    TokensDiff {
+        #[arg(long = "ref")]
+        reference: PathBuf,
+        #[arg(long)]
+        test: PathBuf,
+        /// also print the corpus line (1-based) for each mismatch, truncated to 120 chars
+        #[arg(long)]
+        lines: Option<PathBuf>,
+    },
 }
 
 fn load_cpu(model: &Path) -> Result<infr_llama::SeamModel> {
@@ -94,6 +105,26 @@ fn unescape(line: &str) -> String {
         }
     }
     out
+}
+
+/// Read a tokenized-corpus file: one line per corpus line, token ids separated by single spaces
+/// (an empty line means the input tokenized to zero tokens).
+fn read_token_lines(path: &Path) -> Result<Vec<Vec<u32>>> {
+    let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    s.lines()
+        .map(|l| {
+            l.split_whitespace()
+                .map(|t| t.parse::<u32>().with_context(|| format!("bad token id {t:?} in {}", path.display())))
+                .collect()
+        })
+        .collect()
+}
+
+/// Up to 3 ids before index `k` plus `k` itself and up to 5 after it, space-separated.
+fn token_window(ids: &[u32], k: usize) -> String {
+    let start = k.saturating_sub(3);
+    let end = (k + 6).min(ids.len());
+    ids[start..end].iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" ")
 }
 
 fn main() -> Result<()> {
@@ -149,6 +180,45 @@ fn main() -> Result<()> {
             let mut p = out.into_os_string();
             p.push(".tokens.txt");
             std::fs::write(&p, o)?;
+        }
+        Cmd::TokensDiff { reference, test, lines } => {
+            let ref_lines = read_token_lines(&reference)?;
+            let test_lines = read_token_lines(&test)?;
+            if ref_lines.len() != test_lines.len() {
+                println!("line counts differ: ref {} lines, test {} lines", ref_lines.len(), test_lines.len());
+            }
+            let corpus = match &lines {
+                Some(p) => Some(std::fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?),
+                None => None,
+            };
+            let n = ref_lines.len().max(test_lines.len());
+            let mut mismatches = 0usize;
+            for i in 0..n {
+                let a: &[u32] = ref_lines.get(i).map_or(&[], |v| v.as_slice());
+                let b: &[u32] = test_lines.get(i).map_or(&[], |v| v.as_slice());
+                // a line present on one side only is a mismatch even when the other side tokenized to nothing
+                let missing = i >= ref_lines.len() || i >= test_lines.len();
+                if let Some(k) = first_token_diff(a, b).or(missing.then_some(0)) {
+                    mismatches += 1;
+                    println!(
+                        "line {}: first difference at token index {}: ref [{}] test [{}]",
+                        i + 1,
+                        k,
+                        token_window(a, k),
+                        token_window(b, k)
+                    );
+                    if let Some(c) = &corpus {
+                        if let Some(line) = c.lines().nth(i) {
+                            let short: String = line.chars().take(120).collect();
+                            println!("  corpus line {}: {}", i + 1, short);
+                        }
+                    }
+                }
+            }
+            println!("tokens-diff: {} of {} lines match", n - mismatches, n);
+            if mismatches > 0 {
+                bail!("tokens-diff: {} of {} lines differ", mismatches, n);
+            }
         }
     }
     Ok(())
