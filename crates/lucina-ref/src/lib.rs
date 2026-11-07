@@ -85,6 +85,10 @@ pub struct Model {
     /// runs: `LUCINA_REF_MUTANT=head_div` maps DeltaNet v-head j to k-head j / (n_v / n_k) instead of
     /// j % n_k; `rope_adjacent` rotates adjacent pairs (2i, 2i+1) instead of NEOX pairs (i, i + n_rot/2).
     pub mutant: Option<String>,
+    /// `LUCINA_REF_ACT_QUANT=ggml`: round every matmul input the way ggml-cpu does before its integer
+    /// dot (Q8_K blocks of 256 for K/IQ weights, Q8_0 blocks of 32 with an f16 scale for Q8_0/IQ4_NL).
+    /// Diagnostic only: it shows how much of llama.cpp's distance from exact math is that rounding.
+    pub act_quant: bool,
 }
 
 type Mat = Vec<Vec<f64>>; // [token][feature]
@@ -108,7 +112,11 @@ impl Model {
             }
             eprintln!("lucina-ref: MUTANT {m} (sensitivity check, results are wrong on purpose)");
         }
-        Ok(Self { g, cfg, mutant })
+        let act_quant = std::env::var("LUCINA_REF_ACT_QUANT").as_deref() == Ok("ggml");
+        if act_quant {
+            eprintln!("lucina-ref: emulating ggml-cpu activation quantization (diagnostic)");
+        }
+        Ok(Self { g, cfg, mutant, act_quant })
     }
 
     fn rope(&self, x: &mut [f64], pos: f64) {
@@ -153,6 +161,13 @@ impl Model {
             bail!("{name}: input width {} != {n_in}", xs[0].len());
         }
         let ty = t.ggml_type;
+        let emulated;
+        let xs = if self.act_quant {
+            emulated = xs.iter().map(|x| quant::ggml_act_quant(ty, x)).collect::<Mat>();
+            &emulated
+        } else {
+            xs
+        };
         // cols[r][tok]
         let cols: Vec<Vec<f64>> = (0..n_out)
             .into_par_iter()

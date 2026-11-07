@@ -329,3 +329,47 @@ mod tests {
         assert_eq!(y[0], 0.25 * -32.0);
     }
 }
+
+/// ggml-cpu's activation rounding before an integer dot (diagnostic emulation, see `Model::act_quant`).
+/// `quantize_row_q8_K_ref`: per 256, iscale = -127 / (signed value of max |x|), q = nearest(iscale * x)
+/// capped at 127, d = 1 / iscale (f32). `quantize_row_q8_0_ref`: per 32, d = amax / 127 stored as f16,
+/// q = roundf(x / d_f32). Returns q * d in f64. F32/F16/BF16 weights: unchanged (F16 rounding ignored).
+pub fn ggml_act_quant(weight_type: u32, x: &[f64]) -> Vec<f64> {
+    let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+    let mut out = vec![0f64; x.len()];
+    match weight_type {
+        Q3_K | Q4_K | Q5_K | Q6_K | IQ3_S | IQ4_XS => {
+            for (blk, o) in xf.chunks(QK_K).zip(out.chunks_mut(QK_K)) {
+                let (mut amax, mut max) = (0f32, 0f32);
+                for &v in blk {
+                    if v.abs() > amax {
+                        amax = v.abs();
+                        max = v;
+                    }
+                }
+                if amax == 0.0 {
+                    continue;
+                }
+                let iscale = -127.0f32 / max;
+                let d = 1.0f32 / iscale;
+                for (oj, &v) in o.iter_mut().zip(blk) {
+                    let q = ((iscale * v).round_ties_even() as i32).min(127);
+                    *oj = q as f64 * d as f64;
+                }
+            }
+        }
+        Q8_0 | IQ4_NL => {
+            for (blk, o) in xf.chunks(32).zip(out.chunks_mut(32)) {
+                let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / 127.0;
+                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+                let dh = f16::from_f32(d).to_f32();
+                for (oj, &v) in o.iter_mut().zip(blk) {
+                    *oj = (v * id).round() as f64 * dh as f64;
+                }
+            }
+        }
+        _ => return x.to_vec(),
+    }
+    out
+}

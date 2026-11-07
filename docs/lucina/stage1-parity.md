@@ -43,7 +43,7 @@ Distance from the f64 reference:
 | **infr CPU** | **4.16e-3** | **0.077** | **0.767** | 7.21 | **128/128** | 142/149 |
 | tolerance (2x) | 5.56e-3 | 0.139 | 1.119 | - | all | - |
 
-Gate result: **PASS** (`lucina-parity gate --ref work/f64/q35-9b-chat --self <llama.cpp runs> --test work/infr/q35-9b-chat --k 2`).
+Gate result: **PASS** (`lucina-parity gate --ref work/f64/q35-9b-chat --self <llama.cpp runs> --test work/infr/q35-9b-chat --k 2`). Integration tests: `crates/lucina-parity/tests/oracle_parity.rs` (both gates; the llama.cpp-referenced one written by local Qwen through the coding-agent queue and reviewed).
 
 Against llama.cpp b512 directly: infr mean KL 4.77e-3, max 0.055, decisive top-1 126/126; llama.cpp seq
 vs b512: mean KL 2.68e-3, max 0.109. infr's worst positions (112, 104, 10-12, 140) are the same positions
@@ -65,9 +65,59 @@ per batch run, 349 s token by token; infr CPU 55 s; lucina-ref f64 185 s.
 
 ## Qwen3.8-27B UD-Q4_K_XL (the production file), CPU
 
-Pending in this session (`work/run-27b-cpu.sh`, gated on Tctl < 88 °C): llama.cpp b512 and seq against
-infr, short prompt `oracle/prompts/short.txt`. lucina-ref cannot run the 27B yet: it has no IQ4_XS,
-IQ4_NL, IQ3_S or Q3_K dequant (port from ggml-quants.c next).
+Prompt `oracle/prompts/short.txt` (35 tokens: chat template, Danish, an empty `<think>` block, the start of
+an answer).
+
+| Comparison | mean KL | max KL | max rel RMS | top-1 decisive | top-1 all |
+|---|---|---|---|---|---|
+| llama.cpp seq vs llama.cpp b512 (self-spread) | 7.1e-4 | 9.5e-3 | 0.162 | 32/32 | 35/35 |
+| **infr CPU vs llama.cpp b512** | **4.6e-4** | **5.2e-3** | 0.242 | **32/32** | **35/35** |
+| llama.cpp b512 vs f64 | 2.43e-2 | 0.828 | 0.763 | 32/33 | 34/35 |
+| llama.cpp seq vs f64 | 2.19e-2 | 0.752 | 0.828 | 32/33 | 34/35 |
+| infr CPU vs f64 | 2.31e-2 | 0.794 | 0.883 | 32/33 | 34/35 |
+
+Both gates **PASS**: the llama.cpp-referenced gate (infr is closer to llama.cpp b512 than llama.cpp's own
+token-by-token run is), and the f64-referenced gate.
+
+**Why llama.cpp and infr both sit about 0.02 mean KL from exact math on the 27B:** the distance is one
+position. Position 25 (the `assistant` token after `<|im_start|>`) has KL 2.05 and relative RMS 0.96 against
+f64, while every other position stays around 1e-5 to 1e-2. That token carries a massive activation. ggml-cpu
+quantizes every matmul input to 8-bit blocks (Q8_K per 256 values for K/IQ weights, Q8_0 per 32 for
+Q8_0/IQ4_NL), and one huge value in a block rounds its neighbours to zero. infr's CPU path does the same, so
+it agrees with llama.cpp (KL 4.6e-4) and not with f64. Checked directly: with ggml's activation rounding
+emulated in lucina-ref (`LUCINA_REF_ACT_QUANT=ggml`), position 25 drops to KL 0.075 and relative RMS 0.16
+against llama.cpp, and mean KL to 2.7e-3.
+
+Consequences:
+- The gate's argmax rule is now "no more decisive flips than the original shows against the same
+  reference" (`Tolerance::decisive_flips`). llama.cpp flips 1 of 33 against f64 on the 27B and 0 against
+  itself everywhere.
+- On the 27B the f64-referenced bounds are loose (max KL 1.66), because the original itself is far off at
+  position 25. There the llama.cpp-referenced gate is the tight one.
+- A GPU path that keeps activations in f16 will be **closer** to exact math than llama.cpp CPU at such
+  tokens. Stage 2 therefore gates the GPU against both references and llama.cpp Vulkan's own spread.
+
+Timings (other sessions loading build-host; not a benchmark): llama.cpp CPU 34 s batch, 231 s token by token; infr
+CPU 21 s; lucina-ref f64 101 s.
+
+## Sensitivity: does the gate catch real bugs?
+
+Two deliberately wrong builds of lucina-ref (`LUCINA_REF_MUTANT`), 9B, first 48 tokens of the chat prompt, gate
+against f64 with llama.cpp b512 and seq as the spread:
+
+| Build | mean KL | max KL | top-1 decisive | Gate |
+|---|---|---|---|---|
+| `head_div`: DeltaNet v-head j reads k-head j/(n_v/n_k) instead of j % n_k | 2.47 | 11.5 | 19/37 | **FAIL** on every metric |
+| `rope_adjacent`: rope on (2i, 2i+1) instead of (i, i+32) | 3.8e-3 | 0.076 | 37/37 | **FAIL, barely** (max KL 0.076 > 0.065) |
+| infr (control) | 7.0e-3 | 0.050 | 37/37 | PASS |
+| bound | 7.8e-3 | 0.065 | 0 flips | |
+
+The head mapping (and anything of that size: norms, gates, conv, state layout) is caught by orders of
+magnitude. **A wrong rope pairing is caught only just**, and its mean KL is lower than infr's. On a short
+prompt, positions are small, only 1 layer in 4 is attention, and rope covers 64 of 256 dims, so positional
+bugs hardly reach the logits. Logits on short prompts are not enough to vouch for positional code. Stage 2
+adds a long-prompt gate (4k and 32k tokens, where rope and attention errors grow) and per-layer hidden-state
+comparisons against llama.cpp (`llama-eval-callback` dumps).
 
 ## Tokenizer: a real bug, fixed
 

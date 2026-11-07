@@ -173,6 +173,10 @@ pub struct Tolerance {
     pub kl_mean: f64,
     pub kl_max: f64,
     pub rel_rms_max: f64,
+    /// decisive argmax flips allowed: as many as the original shows against the same reference
+    /// (0 against llama.cpp itself; on the 27B llama.cpp flips one decisive position against exact
+    /// math, at a massive-activation token where its Q8 activation rounding loses the most)
+    pub decisive_flips: usize,
 }
 
 impl Tolerance {
@@ -181,7 +185,13 @@ impl Tolerance {
     /// docs/lucina/stage1-parity.md records the spreads and the chosen `k`.
     pub fn from_self_spread(spreads: &[&Report], k: f64) -> Self {
         let f = |g: &dyn Fn(&Report) -> f64| spreads.iter().map(|r| g(r)).fold(0.0, f64::max) * k;
-        Self { kl_mean: f(&|r| r.kl_mean()), kl_max: f(&|r| r.kl_max()), rel_rms_max: f(&|r| r.rel_rms_max()) }
+        let flips = spreads.iter().map(|r| r.top1_decisive().1 - r.top1_decisive().0).max().unwrap_or(0);
+        Self {
+            kl_mean: f(&|r| r.kl_mean()),
+            kl_max: f(&|r| r.kl_max()),
+            rel_rms_max: f(&|r| r.rel_rms_max()),
+            decisive_flips: flips,
+        }
     }
 
     pub fn check(&self, r: &Report) -> Result<()> {
@@ -196,8 +206,8 @@ impl Tolerance {
         if r.rel_rms_max() > self.rel_rms_max {
             bad.push(format!("rel_rms_max {:.3e} > {:.3e}", r.rel_rms_max(), self.rel_rms_max));
         }
-        if a != n {
-            bad.push(format!("top1 on decisive positions {a}/{n}"));
+        if n - a > self.decisive_flips {
+            bad.push(format!("top1 on decisive positions {a}/{n} (allowed flips {})", self.decisive_flips));
         }
         if bad.is_empty() {
             Ok(())
@@ -256,7 +266,7 @@ mod tests {
         let r = Logits { n_vocab, data: vec![5.0, 0.0] };
         let t = Logits { n_vocab, data: vec![0.0, 5.0] };
         let rep = Report::new(&r, &t).unwrap();
-        let tol = Tolerance { kl_mean: 1e9, kl_max: 1e9, rel_rms_max: 1e9 };
+        let tol = Tolerance { kl_mean: 1e9, kl_max: 1e9, rel_rms_max: 1e9, decisive_flips: 0 };
         assert!(tol.check(&rep).is_err());
     }
 

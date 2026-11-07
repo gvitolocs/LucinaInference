@@ -47,6 +47,13 @@ uses q4_0 KV plus MTP, so those ratios do not carry over. Step 3 measures them a
   flash attention's split-K path and the DeltaNet chunked path both run).
 - Greedy 256-token continuations on five agent-style prompts: count the first divergence position against
   llama.cpp Vulkan.
+- **Long-prompt and per-layer gates** (stage 1 showed a wrong rope pairing only just fails a 48-token
+  logits gate): 4k- and 32k-token prompts on CPU first (oracle + lucina-ref + infr), then the GPU. Per-layer
+  hidden states against llama.cpp's `llama-eval-callback` tensor dumps (`attn_residual`, `post_ffn`,
+  `linear_attn_out` per layer), so a mismatch names its layer and op.
+- Gate the GPU against both the llama.cpp CPU oracle and the f64 reference. At massive-activation tokens an
+  f16-activation GPU path should be closer to exact math than llama.cpp CPU, whose 8-bit activation rounding
+  dominates there (stage 1, position 25 of the 27B prompt).
 
 ### 3. Speed matrix (same flags as production on both sides)
 

@@ -160,7 +160,7 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "tolerance": {"kl_mean": tol.kl_mean, "kl_max": tol.kl_max, "rel_rms_max": tol.rel_rms_max, "k": k},
+                    "tolerance": {"kl_mean": tol.kl_mean, "kl_max": tol.kl_max, "rel_rms_max": tol.rel_rms_max, "decisive_flips": tol.decisive_flips, "k": k},
                     "self_spread": spreads.iter().map(|s| s.json()).collect::<Vec<_>>(),
                     "test": rep.json(),
                 }))?
