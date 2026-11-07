@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 static void die(const char * msg) {
@@ -46,9 +47,9 @@ static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::s
 }
 
 int main(int argc, char ** argv) {
-    std::string model_path, prompt_file, lines_file, out;
+    std::string model_path, prompt_file, lines_file, tokens_file, positions_arg = "all", out;
     int ubatch = 512, threads = 8;
-    bool one_by_one = false, special = true;
+    bool one_by_one = false, special = true, gpu = false, tokenize_only = false;
     std::string kv = "f16";
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -62,16 +63,25 @@ int main(int argc, char ** argv) {
         else if (a == "--one-by-one") one_by_one = true;
         else if (a == "--kv") kv = next();
         else if (a == "--no-special") special = false;
+        else if (a == "--tokens") tokens_file = next();           // token ids (whitespace separated) instead of text
+        else if (a == "--positions") positions_arg = next();     // "all" or comma list: logits only for these rows
+        else if (a == "--tokenize-only") tokenize_only = true;  // write <out>.tokens.txt and stop
+        else if (a == "--gpu") gpu = true;                         // llama.cpp's own Vulkan backend, all layers, flash attn on
         else die(("unknown argument " + a).c_str());
     }
-    if (model_path.empty() || out.empty() || (prompt_file.empty() == lines_file.empty()))
-        die("need --model, --out and exactly one of --prompt-file / --tokenize-lines");
+    if (model_path.empty() || out.empty() ||
+        ((int) !prompt_file.empty() + (int) !lines_file.empty() + (int) !tokens_file.empty()) != 1)
+        die("need --model, --out and exactly one of --prompt-file / --tokens / --tokenize-lines");
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     static ggml_backend_dev_t no_devices[1] = { nullptr };
-    mp.devices = no_devices;   // CPU only: no GPU device is offered to the model
-    mp.n_gpu_layers = 0;
+    if (!gpu) {
+        mp.devices = no_devices;   // CPU only: no GPU device is offered to the model
+        mp.n_gpu_layers = 0;
+    } else {
+        mp.n_gpu_layers = 999;     // production layout: every layer on the GPU (device chosen by the env)
+    }
     mp.load_mtp = false;       // the MTP head is not part of the main forward
     llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
     if (!model) die("model load failed");
@@ -99,10 +109,22 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    const std::string text = read_file(prompt_file);
-    std::vector<llama_token> toks = tokenize(vocab, text, special);
+    std::vector<llama_token> toks;
+    if (!tokens_file.empty()) {
+        std::istringstream in(read_file(tokens_file));
+        long long t;
+        while (in >> t) toks.push_back((llama_token) t);
+    } else {
+        toks = tokenize(vocab, read_file(prompt_file), special);
+    }
     const int n = (int) toks.size();
     if (n == 0) die("empty prompt");
+    if (tokenize_only) {
+        std::ofstream o(out + ".tokens.txt");
+        for (auto t : toks) o << t << "\n";
+        llama_model_free(model);
+        return 0;
+    }
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = std::max(256, ((n + 255) / 256) * 256);
@@ -111,13 +133,24 @@ int main(int argc, char ** argv) {
     cp.n_seq_max = 1;
     cp.n_threads = threads;
     cp.n_threads_batch = threads;
-    cp.op_offload = false;
-    cp.type_k = kv == "f32" ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    cp.op_offload = gpu;
+    if (gpu) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.type_k = kv == "f32" ? GGML_TYPE_F32 : kv == "q4_0" ? GGML_TYPE_Q4_0 : kv == "q8_0" ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
     cp.type_v = cp.type_k;
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) die("context init failed");
 
-    std::vector<float> logits((size_t) n * n_vocab);
+    std::vector<int> rows; // positions whose logits are kept, ascending
+    if (positions_arg == "all") { for (int i = 0; i < n; i++) rows.push_back(i); }
+    else {
+        std::stringstream ps(positions_arg); std::string item;
+        while (std::getline(ps, item, ',')) { int p = atoi(item.c_str()); if (p < 0 || p >= n) die("position out of range"); rows.push_back(p); }
+        std::sort(rows.begin(), rows.end());
+    }
+    std::vector<char> want(n, 0);
+    for (int p : rows) want[p] = 1;
+    std::vector<float> logits((size_t) rows.size() * n_vocab);
+    if (one_by_one && positions_arg != "all") die("--one-by-one only with all positions");
     if (one_by_one) {
         for (int i = 0; i < n; i++) {
             llama_batch b = llama_batch_init(1, 0, 1);
@@ -131,17 +164,19 @@ int main(int argc, char ** argv) {
         llama_batch b = llama_batch_init(n, 0, 1);
         b.n_tokens = n;
         for (int i = 0; i < n; i++) {
-            b.token[i] = toks[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+            b.token[i] = toks[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = want[i];
         }
         if (llama_decode(ctx, b) != 0) die("decode failed");
-        for (int i = 0; i < n; i++)
-            memcpy(&logits[(size_t) i * n_vocab], llama_get_logits_ith(ctx, i), sizeof(float) * n_vocab);
+        for (size_t r = 0; r < rows.size(); r++)
+            memcpy(&logits[r * n_vocab], llama_get_logits_ith(ctx, rows[r]), sizeof(float) * n_vocab);
         llama_batch_free(b);
     }
 
     {
         std::ofstream o(out + ".tokens.txt");
         for (auto t : toks) o << t << "\n";
+        std::ofstream op(out + ".positions.txt");
+        for (int p : rows) op << p << "\n";
     }
     {
         FILE * f = fopen((out + ".logits.f32").c_str(), "wb");
@@ -153,7 +188,7 @@ int main(int argc, char ** argv) {
         std::ofstream o(out + ".meta.json");
         o << "{\"model\":\"" << model_path << "\",\"n_tokens\":" << n << ",\"n_vocab\":" << n_vocab
           << ",\"ubatch\":" << cp.n_ubatch << ",\"threads\":" << threads << ",\"one_by_one\":" << (one_by_one ? "true" : "false")
-          << ",\"kv\":\"" << kv << "\",\"special\":" << (special ? "true" : "false") << ",\"backend\":\"cpu\"}\n";
+          << ",\"kv\":\"" << kv << "\",\"special\":" << (special ? "true" : "false") << ",\"backend\":\"" << (gpu ? "vulkan" : "cpu") << "\",\"rows\":" << rows.size() << "}\n";
     }
     llama_free(ctx);
     llama_model_free(model);

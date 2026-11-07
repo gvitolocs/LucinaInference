@@ -73,10 +73,14 @@ enum Cmd {
         tokens: PathBuf,
         #[arg(long, value_delimiter = ',')]
         prefixes: Vec<usize>,
-        #[arg(long, default_value_t = 122880)]
+        /// session context to probe VRAM with; 0 skips the session probe
+        #[arg(long, default_value_t = 0)]
         ctx: usize,
         #[arg(long, default_value = "q4_0")]
         kv: String,
+        /// also write the logits of every row (<out>.logits.f32) from one batched forward
+        #[arg(long)]
+        all_rows: bool,
         #[arg(long)]
         out: PathBuf,
     },
@@ -198,7 +202,7 @@ fn main() -> Result<()> {
             p.push(".tokens.txt");
             std::fs::write(&p, o)?;
         }
-        Cmd::VulkanWindow { model, tokens, prefixes, ctx, kv, out } => {
+        Cmd::VulkanWindow { model, tokens, prefixes, ctx, kv, all_rows, out } => {
             let toks = read_tokens(&tokens)?;
             let mut cfg = infr_llama::EngineConfig::default();
             let dt = infr_core::budget::parse_kv_dtype(&kv).with_context(|| format!("unknown kv type {kv}"))?;
@@ -209,7 +213,7 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             let m = infr_llama::SeamModel::load_with(&model, None, Arc::new(cfg))?;
             eprintln!("WINDOW model opened in {:.1} s", t0.elapsed().as_secs_f64());
-            {
+            if ctx > 0 {
                 let t = std::time::Instant::now();
                 let s = m.vulkan_session(ctx)?;
                 let v = s.vram();
@@ -222,7 +226,14 @@ fn main() -> Result<()> {
                     (v.total - v.available) >> 20
                 );
             }
-            eprintln!("WINDOW session dropped");
+            if all_rows {
+                let t = std::time::Instant::now();
+                let rows = m.verify_logits_vulkan(&toks)?;
+                eprintln!("WINDOW vulkan all-row logits, {} tokens: {:.1} s", toks.len(), t.elapsed().as_secs_f64());
+                let mut o = out.clone().into_os_string();
+                o.push(".logits.f32");
+                Logits::write(Path::new(&o), &rows)?;
+            }
             for p in prefixes {
                 let t = std::time::Instant::now();
                 let row = m.prefill_logits_vulkan(&toks[..p.min(toks.len())])?;

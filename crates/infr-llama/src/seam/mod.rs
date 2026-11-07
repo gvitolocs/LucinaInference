@@ -3536,6 +3536,55 @@ pub(crate) fn verify_dense_vulkan(
     Ok(logits)
 }
 
+/// [`verify_rows_cpu_with_h`]'s Vulkan twin (LucinaInference parity): one batched causal forward
+/// of `tokens` through the production Vulkan seam, returning the logits of EVERY row
+/// (`[tokens.len() * vocab]`, row = position). Uses the MTP verify branch's full-logits download,
+/// so the host and VRAM hold `tokens.len() * vocab` f32: meant for short parity prompts (a few
+/// hundred tokens), not for long contexts.
+pub(crate) fn verify_rows_vulkan(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<Vec<f32>> {
+    let mut logits = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        vk,
+        &|_name, tb, dt, _n| {
+            let bytes = tb.materialize();
+            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+            let buf = vk
+                .alloc(padded.len(), BufferUsage::Weights)
+                .map_err(|e| anyhow!("{e}"))?;
+            vk.upload(buf.as_ref(), &padded)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok((buf, dt))
+        },
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        tokens,
+        0,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        Some(&mut logits),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    Ok(logits)
+}
+
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it
 /// on `be` (CPU reference or Vulkan). `bind_weight` turns each native-dtype GGUF tensor into a
 /// backend buffer: the CPU maps it zero-copy from the mmap; the GPU pads + uploads it to VRAM. This
