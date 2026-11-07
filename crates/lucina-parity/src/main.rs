@@ -63,6 +63,23 @@ enum Cmd {
         out: PathBuf,
     },
     /// Compare two tokenized-corpus files line by line (one line per corpus line, ids space-separated).
+    /// GPU window probe on the Vulkan backend, one model load: open a session at `ctx` with the given
+    /// KV type (weights + KV resident) and report VRAM, drop it, then last-token logits for each
+    /// prefix length (written as <out>-p<N>.logits.f32, one row each).
+    VulkanWindow {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        tokens: PathBuf,
+        #[arg(long, value_delimiter = ',')]
+        prefixes: Vec<usize>,
+        #[arg(long, default_value_t = 122880)]
+        ctx: usize,
+        #[arg(long, default_value = "q4_0")]
+        kv: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
     TokensDiff {
         #[arg(long = "ref")]
         reference: PathBuf,
@@ -180,6 +197,40 @@ fn main() -> Result<()> {
             let mut p = out.into_os_string();
             p.push(".tokens.txt");
             std::fs::write(&p, o)?;
+        }
+        Cmd::VulkanWindow { model, tokens, prefixes, ctx, kv, out } => {
+            let toks = read_tokens(&tokens)?;
+            let mut cfg = infr_llama::EngineConfig::default();
+            let dt = infr_core::budget::parse_kv_dtype(&kv).with_context(|| format!("unknown kv type {kv}"))?;
+            cfg.kv.type_k = Some(dt);
+            cfg.kv.type_k_specified = true;
+            cfg.kv.type_v = Some(dt);
+            cfg.kv.type_v_specified = true;
+            let t0 = std::time::Instant::now();
+            let m = infr_llama::SeamModel::load_with(&model, None, Arc::new(cfg))?;
+            eprintln!("WINDOW model opened in {:.1} s", t0.elapsed().as_secs_f64());
+            {
+                let t = std::time::Instant::now();
+                let s = m.vulkan_session(ctx)?;
+                let v = s.vram();
+                eprintln!(
+                    "WINDOW session ctx {ctx} kv {kv} on {}: ready in {:.1} s; device total {} MiB, available {} MiB, used {} MiB",
+                    s.device_name(),
+                    t.elapsed().as_secs_f64(),
+                    v.total >> 20,
+                    v.available >> 20,
+                    (v.total - v.available) >> 20
+                );
+            }
+            eprintln!("WINDOW session dropped");
+            for p in prefixes {
+                let t = std::time::Instant::now();
+                let row = m.prefill_logits_vulkan(&toks[..p.min(toks.len())])?;
+                eprintln!("WINDOW vulkan logits prefix {p}: {:.1} s", t.elapsed().as_secs_f64());
+                let mut o = out.clone().into_os_string();
+                o.push(format!("-p{p}.logits.f32"));
+                Logits::write(Path::new(&o), &row)?;
+            }
         }
         Cmd::TokensDiff { reference, test, lines } => {
             let ref_lines = read_token_lines(&reference)?;
