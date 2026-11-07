@@ -1,0 +1,8 @@
+<|im_start|>user
+Explain in one paragraph why Rust has no garbage collector. Svar også kort på dansk.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Rust manages memory

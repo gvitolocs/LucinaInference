@@ -80,6 +80,10 @@ impl Config {
 pub struct Model {
     pub g: Gguf,
     pub cfg: Config,
+    /// Deliberate bug for the gate's sensitivity check (docs/lucina/stage1-parity.md), never in normal
+    /// runs: `LUCINA_REF_MUTANT=head_div` maps DeltaNet v-head j to k-head j / (n_v / n_k) instead of
+    /// j % n_k; `rope_adjacent` rotates adjacent pairs (2i, 2i+1) instead of NEOX pairs (i, i + n_rot/2).
+    pub mutant: Option<String>,
 }
 
 type Mat = Vec<Vec<f64>>; // [token][feature]
@@ -96,7 +100,28 @@ impl Model {
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let g = Gguf::open(path)?;
         let cfg = Config::from_gguf(&g)?;
-        Ok(Self { g, cfg })
+        let mutant = std::env::var("LUCINA_REF_MUTANT").ok().filter(|m| !m.is_empty());
+        if let Some(m) = &mutant {
+            if m != "head_div" && m != "rope_adjacent" {
+                bail!("unknown LUCINA_REF_MUTANT {m}");
+            }
+            eprintln!("lucina-ref: MUTANT {m} (sensitivity check, results are wrong on purpose)");
+        }
+        Ok(Self { g, cfg, mutant })
+    }
+
+    fn rope(&self, x: &mut [f64], pos: f64) {
+        if self.mutant.as_deref() == Some("rope_adjacent") {
+            for i in 0..self.cfg.n_rot / 2 {
+                let theta = pos * self.cfg.rope_base.powf(-2.0 * i as f64 / self.cfg.n_rot as f64);
+                let (s, c) = theta.sin_cos();
+                let (x0, x1) = (x[2 * i], x[2 * i + 1]);
+                x[2 * i] = x0 * c - x1 * s;
+                x[2 * i + 1] = x0 * s + x1 * c;
+            }
+        } else {
+            rope_neox(x, pos, self.cfg.n_rot, self.cfg.rope_base);
+        }
     }
 
     /// A 1-D f32 tensor (norm weights, biases, ssm_a) as f64.
@@ -190,11 +215,11 @@ impl Model {
                 let base = h * 2 * hd;
                 q[t][h] = rms_norm(&qfull[t][base..base + hd], &qn, c.eps);
                 gate[t][h] = qfull[t][base + hd..base + 2 * hd].to_vec();
-                rope_neox(&mut q[t][h], t as f64, c.n_rot, c.rope_base);
+                self.rope(&mut q[t][h], t as f64);
             }
             for h in 0..c.n_head_kv {
                 k[t][h] = rms_norm(&kf[t][h * hd..(h + 1) * hd], &kn, c.eps);
-                rope_neox(&mut k[t][h], t as f64, c.n_rot, c.rope_base);
+                self.rope(&mut k[t][h], t as f64);
                 v[t][h] = vf[t][h * hd..(h + 1) * hd].to_vec();
             }
         }
@@ -272,7 +297,8 @@ impl Model {
         let per_head: Vec<Vec<Vec<f64>>> = (0..nv)
             .into_par_iter()
             .map(|j| {
-                let kh = j % nk; // ggml repeat / fused kernel: v head j reads k/q head j % n_k_heads
+                // ggml repeat / fused kernel: v head j reads k/q head j % n_k_heads
+                let kh = if self.mutant.as_deref() == Some("head_div") { j / (nv / nk) } else { j % nk };
                 let mut s = vec![vec![0f64; sk]; dv]; // S[b = v index][a = k index]
                 let mut outs = Vec::with_capacity(n);
                 for t in 0..n {
