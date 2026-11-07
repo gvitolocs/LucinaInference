@@ -1,19 +1,25 @@
 //! Row dequantization, ported from llama.cpp ggml/src/ggml-quants.c at 3612199ed (MIT, (c) the ggml
-//! authors): `dequantize_row_q8_0`, `_q4_K`, `_q5_K`, `_q6_K`, `get_scale_min_k4`. The arithmetic is
-//! kept in f32 exactly as ggml does it, so a row matches ggml's `to_float` bit for bit; the reference
-//! forward widens to f64 afterwards.
+//! authors): `dequantize_row_q8_0`, `_q4_K`, `_q5_K`, `_q6_K`, `get_scale_min_k4`, `_q3_K`,
+//! `_iq4_nl`, `_iq4_xs`, `_iq3_s` (block structs and lookup tables from ggml/src/ggml-common.h, see
+//! `iq_tables.rs`). The arithmetic is kept in f32 exactly as ggml does it, so a row matches ggml's
+//! `to_float` bit for bit; the reference forward widens to f64 afterwards.
 use anyhow::{bail, Result};
 use half::{bf16, f16};
 
 pub const F32: u32 = 0;
 pub const F16: u32 = 1;
 pub const Q8_0: u32 = 8;
+pub const Q3_K: u32 = 11;
 pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
+pub const IQ4_NL: u32 = 20;
+pub const IQ3_S: u32 = 21;
+pub const IQ4_XS: u32 = 23;
 pub const BF16: u32 = 30;
 
 const QK_K: usize = 256;
+const QK4_NL: usize = 32;
 
 /// (elements per block, bytes per block)
 pub fn block_layout(t: u32) -> Result<(usize, usize)> {
@@ -21,9 +27,13 @@ pub fn block_layout(t: u32) -> Result<(usize, usize)> {
         F32 => (1, 4),
         F16 | BF16 => (1, 2),
         Q8_0 => (32, 34),
+        Q3_K => (QK_K, 110),
         Q4_K => (QK_K, 144),
         Q5_K => (QK_K, 176),
         Q6_K => (QK_K, 210),
+        IQ4_NL => (QK4_NL, 18),
+        IQ3_S => (QK_K, 110),
+        IQ4_XS => (QK_K, 136),
         _ => bail!("ggml type {t} not supported by the reference (needs a port)"),
     })
 }
@@ -64,6 +74,46 @@ pub fn dequant_row(t: u32, src: &[u8], y: &mut [f32]) -> Result<()> {
                 let d = h(&b[0..2]);
                 for j in 0..32 {
                     y[bi * 32 + j] = (b[2 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        Q3_K => {
+            // block_q3_K { u8 hmask[QK_K/8]; u8 qs[QK_K/4]; u8 scales[12]; half d; }
+            for (bi, b) in src.chunks_exact(110).take(n / QK_K).enumerate() {
+                let d_all = h(&b[108..110]);
+                let hm = &b[0..32];
+                let mut q = &b[32..96];
+                let s = &b[96..108];
+                // the 12 scale bytes expand to the 16 int8 scales of aux[0..4] in ggml-quants.c
+                let mut scales = [0i32; 16];
+                for k in 0..4 {
+                    scales[k] = (s[k] & 0x0f | (s[8 + k] & 0x03) << 4) as i32;
+                    scales[4 + k] = (s[4 + k] & 0x0f | ((s[8 + k] >> 2) & 0x03) << 4) as i32;
+                    scales[8 + k] = ((s[k] >> 4) | ((s[8 + k] >> 4) & 0x03) << 4) as i32;
+                    scales[12 + k] = ((s[4 + k] >> 4) | ((s[8 + k] >> 6) & 0x03) << 4) as i32;
+                }
+                let y = &mut y[bi * QK_K..(bi + 1) * QK_K];
+                let (mut is, mut m, mut o) = (0usize, 1u32, 0usize);
+                for _ in (0..QK_K).step_by(128) {
+                    let mut shift = 0u32;
+                    for _ in 0..4 {
+                        let dl = d_all * (scales[is] - 32) as f32;
+                        is += 1;
+                        for l in 0..16 {
+                            let qv = ((q[l] >> shift) & 3) as i32 - if hm[l] as u32 & m != 0 { 0 } else { 4 };
+                            y[o + l] = dl * qv as f32;
+                        }
+                        let dl = d_all * (scales[is] - 32) as f32;
+                        is += 1;
+                        for l in 0..16 {
+                            let qv = ((q[l + 16] >> shift) & 3) as i32 - if hm[l + 16] as u32 & m != 0 { 0 } else { 4 };
+                            y[o + 16 + l] = dl * qv as f32;
+                        }
+                        shift += 2;
+                        m <<= 1;
+                        o += 32;
+                    }
+                    q = &q[32..];
                 }
             }
         }
@@ -146,6 +196,88 @@ pub fn dequant_row(t: u32, src: &[u8], y: &mut [f32]) -> Result<()> {
                         y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
                         y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
                     }
+                }
+            }
+        }
+        IQ4_NL => {
+            // block_iq4_nl { half d; u8 qs[QK4_NL/2]; }
+            for (bi, b) in src.chunks_exact(18).take(n / QK4_NL).enumerate() {
+                let d = h(&b[0..2]);
+                let qs = &b[2..18];
+                let y = &mut y[bi * QK4_NL..(bi + 1) * QK4_NL];
+                for j in 0..QK4_NL / 2 {
+                    y[j] = d * crate::iq_tables::KVALUES_IQ4NL[(qs[j] & 0xf) as usize] as f32;
+                    y[j + QK4_NL / 2] = d * crate::iq_tables::KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32;
+                }
+            }
+        }
+        IQ3_S => {
+            // block_iq3_s { half d; u8 qs[QK_K/4]; u8 qh[QK_K/32]; u8 signs[QK_K/8]; u8 scales[QK_K/64]; }
+            for (bi, b) in src.chunks_exact(110).take(n / QK_K).enumerate() {
+                let d = h(&b[0..2]);
+                let mut qs = &b[2..66];
+                let mut qh = &b[66..74];
+                let mut signs = &b[74..106];
+                let scales = &b[106..110];
+                let y = &mut y[bi * QK_K..(bi + 1) * QK_K];
+                let mut o = 0usize;
+                for ib32 in (0..QK_K / 32).step_by(2) {
+                    let db1 = d * (1 + 2 * (scales[ib32 / 2] & 0xf)) as f32;
+                    let db2 = d * (1 + 2 * (scales[ib32 / 2] >> 4)) as f32;
+                    for l in 0..4 {
+                        // grid index: qs byte | bit 8 from qh; the grid entry's 4 bytes are the values
+                        let g1 = crate::iq_tables::IQ3S_GRID
+                            [(qs[2 * l] as usize) | (((qh[0] as u32) << (8 - 2 * l)) & 256) as usize];
+                        let g2 = crate::iq_tables::IQ3S_GRID
+                            [(qs[2 * l + 1] as usize) | (((qh[0] as u32) << (7 - 2 * l)) & 256) as usize];
+                        for j in 0..4 {
+                            let s1 = if signs[l] & crate::iq_tables::KMASK_IQ2XS[j] != 0 { -1.0f32 } else { 1.0 };
+                            let s2 = if signs[l] & crate::iq_tables::KMASK_IQ2XS[j + 4] != 0 { -1.0f32 } else { 1.0 };
+                            y[o + j] = db1 * ((g1 >> (8 * j)) & 0xff) as f32 * s1;
+                            y[o + 4 + j] = db1 * ((g2 >> (8 * j)) & 0xff) as f32 * s2;
+                        }
+                        o += 8;
+                    }
+                    qs = &qs[8..];
+                    signs = &signs[4..];
+                    for l in 0..4 {
+                        let g1 = crate::iq_tables::IQ3S_GRID
+                            [(qs[2 * l] as usize) | (((qh[1] as u32) << (8 - 2 * l)) & 256) as usize];
+                        let g2 = crate::iq_tables::IQ3S_GRID
+                            [(qs[2 * l + 1] as usize) | (((qh[1] as u32) << (7 - 2 * l)) & 256) as usize];
+                        for j in 0..4 {
+                            let s1 = if signs[l] & crate::iq_tables::KMASK_IQ2XS[j] != 0 { -1.0f32 } else { 1.0 };
+                            let s2 = if signs[l] & crate::iq_tables::KMASK_IQ2XS[j + 4] != 0 { -1.0f32 } else { 1.0 };
+                            y[o + j] = db2 * ((g1 >> (8 * j)) & 0xff) as f32 * s1;
+                            y[o + 4 + j] = db2 * ((g2 >> (8 * j)) & 0xff) as f32 * s2;
+                        }
+                        o += 8;
+                    }
+                    qh = &qh[2..];
+                    qs = &qs[8..];
+                    signs = &signs[4..];
+                }
+            }
+        }
+        IQ4_XS => {
+            // block_iq4_xs { half d; u16 scales_h; u8 scales_l[QK_K/64]; u8 qs[QK_K/2]; }
+            for (bi, b) in src.chunks_exact(136).take(n / QK_K).enumerate() {
+                let d = h(&b[0..2]);
+                let scales_h = u16::from_le_bytes([b[2], b[3]]);
+                let scales_l = &b[4..8];
+                let mut qs = &b[8..136];
+                let y = &mut y[bi * QK_K..(bi + 1) * QK_K];
+                let mut o = 0usize;
+                for ib in 0..QK_K / 32 {
+                    let ls = ((scales_l[ib / 2] as i32 >> (4 * (ib % 2))) & 0xf)
+                        | (((scales_h as i32 >> (2 * ib)) & 3) << 4);
+                    let dl = d * (ls - 32) as f32;
+                    for j in 0..16 {
+                        y[o + j] = dl * crate::iq_tables::KVALUES_IQ4NL[(qs[j] & 0xf) as usize] as f32;
+                        y[o + 16 + j] = dl * crate::iq_tables::KVALUES_IQ4NL[(qs[j] >> 4) as usize] as f32;
+                    }
+                    o += 32;
+                    qs = &qs[16..];
                 }
             }
         }
