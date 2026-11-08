@@ -19,6 +19,7 @@ members = [
     "crates/lucina-parity",
     "crates/lucina-ref",
     "crates/lucina-rules",
+    "crates/lucina-bench-client",
 ]
 
 [workspace.package]

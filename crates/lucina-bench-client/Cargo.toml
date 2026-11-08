@@ -1,0 +1,12 @@
+[package]
+name = "lucina-bench-client"
+description = "Times streaming OpenAI chat completions identically against llama-server and infr serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
