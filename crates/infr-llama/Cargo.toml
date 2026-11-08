@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# LucinaInference: Verus-proved pure rules (no dependencies)
+lucina-rules = { path = "../lucina-rules" }
 infr-prof.workspace = true
 infr-prof-rt.workspace = true
 infr-core.workspace = true

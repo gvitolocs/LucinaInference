@@ -2644,6 +2644,8 @@ fn generate_mtp_spec_core(
         // the NEXT verify's prefix-diff re-prefills only the short accepted suffix from there rather
         // than triggering qwen35's full state reset. `h_rows`/`varg` were already read above, so the
         // rollback only affects the trunk state the next cycle consumes.
+        // LucinaInference: this cycle's bookkeeping must match the Verus-proved model (lucina_rules::spec_rules::cycle).
+        let committed_before = committed.len();
         let mut restored = false;
         if mtp_ckpt {
             if let Some(st) = trunk_state.as_mut() {
@@ -2750,6 +2752,16 @@ fn generate_mtp_spec_core(
 
         id_last = next_tok;
         n_past = committed.len();
+        debug_assert_eq!(
+            Some(committed.len()),
+            lucina_rules::spec_rules::cycle(committed_before, 0, cand.len(), accepted, usize::MAX / 2).map(|c| c.committed),
+            "MTP cycle committed count diverged from lucina_rules::spec_rules::cycle"
+        );
+        debug_assert!(
+            !mtp_ckpt || boundary <= committed.len(),
+            "MTP rollback boundary {boundary} past the committed tokens {}",
+            committed.len()
+        );
 
         // Partial-accept boundary re-prime (`mtp_reprime`'s doc): when the rollback window has
         // grown enough that the NEXT verify would leave the small-m fast-tile regime, prefill the

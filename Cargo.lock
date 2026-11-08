@@ -1303,6 +1303,7 @@ dependencies = [
  "infr-prof-rt",
  "infr-vulkan",
  "llguidance",
+ "lucina-rules",
  "rayon",
  "serde_json",
  "tokenizers 0.20.4",

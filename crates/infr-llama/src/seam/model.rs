@@ -2282,12 +2282,9 @@ impl DiffusionGemmaMetalSession {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn spec_accept(cand: &[u32], verify_argmax: &[u32]) -> (usize, u32) {
     debug_assert_eq!(verify_argmax.len(), cand.len() + 1);
-    let accepted = cand
-        .iter()
-        .zip(verify_argmax)
-        .take_while(|(c, v)| c == v)
-        .count();
-    (accepted, verify_argmax[accepted])
+    // LucinaInference: the rule is proved by Verus in lucina_rules::spec_rules (kept drafts equal the target's
+    // argmax, the first rejected one does not, the next token is the target's choice after them).
+    lucina_rules::spec_rules::spec_accept(cand, verify_argmax)
 }
 
 /// Temperature-aware speculative accept rule — the stochastic sibling of [`spec_accept`], used
