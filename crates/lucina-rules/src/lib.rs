@@ -5,3 +5,4 @@ pub mod kv_rules;
 pub mod split_rules;
 pub mod gate_rules;
 pub mod spec_rules;
+pub mod dequant_index;

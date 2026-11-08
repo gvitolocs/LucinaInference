@@ -10,7 +10,7 @@
 //! `iv1 % n_k_heads`), src/models/models.h `build_gdn_l2_norm`, ggml-cpu `ssm_conv` and
 //! `ggml_mrope_cache_init` (IMROPE with text positions copied into all sections).
 pub mod gguf;
-mod iq_tables;
+pub mod iq_tables;
 pub mod quant;
 
 use anyhow::{bail, Context, Result};
