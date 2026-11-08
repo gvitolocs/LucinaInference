@@ -16,6 +16,8 @@ bytemuck.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# LucinaInference: Verus-proved bounds helpers (pure, no dependencies)
+lucina-rules = { path = "../lucina-rules" }
 
 [dev-dependencies]
 tempfile = "3"

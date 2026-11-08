@@ -175,14 +175,15 @@ impl<'a> Reader<'a> {
                 self.pos
             ))
         })?;
-        if end > self.buf.len() {
-            Err(Error::Loader(format!(
+        let _ = end;
+        // proved (lucina_rules::gguf_bounds::take_end, Verus): `Some(e)` means pos <= e <= len
+        match lucina_rules::gguf_bounds::take_end(self.pos, n as u64, self.buf.len()) {
+            Some(_) => Ok(()),
+            None => Err(Error::Loader(format!(
                 "GGUF: unexpected EOF at offset {} (need {n} more bytes, file is {} bytes)",
                 self.pos,
                 self.buf.len()
-            )))
-        } else {
-            Ok(())
+            ))),
         }
     }
 
@@ -817,7 +818,10 @@ impl Gguf {
             }
 
             // ── data region: align cursor position to `alignment` ─────────────
-            let data_region_start = r.pos.div_ceil(alignment) * alignment;
+            // proved (gguf_bounds::align_up): a multiple of the alignment, >= pos, < pos + alignment
+            let data_region_start = lucina_rules::gguf_bounds::align_up(r.pos as u64, alignment as u64)
+                .ok_or_else(|| Error::Loader("GGUF: data region start overflows".into()))? as usize;
+            let file_len = r.buf.len();
 
             // ── convert raw tensor entries to TensorInfo ─────────────────────
             let mut tensors: Vec<TensorInfo> = Vec::with_capacity(raw.len());
@@ -866,6 +870,23 @@ impl Gguf {
                         "GGUF: tensor '{name}' shape {shape:?} byte size overflows usize"
                     ))
                 })?;
+                // llama.cpp gguf.cpp refuses a tensor offset that is not a multiple of the alignment, and
+                // any tensor whose bytes are not all inside the file; check both at load, through the
+                // proved helpers, so `resolve` never sees such a tensor.
+                if offset % alignment as u64 != 0 {
+                    return Err(Error::Loader(format!(
+                        "GGUF: tensor '{name}' offset {offset} is not a multiple of the alignment {alignment}"
+                    )));
+                }
+                let in_file = (data_region_start as u64)
+                    .checked_add(offset)
+                    .and_then(|start| usize::try_from(start).ok())
+                    .and_then(|start| lucina_rules::gguf_bounds::take_end(start, nbytes as u64, file_len));
+                if in_file.is_none() {
+                    return Err(Error::Loader(format!(
+                        "GGUF: tensor '{name}' bytes (offset {offset}, {nbytes} bytes) are not inside the {file_len}-byte file"
+                    )));
+                }
                 tensors.push(TensorInfo {
                     name,
                     shape,
@@ -1336,6 +1357,38 @@ mod tests {
     /// Two tensors sharing a name make `resolve`'s linear `find` silently serve the first and
     /// leave the second unreachable. That is malformed input being accepted, so `open` rejects
     /// it and names the duplicate.
+        fn one_f32_tensor(offset: u64, data: usize) -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        push_u32(&mut b, GGUF_MAGIC);
+        push_u32(&mut b, 3);
+        push_u64(&mut b, 1); // tensor_count
+        push_u64(&mut b, 0); // kv_count
+        push_gguf_str(&mut b, "t");
+        push_u32(&mut b, 1);
+        push_u64(&mut b, 4); // 4 x F32 = 16 bytes
+        push_u32(&mut b, 0);
+        push_u64(&mut b, offset);
+        while !b.len().is_multiple_of(32) {
+            b.push(0);
+        }
+        b.extend(std::iter::repeat(0u8).take(data));
+        b
+    }
+
+    /// LucinaInference: a tensor offset that is not a multiple of the alignment is refused at load
+    /// (llama.cpp gguf.cpp requires the padded running offset), and so is a tensor whose bytes end past the file.
+    #[test]
+    fn misaligned_or_out_of_file_tensors_are_refused_at_load() {
+        let ok = write_temp_gguf(&one_f32_tensor(0, 32));
+        assert!(Gguf::open(ok.path()).is_ok());
+        let bad = write_temp_gguf(&one_f32_tensor(8, 64));
+        let Err(Error::Loader(msg)) = Gguf::open(bad.path()).map(|_| ()) else { panic!("misaligned offset accepted") };
+        assert!(msg.contains("not a multiple of the alignment"), "{msg}");
+        let past = write_temp_gguf(&one_f32_tensor(32, 32));
+        let Err(Error::Loader(msg)) = Gguf::open(past.path()).map(|_| ()) else { panic!("out-of-file tensor accepted") };
+        assert!(msg.contains("not inside"), "{msg}");
+    }
+
     #[test]
     fn duplicate_tensor_name_errors() {
         let mut b: Vec<u8> = Vec::new();
@@ -1343,7 +1396,8 @@ mod tests {
         push_u32(&mut b, 3);
         push_u64(&mut b, 2); // tensor_count = 2
         push_u64(&mut b, 0); // kv_count = 0
-        for offset in [0u64, 16] {
+        // offsets padded to the alignment, as llama.cpp gguf.cpp requires (each offset = the previous ones padded)
+        for offset in [0u64, 32] {
             push_gguf_str(&mut b, "tensor0"); // same name twice
             push_u32(&mut b, 1); // n_dims
             push_u64(&mut b, 4); // dim[0]
@@ -1353,7 +1407,7 @@ mod tests {
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
-        b.extend_from_slice(&[0u8; 32]);
+        b.extend_from_slice(&[0u8; 64]);
         let tmp = write_temp_gguf(&b);
         let err = Gguf::open(tmp.path()).map(|_| ());
         let Err(Error::Loader(msg)) = err else {
