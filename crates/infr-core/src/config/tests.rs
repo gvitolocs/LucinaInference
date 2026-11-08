@@ -1341,3 +1341,16 @@ fn migrated_keys_are_exactly_the_landed_slices() {
          list it here in the SAME commit"
     );
 }
+
+
+#[test]
+fn a_kv_format_named_by_set_counts_as_specified() {
+    let mut cli = PartialConfig::default();
+    cli.set_path("kv.type_k", "q4_0").unwrap();
+    cli.set_path("kv.type_v", "q4_0").unwrap();
+    let cfg = Config::load_from_layers(&[cli]);
+    assert_eq!(cfg.kv.type_k, Some(crate::DType::Q4_0));
+    assert!(cfg.kv.type_k_specified && cfg.kv.type_v_specified);
+    let none = Config::load_from_layers(&[]);
+    assert!(!none.kv.type_k_specified && !none.kv.type_v_specified);
+}

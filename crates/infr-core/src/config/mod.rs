@@ -821,6 +821,12 @@ impl Config {
         }
         let mut cfg = Config::default();
         merged.apply(&mut cfg);
+        // A K/V format that ANY layer named (env, config file, `--set kv.type_k=q4_0`) is a named
+        // request. Only the env layer used to set `*_specified`, so a `--set`/TOML q4_0 reached the
+        // runner's dtype but not the placement, which priced the context as F16/F16, refused 64k and
+        // 120k, and auto-picked q8_0 at 32k (LucinaInference stage 2, 2026-11-08 window 3).
+        cfg.kv.type_k_specified |= cfg.kv.type_k.is_some();
+        cfg.kv.type_v_specified |= cfg.kv.type_v.is_some();
         cfg
     }
 
