@@ -17,3 +17,7 @@ serde_json.workspace = true
 [[bin]]
 name = "lucina-parity"
 path = "src/main.rs"
+
+[dev-dependencies]
+lucina-rules = { path = "../lucina-rules" }
+tokenizers.workspace = true

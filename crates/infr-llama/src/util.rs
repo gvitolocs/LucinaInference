@@ -17,7 +17,7 @@ pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}
 /// group out case by case because its own regex engine lacks it). Without this arm the vocab fell
 /// through to the GPT-2 ByteLevel default and 34 of 144 corpus lines tokenized differently from
 /// llama.cpp (LucinaInference docs/lucina/stage1-parity.md, "Tokenizer").
-pub(crate) const QWEN35_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+pub const QWEN35_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// DeepSeek-LLM (V1) pre-tokenizer patterns — 6 successive splits applied in order
 /// (llama.cpp's `DEEPSEEK_LLM` pre-type, `src/llama-vocab.cpp`). See docs/deepseek.md §0.2.
