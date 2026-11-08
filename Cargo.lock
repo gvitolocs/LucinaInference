@@ -1554,9 +1554,14 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "half",
+ "lucina-rules",
  "memmap2",
  "rayon",
 ]
+
+[[package]]
+name = "lucina-rules"
+version = "0.2.0"
 
 [[package]]
 name = "macro_rules_attribute"

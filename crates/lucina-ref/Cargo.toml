@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+lucina-rules = { path = "../lucina-rules" }
 half.workspace = true
 memmap2.workspace = true
 rayon.workspace = true

@@ -1,6 +1,7 @@
 //! Minimal GGUF v2/v3 reader (metadata + tensor directory over an mmap). Written from the format as
 //! llama.cpp's `gguf.cpp` reads it; deliberately shares no code with the engine's loader.
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use lucina_rules::gguf_bounds as gb;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -52,6 +53,7 @@ pub struct Gguf {
     pub tensors: HashMap<String, TensorInfo>,
     map: memmap2::Mmap,
     data_start: usize,
+    align: u64,
 }
 
 struct Rd<'a> {
@@ -61,12 +63,14 @@ struct Rd<'a> {
 
 impl<'a> Rd<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.p + n > self.b.len() {
-            bail!("truncated gguf at byte {}", self.p);
-        }
-        let s = &self.b[self.p..self.p + n];
-        self.p += n;
+        // proved: end <= len (gguf_bounds::take_end)
+        let end = gb::take_end(self.p, n as u64, self.b.len()).ok_or_else(|| anyhow!("truncated gguf at byte {}", self.p))?;
+        let s = &self.b[self.p..end];
+        self.p = end;
         Ok(s)
+    }
+    fn remaining(&self) -> u64 {
+        self.b.len().saturating_sub(self.p) as u64
     }
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
@@ -75,8 +79,11 @@ impl<'a> Rd<'a> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
     fn string(&mut self) -> Result<String> {
-        let n = self.u64()? as usize;
-        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+        let n = self.u64()?;
+        if !gb::count_fits(n, 1, self.remaining()) {
+            bail!("string of {n} bytes at byte {} runs past the file", self.p);
+        }
+        Ok(String::from_utf8_lossy(self.take(n as usize)?).into_owned())
     }
     fn value(&mut self, t: u32) -> Result<Value> {
         Ok(match t {
@@ -91,8 +98,13 @@ impl<'a> Rd<'a> {
             8 => Value::Str(self.string()?),
             9 => {
                 let et = self.u32()?;
-                let n = self.u64()? as usize;
-                let mut v = Vec::with_capacity(n.min(1 << 20));
+                let n = self.u64()?;
+                // every element takes at least one byte: a count the file cannot hold is refused before allocating
+                if !gb::count_fits(n, 1, self.remaining()) {
+                    bail!("array of {n} elements at byte {} runs past the file", self.p);
+                }
+                let n = n as usize;
+                let mut v = Vec::with_capacity(n);
                 for _ in 0..n {
                     v.push(self.value(et)?);
                 }
@@ -119,8 +131,14 @@ impl Gguf {
         if !(2..=3).contains(&version) {
             bail!("unsupported GGUF version {version}");
         }
-        let n_tensors = r.u64()? as usize;
-        let n_kv = r.u64()? as usize;
+        let n_tensors = r.u64()?;
+        let n_kv = r.u64()?;
+        if !gb::count_fits(n_kv, gb::MIN_KV_BYTES, r.remaining()) {
+            bail!("{n_kv} metadata pairs cannot fit in the file");
+        }
+        if !gb::count_fits(n_tensors, gb::MIN_TENSOR_INFO_BYTES, r.remaining()) {
+            bail!("{n_tensors} tensors cannot fit in the file");
+        }
         let mut kv = HashMap::new();
         for _ in 0..n_kv {
             let k = r.string()?;
@@ -131,14 +149,23 @@ impl Gguf {
         for _ in 0..n_tensors {
             let name = r.string()?;
             let nd = r.u32()? as usize;
+            if nd == 0 || nd > gb::MAX_DIMS {
+                bail!("tensor {name}: {nd} dimensions (1..={} allowed)", gb::MAX_DIMS);
+            }
             let dims = (0..nd).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
             let ggml_type = r.u32()?;
             let offset = r.u64()?;
             tensors.insert(name.clone(), TensorInfo { name, dims, ggml_type, offset });
         }
-        let align = kv.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
-        let data_start = r.p.div_ceil(align) * align;
-        Ok(Self { kv, tensors, map, data_start })
+        let align = kv.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(32);
+        if align == 0 || !align.is_power_of_two() {
+            bail!("general.alignment {align} is not a power of two");
+        }
+        let data_start = gb::align_up(r.p as u64, align).ok_or_else(|| anyhow!("data section start overflows"))?;
+        if data_start > map.len() as u64 {
+            bail!("data section starts past the end of the file");
+        }
+        Ok(Self { kv, tensors, map, data_start: data_start as usize, align })
     }
 
     pub fn u(&self, key: &str) -> Result<u64> {
@@ -157,10 +184,12 @@ impl Gguf {
 
     /// Raw bytes of a tensor.
     pub fn bytes(&self, t: &TensorInfo) -> Result<&[u8]> {
-        let numel: u64 = t.dims.iter().product();
+        // proved (gguf_bounds): no overflowing element count, whole blocks, aligned offset, range inside the file
+        let numel = gb::numel(&t.dims).with_context(|| format!("tensor {}: bad dimensions {:?}", t.name, t.dims))?;
         let (blk, sz) = crate::quant::block_layout(t.ggml_type)?;
-        let n = (numel as usize / blk) * sz;
-        let s = self.data_start + t.offset as usize;
-        self.map.get(s..s + n).with_context(|| format!("tensor {} out of file bounds", t.name))
+        let (start, len) =
+            gb::tensor_span(self.map.len() as u64, self.data_start as u64, t.offset, numel, blk as u64, sz as u64, self.align)
+                .with_context(|| format!("tensor {} out of file bounds or misaligned", t.name))?;
+        Ok(&self.map[start as usize..(start + len) as usize])
     }
 }

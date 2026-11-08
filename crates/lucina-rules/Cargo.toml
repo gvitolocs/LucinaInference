@@ -1,0 +1,12 @@
+[package]
+name = "lucina-rules"
+description = "LucinaInference pure rules proved by Verus in place: GGUF bounds, dequant indexing, KV accounting, split coverage, GPU-window protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }
