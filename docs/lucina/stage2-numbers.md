@@ -58,3 +58,9 @@ the llama.cpp CPU oracle alone would flag the GPU as wrong there.
 | VRAM at 122,880 context, q4_0 | 5 min |
 | Restores and margins | 10 min |
 | **Total** | **about 2 h**, at night when build-host is cool; it can be split into three windows of about 40 minutes (correctness+VRAM, llama.cpp matrix, infr matrix+MTP) |
+
+## Inline q4_0 decode vs prepass (iGPU RADV, 2026-11-09)
+
+`crates/infr-vulkan/tests/kv_inline_q4_parity.rs` compares both legs with exact f64 attention over the same q4_0 data, at decode shapes
+nh 24 / nkv 4 / hd 256. The shader's claim that inline is byte-identical to the prepass does not hold at hd 256 on RADV. Inline is the
+accurate leg: relative error about 3e-7 against exact, while the prepass (q4_0 → f16 scratch) is off by 1.5e-4 to 3.3e-4 from f16 rounding of the dequantized values.

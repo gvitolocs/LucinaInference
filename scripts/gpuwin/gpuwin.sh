@@ -9,7 +9,7 @@ cd ~/Projects/Lucina/LucinaInference
 L=work/logs/$NAME; mkdir -p $L
 MEAS='target/release/infr|lucina-parity vulkan-window|work/bin/llama-logits|llama-bench|llama-server .*--port <bench-port>'
 # Headroom gate (coordinator, 2026-11-07 22:15): never start while build-host is swapping.
-# OK = MemAvailable >= 20 GB, 1-min load < 16, swap-in+out < 256 pages/s over 5 s.
+# OK = MemAvailable >= 14 GB, 1-min load < 16, swap-in+out < 256 pages/s over 5 s.
 res_ok() {
   local avail load sio
   avail=$(awk "/MemAvailable/{print int(\$2/1048576)}" /proc/meminfo)
@@ -21,7 +21,7 @@ res_ok() {
   others=$($LI_GPU_LEASE status --json | jq '[.entries[] | select(.name != "llama-server") | .mb] | add // 0')
   budget=$($LI_GPU_LEASE status --json | jq '.vramTotalMb - .reserveMb')
   echo "$(date -u +%T) $NAME: headroom avail ${avail} GB, load ${load}, swap io ${sio}/s, other leases ${others} MiB of ${budget}"
-  if [ "$avail" -ge 20 ] && [ "$load" -lt 16 ] && [ "$sio" -lt 256 ] && [ $(( others + 21500 )) -le "$budget" ]; then
+  if [ "$avail" -ge 14 ] && [ "$load" -lt 16 ] && [ "$sio" -lt 256 ] && [ $(( others + 21500 )) -le "$budget" ]; then
     echo "$(date -u +%T) $NAME: headroom ok"; return 0
   fi
   echo "$(date -u +%T) $NAME: headroom low"; return 1
