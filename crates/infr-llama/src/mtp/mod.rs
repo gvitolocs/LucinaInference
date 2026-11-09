@@ -92,7 +92,9 @@ pub struct MtpHeadWeights {
 /// The real fix is an accuracy mitigation (e.g. re-verify in f32 when the top-2 logit margin is
 /// below a threshold), NOT faster kernels — see `infr_vulkan`'s `mmv_int8_decode_dtypes` doc.
 pub fn mtp_enabled() -> bool {
-    false
+    // LucinaInference: `INFR_MTP_MEASURE=1` opens the park for GPU-window measurements only. It stays parked by default until
+    // `mtp_spec_matches_target_only_greedy` passes (see the WHY above).
+    std::env::var_os("INFR_MTP_MEASURE").is_some_and(|v| v == "1")
 }
 
 /// The SINGLE MTP opt-in decision the chat backends share (`chat::vulkan`/`chat::metal`/`chat::cpu`
