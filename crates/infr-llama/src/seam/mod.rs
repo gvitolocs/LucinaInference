@@ -999,6 +999,15 @@ pub(crate) fn pin_kv_auto_q8() {
     });
 }
 
+/// The (K, V) formats the dense placement prices. A format the user named is what the runner allocates, so it is what
+/// has to be priced: pricing `--set kv.type_k=q4_0` as f16 refused context 122880 for a 32 GB cache that is really 2.3 GB.
+/// A side left unnamed takes the auto rung (`q8_0` when pinned, else f16).
+pub(crate) fn placement_kv_fmts(ec: &EngineConfig, q8: bool) -> (DType, DType) {
+    let auto = if q8 { DType::Q8_0 } else { DType::F16 };
+    let side = |specified: bool, dt: Option<DType>| if specified { dt.unwrap_or(DType::F16) } else { auto };
+    (side(ec.kv.type_k_specified, ec.kv.type_k), side(ec.kv.type_v_specified, ec.kv.type_v))
+}
+
 /// True when the user expressed NO explicit KV-format choice — the only state auto-q8 may fill.
 ///
 /// Use the `*_specified` flags, NOT `type_k.is_some()`. An unrecognized format name
@@ -2222,10 +2231,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
         // (see `kv_rows`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
         // KV small enough to take the try-resident tier at real contexts instead of streaming.
-        let kv_fmts = |q8: bool| {
-            let side = if q8 { DType::Q8_0 } else { DType::F16 };
-            (side, side)
-        };
+        let kv_fmts = |q8: bool| placement_kv_fmts(ec, q8);
         // Does weights + KV + the honest activation reserve fit at this (chunk, fmt)? Through the
         // SHARED predicate, so this decision and `kv_fit_ctx_for`'s price the same session against
         // the same ceiling — the ALLOCATOR's (`VramInfo::alloc_room`), not the raw free figure.
@@ -3828,6 +3834,22 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
+    #[test]
+    fn placement_prices_the_named_kv_format() {
+        let mut ec = EngineConfig::default();
+        assert_eq!(super::placement_kv_fmts(&ec, false), (DType::F16, DType::F16));
+        assert_eq!(super::placement_kv_fmts(&ec, true), (DType::Q8_0, DType::Q8_0));
+        ec.kv.type_k = Some(DType::Q4_0);
+        ec.kv.type_k_specified = true;
+        ec.kv.type_v = Some(DType::Q4_0);
+        ec.kv.type_v_specified = true;
+        assert_eq!(super::placement_kv_fmts(&ec, false), (DType::Q4_0, DType::Q4_0));
+        assert_eq!(super::placement_kv_fmts(&ec, true), (DType::Q4_0, DType::Q4_0), "a named side beats the auto rung");
+        ec.kv.type_v = None;
+        ec.kv.type_v_specified = false;
+        assert_eq!(super::placement_kv_fmts(&ec, true), (DType::Q4_0, DType::Q8_0));
+    }
+
     use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
 
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function

@@ -4,11 +4,7 @@ cd ~/Projects/Lucina/LucinaInference
 source scripts/gpuwin/win-common.sh
 M=~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf
 LB=~/llama.cpp/build/bin/llama-bench
-P="-m $M -ngl 99 -fa 1 -ctk q4_0 -ctv q4_0 -ub 256 -b 512 -o json"
-step lb_pp_d0 $LB $P -p 512,4096 -n 0 -r 3
-step lb_tg_d0_d4k $LB $P -p 0 -n 128 -d 0,4096 -r 3
-step lb_pp512_d4k $LB $P -p 512 -n 0 -d 4096 -r 3
-step lb_deep $LB $P -p 512 -n 128 -d 32768,65536,120000 -r 1
+P="-m $M -ngl 99 -fa 1 -ctk q4_0 -ctv q4_0 -ub 256 -b 256 -o json"
 KEYF=~/.config/llama-server-api.key
 ~/llama.cpp/build/bin/llama-server -m $M --host 127.0.0.1 --port <bench-port> --no-webui --api-key-file $KEYF \
   -ngl 99 -c 122880 -np 1 --flash-attn on --jinja --reasoning off --no-reasoning-preserve \
@@ -18,4 +14,5 @@ for i in $(seq 1 180); do [ "$(curl -s -m 2 -o /dev/null -w "%{http_code}" http:
 echo "$(date -u +%T) private llama-server health $(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:<bench-port>/health)"
 step client_llama_mtp target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --api-key-file $KEYF --model qwen3.8 \
   --requests work/long/requests.jsonl --repeat 2 --out $L/client-llama-mtp.json
+step client_llama_depth target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --model qwen3.8 --requests work/long/depth.jsonl --repeat 1 --timeout-s 900 --out $L/client-llama-depth.json
 kill $SRV; sleep 3; kill -9 $SRV 2>/dev/null

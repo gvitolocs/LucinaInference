@@ -8,5 +8,6 @@ step() { # name, cmd...
   echo "$(date -u +%T) START $n (${t}s left)"
   local s0; s0=$(date +%s)
   timeout -k 5 "$t" "$@" > $L/$n.log 2>&1
-  echo "$(date -u +%T) END $n exit $? after $(( $(date +%s) - s0 )) s"
+  local rc=$?
+  echo "$(date -u +%T) END $n exit $rc after $(( $(date +%s) - s0 )) s"
 }

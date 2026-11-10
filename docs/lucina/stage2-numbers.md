@@ -64,3 +64,20 @@ the llama.cpp CPU oracle alone would flag the GPU as wrong there.
 `crates/infr-vulkan/tests/kv_inline_q4_parity.rs` compares both legs with exact f64 attention over the same q4_0 data, at decode shapes
 nh 24 / nkv 4 / hd 256. The shader's claim that inline is byte-identical to the prepass does not hold at hd 256 on RADV. Inline is the
 accurate leg: relative error about 3e-7 against exact, while the prepass (q4_0 → f16 scratch) is off by 1.5e-4 to 3.3e-4 from f16 rounding of the dequantized values.
+
+## Night 3 (2026-11-10, q4_0 KV, ub 256, RX 7900 XTX)
+
+| Row | infr | llama.cpp |
+| --- | --- | --- |
+| pp512 d0 | 993 t/s | none: llama-bench aborts |
+| pp4096 d0 | 952 t/s | none |
+| pp512 d4k | 914 t/s | none |
+| tg128 d0 | 35.7 t/s (no MTP) | none |
+| tg128 d4k | 34.4 t/s (no MTP) | none |
+| served decode, real requests | no run: serve refused | 62.6 t/s median, with MTP |
+| d32k | pp512 292, tg128 2.7 (paging, see below) | none |
+| d64k, d120k | refused | none |
+
+Inline vs prepass tg128: 35.2 vs 35.6 at d0, 33.9 vs 34.4 at d4k (inline about 1% slower).
+The d32k paging and the 64k/120k refusals had one cause: the dense placement priced a named q4_0 KV as f16 (32 GB at 122,880 instead of 2.3).
+Fixed by `placement_kv_fmts`. llama-bench aborts at this llama.cpp pin even on CPU (`llama_decode` falls to `encode`, n_backends 0), so the baseline moved to `llama-server` with the client.

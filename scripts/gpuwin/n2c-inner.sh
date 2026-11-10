@@ -21,6 +21,7 @@ replay() { # $1 = label, rest = env assignments
   echo "$(date -u +%T) infr serve $tag health $(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:<bench-port>/health)"
   step client_infr_$tag target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --model qwen3.8 \
     --requests work/long/requests.jsonl --repeat 2 --out $L/client-infr-$tag.json
+  step client_infr_depth_$tag target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --model qwen3.8 --requests work/long/depth.jsonl --repeat 1 --timeout-s 900 --out $L/client-infr-depth-$tag.json
   kill $SRV; sleep 3; kill -9 $SRV 2>/dev/null
 }
 # MTP is parked by default in infr; INFR_MTP_MEASURE=1 opens it for this measurement. The plain row is the honest baseline.
