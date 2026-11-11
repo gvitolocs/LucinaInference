@@ -1254,6 +1254,13 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
+            // LucinaInference: a qwen35 DeltaNet layer has no KV cache, only its fixed conv/S state (what the runner
+            // allocates, `kv_layer_alloc_bytes`). Pricing it as a full-context KV made the 27B's q4_0 cache at 122880
+            // 9.06 GB instead of 2.3 and refused the production context.
+            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
+                let (k, v) = kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, k_fmt, v_fmt);
+                return (k + v) as u64;
+            }
             let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS;
             // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
             // and it has no V side (see `kv_row_elems`).
@@ -3834,6 +3841,17 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
+    /// The production 27B (qwen35: 48 DeltaNet + 16 attention layers) prices only its attention layers as KV.
+    #[test]
+    fn qwen35_deltanet_layers_are_not_priced_as_kv() {
+        let path = "~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf";
+        let Ok(g) = infr_gguf::Gguf::open(std::path::Path::new(path)) else { eprintln!("skip: no {path}"); return };
+        let cfg = crate::Config::from_gguf(&g).expect("config");
+        let est = super::kv_bytes_estimate_fmt(&cfg, 122880, false, 256, DType::Q4_0, DType::Q4_0);
+        // 16 layers x 4 kv heads x 256 x 122880 x 2 sides x 18/32 bytes = 2.26 GB, plus the DeltaNet state and slop
+        assert!(est > 2_200_000_000 && est < 2_700_000_000, "q4_0 KV at 122880 priced at {est} bytes");
+    }
+
     #[test]
     fn placement_prices_the_named_kv_format() {
         let mut ec = EngineConfig::default();

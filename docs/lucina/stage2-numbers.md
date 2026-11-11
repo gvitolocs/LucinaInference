@@ -81,3 +81,10 @@ accurate leg: relative error about 3e-7 against exact, while the prepass (q4_0 â
 Inline vs prepass tg128: 35.2 vs 35.6 at d0, 33.9 vs 34.4 at d4k (inline about 1% slower).
 The d32k paging and the 64k/120k refusals had one cause: the dense placement priced a named q4_0 KV as f16 (32 GB at 122,880 instead of 2.3).
 Fixed by `placement_kv_fmts`. llama-bench aborts at this llama.cpp pin even on CPU (`llama_decode` falls to `encode`, n_backends 0), so the baseline moved to `llama-server` with the client.
+
+## Night 4 (2026-11-11)
+
+With q4_0 priced correctly: tg128 25.0 t/s at d32k (from 2.7), pp512 558 at d32k, 234 at d64k (paged), tg128 4.4 at d64k (paged).
+The pricing still counted the 48 DeltaNet layers as full-context KV (9.06 GB at 122880 instead of about 2.3), so 120k and serve were still refused.
+Fixed: `kv_bytes_estimate_fmt` prices those layers by their fixed state, as the runner allocates them.
+llama.cpp, served with MTP, real requests: 75.7 t/s on `refactor`, 58.4 t/s on `danish`. Its depth rows failed with HTTP 401 (the client lacked the key file), fixed for night 5.

@@ -14,5 +14,5 @@ for i in $(seq 1 180); do [ "$(curl -s -m 2 -o /dev/null -w "%{http_code}" http:
 echo "$(date -u +%T) private llama-server health $(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:<bench-port>/health)"
 step client_llama_mtp target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --api-key-file $KEYF --model qwen3.8 \
   --requests work/long/requests.jsonl --repeat 2 --out $L/client-llama-mtp.json
-step client_llama_depth target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --model qwen3.8 --requests work/long/depth.jsonl --repeat 1 --timeout-s 900 --out $L/client-llama-depth.json
+step client_llama_depth target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --api-key-file $KEYF --model qwen3.8 --requests work/long/depth.jsonl --repeat 1 --timeout-s 900 --out $L/client-llama-depth.json
 kill $SRV; sleep 3; kill -9 $SRV 2>/dev/null
