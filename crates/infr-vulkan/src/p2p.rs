@@ -245,18 +245,26 @@ impl VulkanBackend {
             }
         };
 
+        let mut buf = VkBuffer {
+            shared: Arc::clone(&self.shared),
+            buffer,
+            backing: Backing::External { memory },
+            size,
+            mem_size: req.size,
+            location: MemoryLocation::GpuOnly,
+            sub_offset: 0,
+            own_addr: None,
+            // Outside the budget guard by design (see `Backing::External`), but NOT outside the
+            // ledger: this is committed device memory that carries no `VramCharge`, so it is the
+            // `untracked` row's, and a refusal that could otherwise only say "unexplained" can now
+            // see it.
+            vram: None,
+            vram_untracked: None,
+        };
+        self.tag_untracked(&mut buf, crate::vram_stats::UNTRACKED_P2P);
+
         Ok(P2pExport {
-            buf: VkBuffer {
-                shared: Arc::clone(&self.shared),
-                buffer,
-                backing: Backing::External { memory },
-                size,
-                mem_size: req.size,
-                location: MemoryLocation::GpuOnly,
-                sub_offset: 0,
-                own_addr: None,
-                vram: None,
-            },
+            buf,
             fd,
             mem_size: req.size,
             size,
@@ -391,7 +399,7 @@ impl VulkanBackend {
             return Err(be(format!("p2p_import bind_buffer_memory: {e}")));
         }
 
-        Ok(Box::new(VkBuffer {
+        let mut buf = VkBuffer {
             shared: Arc::clone(&self.shared),
             buffer,
             backing: Backing::External { memory },
@@ -400,7 +408,14 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr: None,
+            // As on the export side: an imported allocation ALIASES device A's pages, so its bytes
+            // are real here and claimed by no usage row. It is the one case where `driver` and
+            // `untracked` can legitimately disagree about who owns them — the same physical memory
+            // counted by two devices — which is why the label says `p2p` and not `weights`.
             vram: None,
-        }))
+            vram_untracked: None,
+        };
+        self.tag_untracked(&mut buf, crate::vram_stats::UNTRACKED_P2P);
+        Ok(Box::new(buf))
     }
 }

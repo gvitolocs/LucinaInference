@@ -35,7 +35,9 @@ pub use recorder::{FlashStage, RecordedCmd, Recorder};
 pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
 pub use tp_allreduce::{AllReduce, AllReduceMode};
 pub use tp_sem::{TpExportSemaphore, TpImportSemaphore};
-pub use vram_stats::{VramBreakdown, VramCharge, VramCounters};
+pub use vram_stats::{
+    HeapCommitted, UntrackedCharge, VramBreakdown, VramCharge, VramCommitted, VramCounters,
+};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
 /// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
@@ -539,6 +541,17 @@ struct VkBuffer {
     /// type's own field drop ([`VramCharge`] is RAII), set only by `make_alloc` /
     /// [`VulkanBackend::alloc_arena_bda`].
     vram: Option<VramCharge>,
+    /// The COMMITTED-bytes counterpart, for a buffer whose allocation `vram` does NOT describe (see
+    /// [`vram_stats::UntrackedCharge`]): either it carries no `VramCharge` at all — a resident-BDA
+    /// arena block, a staging-ring slot, a transient upload/download staging buffer, a P2P
+    /// allocation — or it is a byte range OF such an allocation (a `Backing::BdaSub` weight, whose
+    /// logical bytes the `weights` row does claim, so they leave the arena block's untracked tally
+    /// for as long as the tensor lives). `None` for everything `make_alloc` charges directly, which
+    /// is the whole point: an allocation must be in exactly one of the two tallies, or the
+    /// breakdown's `logical + untracked ≈ driver` ledger double counts it. Boxed: this token is pure
+    /// bookkeeping, and inline it would grow every buffer handle by 40 bytes — `VkBuffer` sits
+    /// inside `pipeline::Handoff`, where clippy reads that as a variant-size cliff.
+    vram_untracked: Option<Box<UntrackedCharge>>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -562,6 +575,24 @@ impl VkBuffer {
             // External P2P memory is never host-mapped — reads/writes route through the staging
             // copy path (device A owns the pages; device B aliases them over PCIe).
             Backing::External { .. } => None,
+        }
+    }
+
+    /// Device-memory bytes actually COMMITTED for this buffer — the unit the ledger's right-hand
+    /// side works in, as opposed to `size` (what the caller asked for) or `mem_size` (that, rounded
+    /// for alignment).
+    ///
+    /// A pooled allocation reports gpu-allocator's OWN size for it: for a dedicated allocation that
+    /// is the whole `VkDeviceMemory`, for a sub-allocation just the range it occupies inside a
+    /// block (the block's leftover is the line's `slack` term, which is per block, not per buffer).
+    /// A `BdaSub` commits nothing by itself — every byte of it belongs to its arena block — so it
+    /// reports 0; that is also why such a handle carries a CARVE token (bytes handed BACK to the
+    /// block's untracked tally) instead of a charge of its own.
+    fn committed_bytes(&self) -> u64 {
+        match &self.backing {
+            Backing::Pooled(a) => a.size(),
+            Backing::Vram { .. } | Backing::External { .. } => self.mem_size,
+            Backing::BdaSub(_) => 0,
         }
     }
 }
@@ -1137,6 +1168,56 @@ fn vram_info(s: &VulkanShared) -> VramInfo {
         live: s.has_mem_budget,
         uma,
     }
+}
+
+/// The driver's COMMITTED per-heap figures, for the breakdown line only — `(heaps, total usage,
+/// live)`, over exactly the heaps [`vram_info`] budgets against (device-local on a discrete card,
+/// every heap on a unified part) so the line's `driver heap` figure is the number the guard's
+/// refusal quotes.
+///
+/// DELIBERATELY NOT REUSED by `vram_info`/`device_local_room`, which stay as they are: those are the
+/// allocation-deciding paths and this exists to report. The one real difference is that this passes
+/// `heapUsage` through raw where the guard's free figure clamps each heap to its size — an
+/// oversubscribed heap should read in the line as the 26 GiB the driver says it used, not as the 24
+/// GiB it was allowed to have.
+///
+/// `live` false means `VK_EXT_memory_budget` was never enabled, so there is no driver figure to
+/// report and `heaps` is empty; the caller falls back to its own tracked tally and SAYS so in the
+/// line.
+fn heap_committed(s: &VulkanShared) -> (Vec<HeapCommitted>, u64, bool) {
+    if !s.has_mem_budget {
+        return (Vec::new(), 0, false);
+    }
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props2 = vk::PhysicalDeviceMemoryProperties2::default();
+    props2 = props2.push_next(&mut budget);
+    unsafe {
+        s.instance
+            .get_physical_device_memory_properties2(s.physical_device, &mut props2)
+    };
+    let mp = props2.memory_properties;
+    let uma = s.caps.unified_memory;
+    let mut heaps = Vec::new();
+    let mut usage = 0u64;
+    for i in 0..mp.memory_heap_count as usize {
+        let device_local = mp.memory_heaps[i]
+            .flags
+            .contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        if !(uma || device_local) {
+            continue;
+        }
+        // `heapUsage` raw, unsigned (`DeviceSize`): what EVERY process holds on this heap.
+        let used = budget.heap_usage[i];
+        heaps.push(HeapCommitted {
+            index: i as u32,
+            device_local,
+            usage: used,
+            budget: budget.heap_budget[i],
+            size: mp.memory_heaps[i].size,
+        });
+        usage += used;
+    }
+    (heaps, usage, true)
 }
 
 /// RAII scope for a weight-load progress bar (see [`VulkanBackend::weight_progress`]). While alive,
@@ -2934,21 +3015,77 @@ impl VulkanBackend {
     }
 
     /// WHAT the device memory this backend holds is, as a [`VramBreakdown`]: live and peak bytes
-    /// per [`BufferUsage`] class, plus the same pair per scratch-pool tag for the pooled
-    /// `Activations` allocations (see [`vram_stats`]).
+    /// per [`BufferUsage`] class, the same pair per scratch-pool tag and per untracked label, and
+    /// the committed view ([`vram_committed`](Self::vram_committed)) that lets the three be checked
+    /// against each other (see [`vram_stats`]).
     ///
     /// `vram()` answers "how much is free?"; this answers "who holds the rest" — the question the
-    /// budget guard's refusal raises and `device_used` (one running total) cannot. Both figures are
-    /// LOGICAL requested bytes, not committed ones; see the module doc for what that leaves out.
-    /// Cheap: atomic loads plus one lock on the tag map, safe to call from a failure path.
+    /// budget guard's refusal raises and `device_used` (one running total) cannot. The usage rows
+    /// are LOGICAL requested bytes, the committed view is not; that gap is the point of printing
+    /// both. Cheap-ish: atomic loads, two small map locks, one driver query and one allocator
+    /// report, safe to call from a failure path.
     pub fn vram_breakdown(&self) -> VramBreakdown {
-        self.shared.vram_stats.snapshot()
+        let mut b = self.shared.vram_stats.snapshot();
+        b.committed = Some(self.vram_committed());
+        b
     }
 
     /// [`vram_breakdown`](Self::vram_breakdown)'s single-line rendering — the form the guard
     /// appends to its refusal and `infr bench` logs.
     pub fn vram_breakdown_line(&self) -> String {
-        self.shared.vram_stats.breakdown_line()
+        self.vram_breakdown().line()
+    }
+
+    /// The COMMITTED half of the line: what the driver says is reserved on the heaps the guard
+    /// budgets, what gpu-allocator says its blocks cost, and this backend's own device-local tally.
+    ///
+    /// Three numbers because they answer three different questions, and the difference between them
+    /// IS the diagnosis: `driver` includes other processes and everything the driver allocates for
+    /// itself (descriptor pools, command buffers, pipeline/shader memory, per-allocation metadata —
+    /// none of which goes through gpu-allocator, so no other row can ever explain it), `reserved` is
+    /// only this process's allocator blocks, `allocated` only the part of those a live allocation
+    /// occupies.
+    ///
+    /// Costs one `vkGetPhysicalDeviceMemoryProperties2` and one `generate_report()` (which walks
+    /// every live allocation) under the allocator lock — a reporting path's price, not an
+    /// allocation path's; call it from a refusal or a benchmark, never per token.
+    pub fn vram_committed(&self) -> VramCommitted {
+        let (heaps, driver, live) = heap_committed(&self.shared);
+        let tracked = self.shared.device_used.load(Ordering::Relaxed);
+        let (reserved, allocated, blocks, names) = {
+            let rep = self.shared.allocator.lock().unwrap().generate_report();
+            // Group the live allocations by their `make_buf_ex` label: `allocated` alone says how
+            // much, this says which kind of buffer it is.
+            let mut by_name: HashMap<&str, (u64, usize)> = HashMap::new();
+            for a in &rep.allocations {
+                let e = by_name.entry(a.name.as_str()).or_insert((0, 0));
+                e.0 += a.size;
+                e.1 += 1;
+            }
+            let mut names: Vec<(String, u64, usize)> = by_name
+                .into_iter()
+                .map(|(n, (bytes, count))| (n.to_string(), bytes, count))
+                .collect();
+            names.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            (
+                rep.total_reserved_bytes,
+                rep.total_allocated_bytes,
+                rep.blocks.len(),
+                names,
+            )
+        };
+        VramCommitted {
+            // Without the extension there is no driver to quote, so the slot holds this process's
+            // own committed bytes — and `driver_live` says so, which the line prints as a marker.
+            driver: if live { driver } else { tracked },
+            driver_live: live,
+            tracked,
+            reserved,
+            allocated,
+            blocks,
+            heaps,
+            names,
+        }
     }
 
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
@@ -3142,12 +3279,34 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr,
+            // NOT untracked, deliberately: both callers (`make_buf_ex`'s UMA spill and
+            // `alloc_kv_host`) return through `make_alloc`, which charges this buffer's bytes under
+            // its `BufferUsage`. A second tally here would count the same bytes twice. A future
+            // caller that keeps the buffer outside `make_alloc` must charge it explicitly.
             vram: None,
+            vram_untracked: None,
         })
     }
 
     fn make_buf(&self, size: usize, location: MemoryLocation, label: &str) -> Result<VkBuffer> {
         self.make_buf_ex(size, location, label, false, false)
+    }
+
+    /// Add `buf`'s COMMITTED bytes to the breakdown's `untracked` row, under `label` (the
+    /// `UNTRACKED_*` constants in [`vram_stats`]) — for an allocation that no `BufferUsage` entry
+    /// point will ever hand a [`VramCharge`], so the usage rows alone would leave it out of the
+    /// ledger entirely. Observation only: it changes nothing about the allocation itself, and the
+    /// bytes come back out when `buf` drops (the token is a field of it).
+    ///
+    /// Calling this on a buffer that DOES go through `make_alloc` is the one way to get the ledger
+    /// wrong — the same bytes would sit in both rows — so it belongs at the handful of sites that
+    /// keep the allocation for themselves, and nowhere else.
+    fn tag_untracked(&self, buf: &mut VkBuffer, label: &'static str) {
+        buf.vram_untracked = Some(Box::new(
+            self.shared
+                .vram_stats
+                .charge_untracked(label, buf.committed_bytes()),
+        ));
     }
 
     /// Allocate one KV-cache buffer in SYSTEM RAM (host-visible, non-device-local heap) WITH a
@@ -3273,6 +3432,14 @@ impl VulkanBackend {
                     // `sub_offset` — no own address needed here.
                     own_addr: None,
                     vram: None,
+                    // `vram` gets its weight charge from `make_alloc` a moment later (this is the
+                    // ONLY weight path), so these `size` bytes must come OUT of the block's
+                    // untracked tally or the arena would be counted twice.
+                    vram_untracked: Some(Box::new(
+                        self.shared
+                            .vram_stats
+                            .charge_carve(crate::vram_stats::UNTRACKED_ARENA, size as u64),
+                    )),
                 });
             }
         }
@@ -3290,13 +3457,19 @@ impl VulkanBackend {
                 self.shared.max_mem_alloc_size
             )));
         }
-        let block_buf = self.make_buf_ex(
+        let mut block_buf = self.make_buf_ex(
             block_bytes as usize,
             MemoryLocation::GpuOnly,
             "resident-bda",
             true,
             true,
         )?;
+        // The block itself is device memory NO usage row will ever claim: the tensors carved out of
+        // it are claimed individually (see the `vram_untracked` docs), so the block's committed
+        // bytes go in here and each tensor's logical bytes come back out of it as it is carved.
+        // What the row nets down to is the stranded tail + alignment padding — the part of a 16 GiB
+        // weight set that `weights` cannot see.
+        self.tag_untracked(&mut block_buf, crate::vram_stats::UNTRACKED_ARENA);
         let buffer = block_buf.buffer;
         // `make_buf_ex(device_address=true)` already stored the block's address in `own_addr`;
         // reuse it instead of a second identical `get_buffer_device_address`.
@@ -3322,6 +3495,11 @@ impl VulkanBackend {
             sub_offset: 0,
             own_addr: None,
             vram: None,
+            vram_untracked: Some(Box::new(
+                self.shared
+                    .vram_stats
+                    .charge_carve(crate::vram_stats::UNTRACKED_ARENA, size as u64),
+            )),
         })
     }
 
@@ -3502,7 +3680,13 @@ impl VulkanBackend {
             location,
             sub_offset: 0,
             own_addr,
+            // Neither tally is filled in here on purpose: `make_buf_ex` is the funnel for BOTH the
+            // `BufferUsage` allocations (`make_alloc` charges them a moment later) and the
+            // untracked ones (whose caller tags them — `tag_untracked`, `alloc_arena_bda`, the arena
+            // block). Deciding here would need a parameter that says which, and get it wrong exactly
+            // when a new caller appears.
             vram: None,
+            vram_untracked: None,
         })
     }
 
@@ -3801,11 +3985,12 @@ impl VulkanBackend {
         let mut bufs = Vec::with_capacity(RING_SLOTS);
         let mut fences = Vec::with_capacity(RING_SLOTS);
         for _ in 0..RING_SLOTS {
-            bufs.push(self.make_buf(
-                RING_SLOT_BYTES,
-                MemoryLocation::CpuToGpu,
-                "upload_staging",
-            )?);
+            let mut slot =
+                self.make_buf(RING_SLOT_BYTES, MemoryLocation::CpuToGpu, "upload_staging")?;
+            // 4 × 32 MiB the whole weight load pays for and no `BufferUsage` row ever claims —
+            // on a ReBAR card they are VRAM, and they are the allocator's bytes either way.
+            self.tag_untracked(&mut slot, crate::vram_stats::UNTRACKED_STAGING_RING);
+            bufs.push(slot);
             fences.push(
                 unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
                     .map_err(|e| be(format!("staging ring create_fence: {e}")))?,
@@ -3952,7 +4137,8 @@ impl Backend for VulkanBackend {
             return self.upload_staged_ring(vk_dst.buffer, vk_dst.sub_offset as u64, src);
         }
 
-        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
+        let mut staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_staging")?;
+        self.tag_untracked(&mut staging, crate::vram_stats::UNTRACKED_UPLOAD);
         let stg_ptr = staging
             .mapped_ptr()
             .ok_or_else(|| be("staging buffer is not mapped"))?;
@@ -4012,7 +4198,9 @@ impl Backend for VulkanBackend {
             unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, dst.as_mut_ptr(), dst.len()) };
         } else {
             // Readback path: device-local → staging → host.
-            let staging = self.make_buf(dst.len(), MemoryLocation::GpuToCpu, "download_staging")?;
+            let mut staging =
+                self.make_buf(dst.len(), MemoryLocation::GpuToCpu, "download_staging")?;
+            self.tag_untracked(&mut staging, crate::vram_stats::UNTRACKED_DOWNLOAD);
 
             let src_buf = vk_src.buffer;
             let stg_buf = staging.buffer;
