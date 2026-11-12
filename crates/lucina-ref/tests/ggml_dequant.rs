@@ -6,8 +6,20 @@ use std::process::Command;
 
 const ROWS: usize = 8;
 
-const M27: &str = "~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf";
-const M9: &str = "~/models/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf";
+fn model_path(rel: &str) -> PathBuf {
+    // Models live under LI_MODELS_DIR (see scripts/local.env.example); unset gives a path that
+    // cannot exist, which takes the skip in `check`.
+    let dir = std::env::var("LI_MODELS_DIR").unwrap_or_default();
+    PathBuf::from(format!("{dir}/{rel}"))
+}
+
+fn m27() -> PathBuf {
+    model_path("Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf")
+}
+
+fn m9() -> PathBuf {
+    model_path("qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf")
+}
 
 fn oracle_bin() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../work/bin/ggml-dequant")
@@ -15,9 +27,9 @@ fn oracle_bin() -> PathBuf {
 
 /// Dequantize `ROWS` rows of `tensor` in `model` with both ggml and the reference and require
 /// bit-identical f32 output.
-fn check(model: &str, tensor: &str) {
+fn check(model: PathBuf, tensor: &str) {
     let bin = oracle_bin();
-    let model_path = Path::new(model);
+    let model_path = model.as_path();
     if !model_path.is_file() || !bin.is_file() {
         eprintln!("skip: {} or {} is missing", model_path.display(), bin.display());
         return;
@@ -81,40 +93,40 @@ fn check(model: &str, tensor: &str) {
 
 #[test]
 fn q3_k_blk_0_ffn_up() {
-    check(M27, "blk.0.ffn_up.weight");
+    check(m27(), "blk.0.ffn_up.weight");
 }
 
 #[test]
 fn iq4_nl_blk_1_ffn_down() {
-    check(M27, "blk.1.ffn_down.weight");
+    check(m27(), "blk.1.ffn_down.weight");
 }
 
 #[test]
 fn iq3_s_blk_14_ffn_down() {
-    check(M27, "blk.14.ffn_down.weight");
+    check(m27(), "blk.14.ffn_down.weight");
 }
 
 #[test]
 fn iq4_xs_blk_0_ffn_down() {
-    check(M27, "blk.0.ffn_down.weight");
+    check(m27(), "blk.0.ffn_down.weight");
 }
 
 #[test]
 fn q4_k_token_embd() {
-    check(M27, "token_embd.weight");
+    check(m27(), "token_embd.weight");
 }
 
 #[test]
 fn q6_k_output() {
-    check(M27, "output.weight");
+    check(m27(), "output.weight");
 }
 
 #[test]
 fn q5_k_blk_3_attn_k() {
-    check(M9, "blk.3.attn_k.weight");
+    check(m9(), "blk.3.attn_k.weight");
 }
 
 #[test]
 fn q8_0_blk_0_ssm_out() {
-    check(M9, "blk.0.ssm_out.weight");
+    check(m9(), "blk.0.ssm_out.weight");
 }

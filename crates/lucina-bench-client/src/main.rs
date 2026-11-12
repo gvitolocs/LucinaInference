@@ -1,7 +1,7 @@
 //! lucina-bench-client: time streaming OpenAI chat completions identically against any server (llama-server, infr
 //! serve). Per request: time to first content token, decode tokens/s, token counts, the server's own `timings`.
 //!
-//!   lucina-bench-client --url http://127.0.0.1:<bench-port> --requests requests.jsonl --out results.json
+//!   lucina-bench-client --url http://127.0.0.1:<bench port> --requests requests.jsonl --out results.json
 //!       [--api-key-file F] [--model NAME] [--repeat N] [--timeout-s 600]
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};

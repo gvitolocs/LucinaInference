@@ -3,10 +3,10 @@
 ## Window 1: 5-minute probe (2026-11-07 21:36 UTC, owner-approved)
 
 Procedure (`work/window.sh`, kept in the gitignored work dir; logs in `work/logs/window/`):
-1. Held the coding-agent queue lock, after waiting for a running job to finish.
-2. Queued a GPU lease for 21,500 MiB, then stopped `llama-server-qwen` (the gateway answers "busy" while a lease waits).
+1. Held the queue lock, after waiting for a running job to finish.
+2. Queued a lease for 21,500 MiB with the GPU lease tool, then stopped `llama-server-qwen` (the gateway answers "busy" while a lease waits).
 3. Ran the probe.
-4. Restarted the unit, waited for `/health`, and sent one request through the gateway (:<gateway-port>, answer "42").
+4. Restarted the unit, waited for `/health`, and sent one request through the gateway (answer "42").
 
 Downtime was 21:36:05 to 21:37:23, 78 s, of which 50 s was GPU work. Model: Qwen3.8-27B-UD-Q4_K_XL. infr fork at 5a44c0a
 plus the `vulkan-window` probe. RADV, `RADV_PERFTEST=nogttspill`, Mesa 25.2.8. Tctl about 92 °C at the start.
@@ -57,7 +57,7 @@ the llama.cpp CPU oracle alone would flag the GPU as wrong there.
 | MTP: llama-server draft-mtp against `INFR_MTP=1` on a recorded agent replay | 15 min |
 | VRAM at 122,880 context, q4_0 | 5 min |
 | Restores and margins | 10 min |
-| **Total** | **about 2 h**, at night when build-host is cool; it can be split into three windows of about 40 minutes (correctness+VRAM, llama.cpp matrix, infr matrix+MTP) |
+| **Total** | **about 2 h**, at night when the build host is cool; it can be split into three windows of about 40 minutes (correctness+VRAM, llama.cpp matrix, infr matrix+MTP) |
 
 ## Inline q4_0 decode vs prepass (iGPU RADV, 2026-11-09)
 

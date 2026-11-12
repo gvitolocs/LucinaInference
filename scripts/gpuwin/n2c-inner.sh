@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Night 2, window C: infr with the same shapes and flags as window B (q4_0 KV, ub 256), then infr serve + MTP replay.
-cd ~/Projects/Lucina/LucinaInference
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd); cd "$ROOT"
+[ -f scripts/local.env ] && . scripts/local.env
+for v in LI_MODELS_DIR LI_BENCH_PORT; do [ -n "${!v:-}" ] || { echo "error: $v is unset; set it in scripts/local.env (see scripts/local.env.example)" >&2; exit 1; }; done
 source scripts/gpuwin/win-common.sh
-M=~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf
+M=$LI_MODELS_DIR/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf
 I="target/release/infr bench $M -u 256 --set kv.type_k=q4_0 --set kv.type_v=q4_0"
 step ib_pp512_d0 $I -p 512 -n 0 -r 3
 step ib_pp4096_d0 $I -p 4096 -n 0 -r 3
@@ -14,14 +16,14 @@ step ib_pp512_d64k $I -p 512 -n 0 -d 65536 -r 1
 step ib_pp512_d120k $I -p 512 -n 0 -d 120000 --ctx 122880 -r 1
 replay() { # $1 = label, rest = env assignments
   local tag=$1; shift
-  env "$@" target/release/infr serve $M --addr 127.0.0.1:<bench-port> --ctx 122880 -u 256 --no-think \
+  env "$@" target/release/infr serve $M --addr 127.0.0.1:$LI_BENCH_PORT --ctx 122880 -u 256 --no-think \
     --set kv.type_k=q4_0 --set kv.type_v=q4_0 > $L/infr-serve-$tag.log 2>&1 &
   SRV=$!
-  for i in $(seq 1 240); do [ "$(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:<bench-port>/health)" = 200 ] && break; sleep 1; done
-  echo "$(date -u +%T) infr serve $tag health $(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:<bench-port>/health)"
-  step client_infr_$tag target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --model qwen3.8 \
+  for i in $(seq 1 240); do [ "$(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:$LI_BENCH_PORT/health)" = 200 ] && break; sleep 1; done
+  echo "$(date -u +%T) infr serve $tag health $(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:$LI_BENCH_PORT/health)"
+  step client_infr_$tag target/release/lucina-bench-client --url http://127.0.0.1:$LI_BENCH_PORT --model qwen3.8 \
     --requests work/long/requests.jsonl --repeat 2 --out $L/client-infr-$tag.json
-  step client_infr_depth_$tag target/release/lucina-bench-client --url http://127.0.0.1:<bench-port> --model qwen3.8 --requests work/long/depth.jsonl --repeat 1 --timeout-s 900 --out $L/client-infr-depth-$tag.json
+  step client_infr_depth_$tag target/release/lucina-bench-client --url http://127.0.0.1:$LI_BENCH_PORT --model qwen3.8 --requests work/long/depth.jsonl --repeat 1 --timeout-s 900 --out $L/client-infr-depth-$tag.json
   kill $SRV; sleep 3; kill -9 $SRV 2>/dev/null
 }
 # MTP is parked by default in infr; INFR_MTP_MEASURE=1 opens it for this measurement. The plain row is the honest baseline.

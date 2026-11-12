@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Regression check of the oracle's new --tokens / --positions path on CPU (waits for Tctl < 88 °C).
-cd ~/Projects/Lucina/LucinaInference
-M=~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf; V=248320
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd); cd "$ROOT"
+[ -f scripts/local.env ] && . scripts/local.env
+[ -n "${LI_MODELS_DIR:-}" ] || { echo "error: LI_MODELS_DIR is unset; set it in scripts/local.env (see scripts/local.env.example)" >&2; exit 1; }
+M=$LI_MODELS_DIR/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf; V=248320
 # gate (coordinator): MemAvailable >= 20 GB, load < 16, Tctl < 88 C; 3 threads, CPUQuota 300%
 ok() { [ "$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)" -ge 20 ] && [ "$(awk '{print int($1)}' /proc/loadavg)" -lt 16 ] && [ "$(sensors | awk '/Tctl/{gsub(/[+°C]/,"",$2); print int($2)}')" -lt 88 ]; }
 until ok; do sleep 60; done

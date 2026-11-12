@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! bash oracle/build.sh
-//! work/bin/llama-logits --model ~/models/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf \
+//! work/bin/llama-logits --model "$LI_MODELS_DIR/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf" \
 //!   --prompt-file oracle/prompts/chat.txt --out work/ref/q35-9b-chat-b512 --ubatch 512 --threads 8
 //! # same but --threads 4                -> --out work/ref/q35-9b-chat-b512t4
 //! # same but --one-by-one               -> --out work/ref/q35-9b-chat-seq
@@ -27,10 +27,17 @@ use std::sync::Arc;
 
 const N_VOCAB: usize = 248320;
 
+/// Default 9B model path: under `LI_MODELS_DIR` (see scripts/local.env.example). Unset gives a path
+/// that cannot exist, which takes the normal self-skip below.
+fn q35_9b_default() -> String {
+    let dir = std::env::var("LI_MODELS_DIR").unwrap_or_default();
+    format!("{dir}/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf")
+}
+
 #[test]
 fn qwen35_9b_cpu_logits_match_llama_cpp() {
-    let model = std::env::var("LUCINA_PARITY_Q35_9B")
-        .unwrap_or_else(|_| "~/models/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf".into());
+    let model =
+        std::env::var("LUCINA_PARITY_Q35_9B").unwrap_or_else(|_| q35_9b_default());
     let ref_dir: PathBuf = std::env::var("LUCINA_PARITY_REF_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -93,8 +100,8 @@ fn qwen35_9b_cpu_logits_match_llama_cpp() {
 /// Self-skips when the f64 file or the oracle files are missing.
 #[test]
 fn qwen35_9b_cpu_logits_within_2x_of_llama_cpp_distance_from_f64() {
-    let model = std::env::var("LUCINA_PARITY_Q35_9B")
-        .unwrap_or_else(|_| "~/models/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf".into());
+    let model =
+        std::env::var("LUCINA_PARITY_Q35_9B").unwrap_or_else(|_| q35_9b_default());
     let work = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../work");
     let f64_path = work.join("f64/q35-9b-chat.logits.f32");
     let tokens_path = work.join("ref/q35-9b-chat-b512.tokens.txt");

@@ -1,6 +1,7 @@
 # Shared mutant harness for verification/lucina-*/mutants.sh (sourced). Each `try FILE FROM TO` plants one bug in a
 # copy of crates/lucina-rules/src and the entry, and Verus has to refuse it. Set ENTRY before sourcing.
 set -uo pipefail
+[ -f scripts/local.env ] && . scripts/local.env
 verus=${VERUS:-verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/lucina-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT

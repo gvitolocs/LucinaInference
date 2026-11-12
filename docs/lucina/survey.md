@@ -1,9 +1,9 @@
 # LucinaInference stage 0: survey of Rust llama.cpp replacements (2026-11-07)
 
-Goal: a full-Rust engine that replaces llama.cpp on build-host for **Qwen3.8-27B UD-Q4_K_XL** on the
+Goal: a full-Rust engine that replaces llama.cpp on the build host for **Qwen3.8-27B UD-Q4_K_XL** on the
 **RX 7900 XTX through Vulkan**, at llama.cpp speed or better, then runs on Juno (AArch64 NEON).
 
-## The target, read from the GGUF on build-host
+## The target, read from the GGUF on the build host
 
 `~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf` (17.56 GB):
 
@@ -23,7 +23,7 @@ Goal: a full-Rust engine that replaces llama.cpp on build-host for **Qwen3.8-27B
 Sources: `~/Projects/AI/benchmarks/inference-2026-10-23/PROGRESS.md` ("Result and decision"),
 `~/Projects/AI/Orchestra/QWEN_DO_ISSUES.md`, Orchestra memory `strata-default-provider.md`.
 
-- Strata on build-host was a **HIP/ROCm** engine (gfx1100 code objects, hipBLASLt), not Vulkan, running the
+- Strata on the build host was a **HIP/ROCm** engine (gfx1100 code objects, hipBLASLt), not Vulkan, running the
   MoE **Qwen3.8-Flash-Next** at IQ2_XS / IQ1_M (68 GB on disk vs 63 GB RAM). Experts streamed from disk.
 - Problems in production: memory.high cgroup throttling (5.8 tok/s with a 12 GB reserve), swap full,
   freezes at 16-20k-token cold reads, `switch_failed` when the GPU was busy.
@@ -70,7 +70,7 @@ What LucinaInference adds on top, and what we do not trust until measured:
 1. An independent oracle harness against the pinned llama.cpp 3612199ed (`oracle/`), and logits
    parity tests on our own files (Qwen3.5-9B Q4_K_M, the 27B UD-Q4_K_XL). infr's own parity claims are
    not taken on faith.
-2. Measured prefill and decode on build-host against our production llama-server (same model, same context,
+2. Measured prefill and decode on the build host against our production llama-server (same model, same context,
    VRAM under 23.5 GB, `RADV_PERFTEST=nogttspill`).
 3. llama-server API compatibility that our gateway and clients rely on (slots, prompt cache,
    checkpoints, `/slots` save and restore, tool-call format), so it can drop in behind

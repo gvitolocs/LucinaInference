@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shows that verification/lucina-kv/rules.rs can fail. Run from the repo root on verus-host:
+# Shows that verification/lucina-kv/rules.rs can fail. Run from the repo root on the Verus host (see scripts/local.env.example):
 #   verus-remote <repo> bash verification/lucina-kv/mutants.sh
 ENTRY=lucina-kv
 source verification/mutant-lib.sh

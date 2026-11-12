@@ -16,3 +16,6 @@ Cargo.lock.bak
 /ref/
 target-prof/
 /work/
+
+# Local machine config (see scripts/local.env.example)
+scripts/local.env

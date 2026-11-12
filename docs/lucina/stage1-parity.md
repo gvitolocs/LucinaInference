@@ -2,7 +2,7 @@
 
 Engine under test: LucinaInference (infr fork, base f2f89cb), CPU reference backend
 (`SeamModel::verify_logits_and_h_cpu`, all positions). Original: llama.cpp 3612199ed (production build on
-build-host), CPU backend only, through `oracle/llama-logits` (no device offered, op offload off).
+the build host), CPU backend only, through `oracle/llama-logits` (no device offered, op offload off).
 
 ## Method
 
@@ -60,7 +60,7 @@ What this also shows:
   had no visible effect on this prompt. The cause was not investigated, so those two runs add nothing to
   the spread.
 
-Timings (build-host, Tctl 88-96 °C, other sessions busy, so not a speed benchmark): llama.cpp CPU 92-109 s
+Timings (the build host, Tctl 88-96 °C, other sessions busy, so not a speed benchmark): llama.cpp CPU 92-109 s
 per batch run, 349 s token by token; infr CPU 55 s; lucina-ref f64 185 s.
 
 ## Qwen3.8-27B UD-Q4_K_XL (the production file), CPU
@@ -97,7 +97,7 @@ Consequences:
 - A GPU path that keeps activations in f16 will be **closer** to exact math than llama.cpp CPU at such
   tokens. Stage 2 therefore gates the GPU against both references and llama.cpp Vulkan's own spread.
 
-Timings (other sessions loading build-host; not a benchmark): llama.cpp CPU 34 s batch, 231 s token by token; infr
+Timings (other sessions loading the build host; not a benchmark): llama.cpp CPU 34 s batch, 231 s token by token; infr
 CPU 21 s; lucina-ref f64 101 s.
 
 ## Sensitivity: does the gate catch real bugs?

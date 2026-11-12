@@ -3,7 +3,7 @@
 Goal: LucinaInference (infr fork) runs the production model `Qwen3.8-27B-UD-Q4_K_XL` on the 7900 XTX at
 llama.cpp's speed or better, at production context, under 23.5 GB VRAM, with logits within the stage 1
 tolerance. Nothing in this stage changes production; every GPU run happens in a window the coordinator
-grants (llama-server-qwen stopped through its unit, the GPU taken through `the GPU lease tool`).
+grants (llama-server-qwen stopped through its unit, the GPU taken through the lease tool).
 
 ## The bar we have to meet (production today)
 
@@ -33,9 +33,9 @@ uses q4_0 KV plus MTP, so those ratios do not carry over. Step 3 measures them a
 
 - Ask the coordinator for a window. Stop `llama-server-qwen` (the proxy then answers "unavailable", the
   other lanes fall through). Record the start and end in `ops_record`.
-- Every run: `the GPU lease tool run --name lucina-inference --mb <measured> --`, the production env above,
+- Every run: the GPU lease tool (`run --name lucina-inference --mb <measured> --`), the production env above,
   `systemd-run --user --scope -p MemoryMax=...`. Stop everything at the end and restart the unit; check
-  `/health` on :<gateway-port>.
+  `/health` on the production server.
 
 ### 2. Correctness on the GPU
 
@@ -73,7 +73,7 @@ Numbers go to `docs/lucina/stage2-numbers.md` with the commit, the Mesa version 
 - Measure `drm-memory-vram` from `/proc/<pid>/fdinfo` at load, after a 120k-token prefill, and at peak during
   decode, for ctx 81,920 and 122,880, q4_0 KV.
 - Hard limit 23.5 GB (above it RADV spills to GTT and decode drops to about 3.7 tok/s). Target: no more than
-  production's 21.5 GB lease, so the GPU lease tool ledger does not change.
+  production's 21.5 GB lease, so the lease ledger does not change.
 
 ### 5. Gaps expected from reading the fork (to confirm in step 2/3)
 
@@ -100,7 +100,7 @@ If a kernel is slower than llama.cpp's, port that ggml-vulkan shader (MIT, notic
 
 ## Stage 3 preview: drop-in behind the gateway
 
-`~/bin/llama-server-qwen-proxy.py` (:<gateway-port> → :<origin-port>) calls `/completion`, `/v1/chat/completions` (and
+`~/bin/llama-server-qwen-proxy.py` (the gateway, in front of the production server) calls `/completion`, `/v1/chat/completions` (and
 `/chat/completions`), `/slots` (save, restore, erase), `/health`, `/v1/models` (`/models`), `/metrics`.
 infr's server has `/v1/chat/completions`, `/v1/models`, `/health`, `/metrics`, `/status`. To add: `/completion`,
 `/slots` with save and restore, checkpoints, llama-server's sampler fields (`presence_penalty`, `top_k`, `min_p`,

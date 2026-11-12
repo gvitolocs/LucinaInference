@@ -41,4 +41,4 @@ licence_ours = "MIT"
 relation = "reference"
 confidence = "confirmed"
 rely_on = ["qwen35 forward (src/models/qwen35.cpp, delta-net-base.cpp)", "ggml CPU kernels", "ggml-vulkan shaders", "llama-server API, slots, checkpoints"]
-notes = "The production llama-server build on build-host. Source of truth for behaviour, logits and speed; oracle/ builds against it. MIT: kernels may be ported with the notice kept."
+notes = "The production llama-server build on the build host. Source of truth for behaviour, logits and speed; oracle/ builds against it. MIT: kernels may be ported with the notice kept."

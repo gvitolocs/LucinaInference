@@ -13,10 +13,13 @@ fn unescape(line: &str) -> String {
 #[test]
 fn qwen35_tokenizer_matches_llama_cpp_on_the_corpus() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Models live under LI_MODELS_DIR (see scripts/local.env.example); unset leaves the candidates
+    // empty, which takes the skip below.
+    let dir = std::env::var("LI_MODELS_DIR").unwrap_or_default();
     let candidates = [
         std::env::var("LUCINA_PARITY_QWEN35_MODEL").unwrap_or_default(),
-        "~/models/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf".into(),
-        "~/models/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf".into(),
+        format!("{dir}/Qwen3.8-27B-UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf"),
+        format!("{dir}/qwen3.5-9b/Qwen_Qwen3.5-9B-Q4_K_M.gguf"),
     ];
     let Some(model) = candidates.iter().find(|p| !p.is_empty() && Path::new(p).exists()) else {
         eprintln!("skip: no qwen35 GGUF found");

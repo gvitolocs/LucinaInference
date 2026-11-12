@@ -3,7 +3,7 @@
 //! through [`check_trace`] (`lucina-gate-check <log>`), so a run that broke the protocol is caught after the fact.
 //!
 //! The rules (coordinator, 2026-11-07/08): production (llama-server-qwen) is stopped only while this window holds the
-//! coding-agent queue lock and has seen enough headroom since taking it; the flock is released only once production is back
+//! queue lock and has seen enough headroom since taking it; the flock is released only once production is back
 //! and the gateway has answered; a window ends with the flock released and production up.
 #![allow(unexpected_cfgs)]
 
@@ -14,7 +14,7 @@ use vstd::prelude::*;
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ev {
-    /// `holding the coding-agent queue lock`
+    /// `holding the queue lock`
     Lock,
     /// a headroom check that passed (memory, load, swap, lease budget)
     HeadroomOk,
@@ -28,7 +28,7 @@ pub enum Ev {
     ProdStart,
     /// the gateway answered a request
     GatewayOk,
-    /// `releasing the coding-agent queue lock`
+    /// `releasing the queue lock`
     Release,
 }
 
@@ -244,14 +244,14 @@ pub fn parse_log(text: &str) -> Vec<Ev> {
         } else if l.contains(": headroom avail") {
             // older logs: a check passed when the script went on to wait for the flock or to stop
             let next = lines.get(i + 1).copied().unwrap_or("");
-            if next.contains("waiting for the coding-agent queue lock") || next.contains("stopping llama-server-qwen") {
+            if next.contains("waiting for the queue lock") || next.contains("stopping llama-server-qwen") {
                 out.push(Ev::HeadroomOk);
             } else {
                 out.push(Ev::HeadroomLow);
             }
         } else if l.contains("headroom gone while waiting") {
             out.push(Ev::Unlock);
-        } else if l.contains("holding the coding-agent queue lock") {
+        } else if l.contains("holding the queue lock") {
             out.push(Ev::Lock);
         } else if l.contains("stopping llama-server-qwen") {
             out.push(Ev::Stop);
@@ -259,7 +259,7 @@ pub fn parse_log(text: &str) -> Vec<Ev> {
             out.push(Ev::ProdStart);
         } else if l.contains("RESTORE: gateway answer: \"content\":\"") || l.contains("RESTORE: gateway confirmed") {
             out.push(Ev::GatewayOk);
-        } else if l.contains("releasing the coding-agent queue lock") {
+        } else if l.contains("releasing the queue lock") {
             out.push(Ev::Release);
         }
     }
@@ -288,10 +288,10 @@ mod tests {
 
     #[test]
     fn parses_the_scripts_lines() {
-        let log = "01:00 w: headroom avail 21 GB\n01:00 w: waiting for the coding-agent queue lock\n01:00 w: holding the coding-agent queue lock\n\
+        let log = "01:00 w: headroom avail 21 GB\n01:00 w: waiting for the queue lock\n01:00 w: holding the queue lock\n\
                    01:00 w: headroom avail 21 GB\n01:00 w: stopping llama-server-qwen (clock starts)\n\
                    01:10 RESTORE: started llama-server-qwen\n01:11 RESTORE: gateway answer: \"content\":\"42\"\n\
-                   01:11 w: releasing the coding-agent queue lock\n";
+                   01:11 w: releasing the queue lock\n";
         assert_eq!(parse_log(log), vec![HeadroomOk, Lock, HeadroomOk, Stop, ProdStart, GatewayOk, Release]);
     }
 }

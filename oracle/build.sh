@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Build the llama.cpp oracle against the pinned checkout (docs/upstreams.toml).
 set -euo pipefail
-LLAMA="${LLAMA_CPP:-~/llama.cpp}"
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+[ -f "$ROOT/scripts/local.env" ] && . "$ROOT/scripts/local.env"
+[ -n "${LI_LLAMA_CPP_DIR:-}" ] || { echo "error: LI_LLAMA_CPP_DIR is unset; set it in scripts/local.env (see scripts/local.env.example)" >&2; exit 1; }
+LLAMA="${LLAMA_CPP:-$LI_LLAMA_CPP_DIR}"
 here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/../work/bin"
 mkdir -p "$out"

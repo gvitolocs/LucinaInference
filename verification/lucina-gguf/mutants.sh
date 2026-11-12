@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Shows that verification/lucina-gguf/rules.rs can fail: each line plants one bug in a copy of the shipped file, and Verus
-# has to refuse it. Run from the repo root on verus-host: verus-remote <repo> bash verification/lucina-gguf/mutants.sh
+# has to refuse it. Run from the repo root on the Verus host (see scripts/local.env.example): verus-remote <repo> bash verification/lucina-gguf/mutants.sh
 set -uo pipefail
+[ -f scripts/local.env ] && . scripts/local.env
 verus=${VERUS:-verus}
 work=$(mktemp -d "${TMPDIR:-/tmp}/lucina-gguf-mutants.XXXXXX")
 trap 'rm -rf "${work:?}"' EXIT
