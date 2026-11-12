@@ -38,6 +38,24 @@ pub struct BenchPlacement {
     pub submit_cap: usize,
 }
 
+/// What the device held at the two points of a Vulkan bench — the VRAM twin of [`BenchPlacement`],
+/// reported by [`SeamModel::bench_vulkan`] because a throughput number alone cannot tell you what
+/// it cost to get.
+///
+/// Both snapshots must be taken — and handed out — INSIDE the bench: they come from the backend's
+/// own counters, which die with the backend that `bench_vulkan` opens and never returns. The bytes
+/// are LOGICAL allocations, not committed device memory — [`infr_vulkan::vram_stats`] says what
+/// that leaves out.
+#[derive(Clone, Debug)]
+pub struct BenchVram {
+    /// After the untimed warmup turn: weights uploaded, KV cache sized, the generic pipelines and
+    /// their scratch opened. What loading this model costs before any measurement.
+    pub after_load: infr_vulkan::VramBreakdown,
+    /// After the last timed rep: what the measured shape itself reached, with the activation and
+    /// pool-tag counters at their peaks.
+    pub after_run: infr_vulkan::VramBreakdown,
+}
+
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
 /// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
 /// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
@@ -1343,8 +1361,9 @@ impl SeamModel {
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
     /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,
     /// `n_gen > 0` = decode at depth, else prefill of `n_prompt` at depth. Returns the per-rep
-    /// tokens/sec samples AND the [`BenchPlacement`] the run actually used, so the number can be
-    /// attributed after the fact instead of being an unlabelled throughput figure.
+    /// tokens/sec samples, the [`BenchPlacement`] the run actually used and the [`BenchVram`] it
+    /// cost — so a number can be attributed after the fact instead of being an unlabelled,
+    /// unexplained throughput figure.
     pub fn bench_vulkan(
         &self,
         n_prompt: usize,
@@ -1352,7 +1371,7 @@ impl SeamModel {
         depth: usize,
         pg: Option<(usize, usize)>,
         reps: usize,
-    ) -> Result<(Vec<f64>, BenchPlacement)> {
+    ) -> Result<(Vec<f64>, BenchPlacement, BenchVram)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
@@ -1443,6 +1462,8 @@ impl SeamModel {
         };
         // Untimed warmup: uploads the weights and compiles the pipelines a generic turn hits.
         unprofiled(8, 2, &mut state)?;
+        // The load's cost, read while the backend that paid it is still alive — see [`BenchVram`].
+        let after_load = vk.vram_breakdown();
         // Untimed warm rep AT THE MEASURED SHAPE, discarded (backlog B6/B16). The (8, 2) turn
         // above does NOT cover the shape being timed — it prefills 7 rows and decodes 2 — so the
         // first TIMED rep was paying that shape's one-time costs (its pipeline variants, its
@@ -1478,6 +1499,12 @@ impl SeamModel {
                 kv_named: (self.ecfg.kv.type_k_specified || self.ecfg.kv.type_v_specified)
                     .then_some((self.ecfg.kv.type_k, self.ecfg.kv.type_v)),
                 submit_cap: vk.submit_cap_now(),
+            },
+            // Same reason as the placement: this is the last moment the counters are reachable, and
+            // the shape that was timed is what they measured.
+            BenchVram {
+                after_load,
+                after_run: vk.vram_breakdown(),
             },
         ))
     }

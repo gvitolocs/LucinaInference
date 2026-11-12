@@ -688,6 +688,9 @@ fn mmv_mw_choice(
 
 /// Get-or-alloc the pool buffer for (tag, bytes); returns the map key so callers can hold several
 /// pool buffers at once via immutable indexing (`pool[&k].as_ref()`).
+///
+/// The `tag` doubles as the VRAM breakdown's row for this scratch — every buffer allocated here is
+/// reported live/peak under it as well as under its usage class (see `vram_stats`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn pooled(
     pool: &mut ScratchPool,
@@ -698,7 +701,7 @@ fn pooled(
     let key = (tag, bytes.max(4));
     if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(key) {
         // alloc_uninit: every pooled buffer is fully written before read within each op.
-        e.insert(be_.alloc_uninit(key.1, BufferUsage::Activations)?);
+        e.insert(be_.alloc_uninit_tagged(key.1, BufferUsage::Activations, Some(tag))?);
     }
     Ok(key)
 }
@@ -5434,7 +5437,8 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
 
 /// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always
 /// `Activations`) — the paged MoE router-ids scratch needs `Staging` (host-visible, so the
-/// small-m split path's readback is a plain mapped memcpy with no extra submit).
+/// small-m split path's readback is a plain mapped memcpy with no extra submit). As in [`pooled`],
+/// the `tag` is also this buffer's row in the VRAM breakdown (`vram_stats`).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn pooled_usage(
     pool: &mut ScratchPool,
@@ -5445,7 +5449,7 @@ fn pooled_usage(
 ) -> Result<(&'static str, usize)> {
     let key = (tag, bytes.max(4));
     if let std::collections::hash_map::Entry::Vacant(e) = pool.entry(key) {
-        e.insert(be_.alloc_uninit(key.1, usage)?);
+        e.insert(be_.alloc_uninit_tagged(key.1, usage, Some(tag))?);
     }
     Ok(key)
 }

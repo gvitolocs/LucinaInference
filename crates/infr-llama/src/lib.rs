@@ -12,7 +12,7 @@ pub mod arch;
 pub mod chat;
 mod config;
 pub mod seam;
-pub use seam::model::{BenchPlacement, SeamModel};
+pub use seam::model::{BenchPlacement, BenchVram, SeamModel};
 pub mod diffusion;
 mod util;
 /// The qwen35 pre-tokenizer regex, public for LucinaInference split-coverage tests.

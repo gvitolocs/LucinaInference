@@ -26,6 +26,7 @@ pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
 mod vkext;
+pub mod vram_stats;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
 pub use p2p::{P2pExport, P2pHandleType};
@@ -34,6 +35,7 @@ pub use recorder::{FlashStage, RecordedCmd, Recorder};
 pub use tp::{TensorParallelBackend, TpBuffer, TpRole};
 pub use tp_allreduce::{AllReduce, AllReduceMode};
 pub use tp_sem::{TpExportSemaphore, TpImportSemaphore};
+pub use vram_stats::{VramBreakdown, VramCharge, VramCounters};
 
 /// Shared-memory bytes consumed per query row of a flash-attention prefill tile
 /// (`Ss` + `Ps` + `Os` + softmax state, at `BN=64` / `HD=128`). The tile height is chosen so
@@ -323,17 +325,17 @@ struct VulkanShared {
     /// VK_EXT_memory_budget is absent — the live per-heap budget is preferred when present
     /// (it also sees other processes' VRAM).
     device_used: AtomicU64,
-    /// Concurrently-live [`BufferUsage::Activations`] bytes, and the high-water mark that figure
-    /// has reached since this backend was built ([`VulkanBackend::activation_peak`]).
+    /// Live + peak bytes per `BufferUsage` class, and per scratch-pool tag for the pooled
+    /// `Activations` allocations (see [`vram_stats`]). The [`BufferUsage::Activations`] row IS the
+    /// old `act_live`/`act_peak` pair:
     ///
-    /// The seam's activation reserve is a PREDICTION of `act_peak`, and nothing else in the tree
-    /// observes the predicted quantity — so a reserve could be wrong by a factor and only show up
-    /// as a mid-prefill allocation failure on some unrelated model. These two counters are what
-    /// make the prediction checkable: the runner compares them against what it reserved when a
-    /// generation ends. Charged in `make_alloc` (the single funnel every `Activations` allocation
-    /// takes) and released in `VkBuffer::drop` via its `act_bytes`.
-    act_live: AtomicU64,
-    act_peak: AtomicU64,
+    /// The seam's activation reserve is a PREDICTION of that row's peak, and nothing else in the
+    /// tree observes the predicted quantity — so a reserve could be wrong by a factor and only show
+    /// up as a mid-prefill allocation failure on some unrelated model. These counters are what make
+    /// the prediction checkable: the runner compares them against what it reserved when a generation
+    /// ends. Charged in `make_alloc` (the single funnel every `BufferUsage` allocation takes) and
+    /// released by the [`VramCharge`] the buffer carries.
+    vram_stats: Arc<VramCounters>,
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
     /// before submitting it and opening the next (`0` = unlimited, never split).
     ///
@@ -530,11 +532,13 @@ struct VkBuffer {
     /// `BufferUsage::KvCache` allocations (see [`Buffer::device_addr`]). `None` for every buffer
     /// that never requested one.
     own_addr: Option<u64>,
-    /// This buffer's charge against [`VulkanShared::act_live`] — its logical size when it was
-    /// allocated as [`BufferUsage::Activations`], and `0` for every other usage (weights, KV,
-    /// staging, readback), which the activation high-water mark deliberately does not count.
-    /// Set by `make_alloc`, released by this buffer's `Drop`.
-    act_bytes: u64,
+    /// This buffer's charge against the VRAM breakdown ([`VramCounters`], [`vram_stats`]): its
+    /// logical size under the [`BufferUsage`] it was allocated with, plus the scratch-pool tag it
+    /// belongs to when it is pooled scratch. `None` for a buffer that never went through a
+    /// `BufferUsage` entry point — an arena block, the staging ring, a P2P import. Released by this
+    /// type's own field drop ([`VramCharge`] is RAII), set only by `make_alloc` /
+    /// [`VulkanBackend::alloc_arena_bda`].
+    vram: Option<VramCharge>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -565,13 +569,9 @@ impl VkBuffer {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VkBuffer {
     fn drop(&mut self) {
-        // Release this buffer's share of the live-activation tally (see `VulkanShared::act_live`).
-        // `act_peak` is a high-water mark and deliberately never comes back down.
-        if self.act_bytes > 0 {
-            self.shared
-                .act_live
-                .fetch_sub(self.act_bytes, Ordering::Relaxed);
-        }
+        // The live/peak tally comes back down through `self.vram`'s own `Drop`, which runs after
+        // this body — see [`VramCharge`]. The peak half of those counters is a high-water mark and
+        // deliberately never comes back down.
         unsafe {
             match &mut self.backing {
                 Backing::Pooled(alloc) => {
@@ -2520,8 +2520,7 @@ impl VulkanBackend {
                 pcache,
                 weight_pb: Mutex::new(None),
                 device_used: AtomicU64::new(0),
-                act_live: AtomicU64::new(0),
-                act_peak: AtomicU64::new(0),
+                vram_stats: Arc::new(VramCounters::default()),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 uma_overflow_type,
                 host_overflow_type,
@@ -2934,6 +2933,24 @@ impl VulkanBackend {
         self.vram().alloc_room()
     }
 
+    /// WHAT the device memory this backend holds is, as a [`VramBreakdown`]: live and peak bytes
+    /// per [`BufferUsage`] class, plus the same pair per scratch-pool tag for the pooled
+    /// `Activations` allocations (see [`vram_stats`]).
+    ///
+    /// `vram()` answers "how much is free?"; this answers "who holds the rest" — the question the
+    /// budget guard's refusal raises and `device_used` (one running total) cannot. Both figures are
+    /// LOGICAL requested bytes, not committed ones; see the module doc for what that leaves out.
+    /// Cheap: atomic loads plus one lock on the tag map, safe to call from a failure path.
+    pub fn vram_breakdown(&self) -> VramBreakdown {
+        self.shared.vram_stats.snapshot()
+    }
+
+    /// [`vram_breakdown`](Self::vram_breakdown)'s single-line rendering — the form the guard
+    /// appends to its refusal and `infr bench` logs.
+    pub fn vram_breakdown_line(&self) -> String {
+        self.shared.vram_stats.breakdown_line()
+    }
+
     /// Device-memory budget guard: hard-error BEFORE a device-local allocation of `want` bytes
     /// that would exceed the budget. Over-committing does not fail cleanly on GPUs — the driver
     /// accepts the allocation and then evicts, which on a discrete card means reading weights back
@@ -2979,7 +2996,7 @@ impl VulkanBackend {
                  cleanly — the driver evicts (weights get read back over the bus) or the device is \
                  lost (TDR) mid-inference. Use a smaller context (INFR_CTX), a smaller/more- \
                  quantized model, close other GPU processes, or run on the CPU backend \
-                 (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk.",
+                 (INFR_DEV=cpu). INFR_NO_VRAM_GUARD=1 overrides at your own risk. {}",
             if v.uma { "Unified-memory" } else { "VRAM" },
             fmt_bytes(want),
             fmt_bytes(used),
@@ -2990,6 +3007,9 @@ impl VulkanBackend {
             },
             fmt_bytes(budget),
             fmt_bytes(v.total),
+            // Who holds the `used` figure. Appended, never prepended: the message's first line is
+            // what a user pastes, and every matcher of it keys on the "budget exceeded" wording.
+            self.vram_breakdown_line(),
         )))
     }
 
@@ -3122,7 +3142,7 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr,
-            act_bytes: 0,
+            vram: None,
         })
     }
 
@@ -3185,7 +3205,18 @@ impl VulkanBackend {
     /// the `SHADER_DEVICE_ADDRESS` usage + the allocator's DEVICE_ADDRESS memory flag are what let
     /// `get_buffer_device_address` succeed.
     pub fn alloc_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
-        let buf = self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "moe-arena", true, true)?;
+        let mut buf = self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "moe-arena", true, true)?;
+        // Charged as WEIGHTS, the one device-local allocation path that carries no `BufferUsage` of
+        // its own: what lives in this arena is expert/dense weight banks paged in and out of it, and
+        // on a paged model they are most of the bytes in the device. `make_alloc` cannot see it (the
+        // arena is allocated by the pager, not by a `Backend::alloc`), so accounting it here is what
+        // keeps the breakdown from silently omitting gigabytes on a MoE run. Released with the
+        // arena buffer, exactly once — the pages inside it are byte ranges of this one allocation.
+        buf.vram = Some(
+            self.shared
+                .vram_stats
+                .charge(BufferUsage::Weights, bytes as u64, None),
+        );
         // `make_buf_ex(device_address=true)` already queried + stored this handle's address in
         // `own_addr` — reuse it rather than issuing a second identical `get_buffer_device_address`.
         let addr = buf
@@ -3241,7 +3272,7 @@ impl VulkanBackend {
                     // `device_addr()` derives a `BdaSub`'s address from the block's `base_addr` +
                     // `sub_offset` — no own address needed here.
                     own_addr: None,
-                    act_bytes: 0,
+                    vram: None,
                 });
             }
         }
@@ -3290,7 +3321,7 @@ impl VulkanBackend {
             location: MemoryLocation::GpuOnly,
             sub_offset: 0,
             own_addr: None,
-            act_bytes: 0,
+            vram: None,
         })
     }
 
@@ -3471,7 +3502,7 @@ impl VulkanBackend {
             location,
             sub_offset: 0,
             own_addr,
-            act_bytes: 0,
+            vram: None,
         })
     }
 
@@ -3513,7 +3544,7 @@ impl VulkanBackend {
     ) -> Result<Vec<Box<dyn Buffer>>> {
         let bufs: Vec<VkBuffer> = sizes
             .iter()
-            .map(|&b| self.make_alloc(b, usage))
+            .map(|&b| self.make_alloc(b, usage, None))
             .collect::<Result<_>>()?;
         let mut dev: Vec<(vk::Buffer, u64, u64)> = Vec::new();
         for buf in &bufs {
@@ -3540,9 +3571,59 @@ impl VulkanBackend {
             .collect())
     }
 
-    /// The shared body of `alloc`/`alloc_uninit`: pick the memory location + tick the weight-load
-    /// progress bar. Zero/poison filling is applied by the callers.
-    fn make_alloc(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
+    /// The shared body of `alloc`/`alloc_uninit`, WITH the VRAM breakdown accounted: every buffer
+    /// this returns carries a [`VramCharge`] for `bytes` under `usage` — and, when the caller named
+    /// one, under that scratch-pool `tag` too (see [`vram_stats`]). Charging here rather than in
+    /// each arm below means the live/peak tallies see EVERY `BufferUsage` allocation the backend
+    /// hands out and none of them twice, and the release is the buffer's own `Drop`. Zero/poison
+    /// filling stays with the callers.
+    fn make_alloc(
+        &self,
+        bytes: usize,
+        usage: BufferUsage,
+        tag: Option<&'static str>,
+    ) -> Result<VkBuffer> {
+        let mut buf = self.make_alloc_uncounted(bytes, usage)?;
+        buf.vram = Some(self.shared.vram_stats.charge(usage, bytes as u64, tag));
+        Ok(buf)
+    }
+
+    /// [`Backend::alloc_uninit`] with the scratch-pool `tag` the allocation belongs to, so the
+    /// pooled buffers report their own live/peak bytes in the breakdown (see [`vram_stats`]).
+    /// `tag: None` is `alloc_uninit` verbatim — same fill, same accounting, no tag row.
+    pub(crate) fn alloc_uninit_tagged(
+        &self,
+        bytes: usize,
+        usage: BufferUsage,
+        tag: Option<&'static str>,
+    ) -> Result<Box<dyn Buffer>> {
+        // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
+        // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
+        // `debug.poison_uninit` (`INFR_POISON_UNINIT=1`) forces the poison in release too — for
+        // hunting layout-sensitive read-before-write bugs whose output shifts with unrelated code
+        // changes.
+        //
+        // KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so
+        // the reasoning lives here rather than behind a citation). One read site —
+        // the line below — and a YAGNI sweep flagged it as scaffolding. It stays: it costs one
+        // branch on an allocation path that runs at load, nothing at all when unset, and it is the
+        // only way to reproduce a read-before-write bug in a RELEASE build, where the debug poison
+        // is compiled out and the symptom moves with unrelated code. YAGNI is about unused
+        // abstraction; this is used, just rarely. Do not delete it for being one line.
+        let buf = self.make_alloc(bytes, usage, tag)?;
+        #[cfg(debug_assertions)]
+        self.fill_buf(&buf, 0xFF)?;
+        #[cfg(not(debug_assertions))]
+        if self.cfg.debug.poison_uninit {
+            self.fill_buf(&buf, 0xFF)?;
+        }
+        Ok(Box::new(buf))
+    }
+
+    /// [`make_alloc`](Self::make_alloc) without the accounting: pick the memory location + tick the
+    /// weight-load progress bar. Nothing here touches the VRAM counters — the caller that charges
+    /// them is `make_alloc`, the sole funnel. Zero/poison filling is applied by the callers.
+    fn make_alloc_uncounted(&self, bytes: usize, usage: BufferUsage) -> Result<VkBuffer> {
         // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
         // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
         // other `BufferUsage` takes the gpu-allocator path in `make_buf` below.
@@ -3610,26 +3691,13 @@ impl VulkanBackend {
             // living in VRAM.
             BufferUsage::HostWeights => (MemoryLocation::GpuToCpu, "host-weights"),
         };
-        let mut buf = self.make_buf(bytes, location, label)?;
+        let buf = self.make_buf(bytes, location, label)?;
         // Advance the weight-load progress bar for host-weights too (the single funnel every
         // weight upload passes through, so no loader can forget to account for a tensor).
         if matches!(usage, BufferUsage::HostWeights) {
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
                 pb.inc(bytes as u64);
             }
-        }
-        // Charge the live-activation tally and raise the high-water mark (see
-        // `VulkanShared::act_live`). The logical `bytes`, not the allocation's aligned size: this
-        // measures what the seam's reserve is trying to predict, which is asked for in logical
-        // bytes. Released by `VkBuffer::drop` through the `act_bytes` set here.
-        if usage == BufferUsage::Activations {
-            buf.act_bytes = bytes as u64;
-            let live = self
-                .shared
-                .act_live
-                .fetch_add(bytes as u64, Ordering::Relaxed)
-                + bytes as u64;
-            self.shared.act_peak.fetch_max(live, Ordering::Relaxed);
         }
         Ok(buf)
     }
@@ -3819,33 +3887,13 @@ impl Backend for VulkanBackend {
 
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         // calloc contract: zero-init so recycled/uninitialized VRAM can't leak into a read-before-write.
-        let buf = self.make_alloc(bytes, usage)?;
+        let buf = self.make_alloc(bytes, usage, None)?;
         self.fill_buf(&buf, 0x00)?;
         Ok(Box::new(buf))
     }
 
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
-        // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
-        // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
-        // `debug.poison_uninit` (`INFR_POISON_UNINIT=1`) forces the poison in release too — for
-        // hunting layout-sensitive read-before-write bugs whose output shifts with unrelated code
-        // changes.
-        //
-        // KEEP (reviewed 2026-08-01; that report was folded into docs/backlog.md and deleted, so
-        // the reasoning lives here rather than behind a citation). One read site —
-        // the line below — and a YAGNI sweep flagged it as scaffolding. It stays: it costs one
-        // branch on an allocation path that runs at load, nothing at all when unset, and it is the
-        // only way to reproduce a read-before-write bug in a RELEASE build, where the debug poison
-        // is compiled out and the symptom moves with unrelated code. YAGNI is about unused
-        // abstraction; this is used, just rarely. Do not delete it for being one line.
-        let buf = self.make_alloc(bytes, usage)?;
-        #[cfg(debug_assertions)]
-        self.fill_buf(&buf, 0xFF)?;
-        #[cfg(not(debug_assertions))]
-        if self.cfg.debug.poison_uninit {
-            self.fill_buf(&buf, 0xFF)?;
-        }
-        Ok(Box::new(buf))
+        self.alloc_uninit_tagged(bytes, usage, None)
     }
 
     /// Copy `src` (host slice) into `dst` (device buffer).
@@ -4022,7 +4070,7 @@ impl Backend for VulkanBackend {
     }
 
     fn activation_peak(&self) -> Option<u64> {
-        Some(self.shared.act_peak.load(Ordering::Relaxed))
+        Some(self.shared.vram_stats.usage_peak(BufferUsage::Activations))
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {

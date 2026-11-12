@@ -2124,7 +2124,12 @@ fn cmd_bench(
     // `VulkanBackend::new_with` when it picks the physical device; the prefill chunk
     // (`-u`/`device.ubatch`) rides the same config. Nothing to set here — straight to the seam.
     let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let (samples, placement) = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
+    let (samples, placement, vram) = model.bench_vulkan(n_prompt, n_gen, depth, pg, reps)?;
+    // What the device held, at load and at the end of the timed reps: bench used to report a
+    // throughput number and nothing about the footprint that bought it. Logged, not printed, so
+    // `--json` stdout stays the one machine-readable record it already is. The snapshots come from
+    // inside `bench_vulkan` — its backend, and their counters, do not outlive the call.
+    tracing::info!("[vram after load] {}", vram.after_load.line());
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
     } else if n_gen > 0 {
@@ -2148,6 +2153,10 @@ fn cmd_bench(
     } else {
         None
     };
+    // The second of the two breakdowns `bench_vulkan` took. The MTP arm above is a separate run on
+    // its own backend, so its footprint is not in these bytes — this is the baseline shape's, the
+    // one the budget guard prices.
+    tracing::info!("[vram at end of run] {}", vram.after_run.line());
     // Numbers measured against a mapping whose file moved under it are not numbers. Checked
     // before REPORTING rather than before running, so the whole timed window is covered.
     watch.check()?;
