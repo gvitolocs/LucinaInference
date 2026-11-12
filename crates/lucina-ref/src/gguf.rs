@@ -42,7 +42,7 @@ impl Value {
 #[derive(Clone, Debug)]
 pub struct TensorInfo {
     pub name: String,
-    /// ggml order: dims[0] is the contiguous (row) dimension
+    /// ggml order: `dims[0]` is the contiguous (row) dimension
     pub dims: Vec<u64>,
     pub ggml_type: u32,
     pub offset: u64,
@@ -64,7 +64,8 @@ struct Rd<'a> {
 impl<'a> Rd<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         // proved: end <= len (gguf_bounds::take_end)
-        let end = gb::take_end(self.p, n as u64, self.b.len()).ok_or_else(|| anyhow!("truncated gguf at byte {}", self.p))?;
+        let end = gb::take_end(self.p, n as u64, self.b.len())
+            .ok_or_else(|| anyhow!("truncated gguf at byte {}", self.p))?;
         let s = &self.b[self.p..end];
         self.p = end;
         Ok(s)
@@ -101,7 +102,10 @@ impl<'a> Rd<'a> {
                 let n = self.u64()?;
                 // every element takes at least one byte: a count the file cannot hold is refused before allocating
                 if !gb::count_fits(n, 1, self.remaining()) {
-                    bail!("array of {n} elements at byte {} runs past the file", self.p);
+                    bail!(
+                        "array of {n} elements at byte {} runs past the file",
+                        self.p
+                    );
                 }
                 let n = n as usize;
                 let mut v = Vec::with_capacity(n);
@@ -150,46 +154,86 @@ impl Gguf {
             let name = r.string()?;
             let nd = r.u32()? as usize;
             if nd == 0 || nd > gb::MAX_DIMS {
-                bail!("tensor {name}: {nd} dimensions (1..={} allowed)", gb::MAX_DIMS);
+                bail!(
+                    "tensor {name}: {nd} dimensions (1..={} allowed)",
+                    gb::MAX_DIMS
+                );
             }
             let dims = (0..nd).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
             let ggml_type = r.u32()?;
             let offset = r.u64()?;
-            tensors.insert(name.clone(), TensorInfo { name, dims, ggml_type, offset });
+            tensors.insert(
+                name.clone(),
+                TensorInfo {
+                    name,
+                    dims,
+                    ggml_type,
+                    offset,
+                },
+            );
         }
-        let align = kv.get("general.alignment").and_then(|v| v.as_u64()).unwrap_or(32);
+        let align = kv
+            .get("general.alignment")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(32);
         if align == 0 || !align.is_power_of_two() {
             bail!("general.alignment {align} is not a power of two");
         }
-        let data_start = gb::align_up(r.p as u64, align).ok_or_else(|| anyhow!("data section start overflows"))?;
+        let data_start = gb::align_up(r.p as u64, align)
+            .ok_or_else(|| anyhow!("data section start overflows"))?;
         if data_start > map.len() as u64 {
             bail!("data section starts past the end of the file");
         }
-        Ok(Self { kv, tensors, map, data_start: data_start as usize, align })
+        Ok(Self {
+            kv,
+            tensors,
+            map,
+            data_start: data_start as usize,
+            align,
+        })
     }
 
     pub fn u(&self, key: &str) -> Result<u64> {
-        self.kv.get(key).and_then(|v| v.as_u64()).with_context(|| format!("missing integer key {key}"))
+        self.kv
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .with_context(|| format!("missing integer key {key}"))
     }
     pub fn f(&self, key: &str) -> Result<f64> {
-        self.kv.get(key).and_then(|v| v.as_f64()).with_context(|| format!("missing float key {key}"))
+        self.kv
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .with_context(|| format!("missing float key {key}"))
     }
     pub fn s(&self, key: &str) -> Result<&str> {
-        self.kv.get(key).and_then(|v| v.as_str()).with_context(|| format!("missing string key {key}"))
+        self.kv
+            .get(key)
+            .and_then(|v| v.as_str())
+            .with_context(|| format!("missing string key {key}"))
     }
 
     pub fn info(&self, name: &str) -> Result<&TensorInfo> {
-        self.tensors.get(name).with_context(|| format!("missing tensor {name}"))
+        self.tensors
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))
     }
 
     /// Raw bytes of a tensor.
     pub fn bytes(&self, t: &TensorInfo) -> Result<&[u8]> {
         // proved (gguf_bounds): no overflowing element count, whole blocks, aligned offset, range inside the file
-        let numel = gb::numel(&t.dims).with_context(|| format!("tensor {}: bad dimensions {:?}", t.name, t.dims))?;
+        let numel = gb::numel(&t.dims)
+            .with_context(|| format!("tensor {}: bad dimensions {:?}", t.name, t.dims))?;
         let (blk, sz) = crate::quant::block_layout(t.ggml_type)?;
-        let (start, len) =
-            gb::tensor_span(self.map.len() as u64, self.data_start as u64, t.offset, numel, blk as u64, sz as u64, self.align)
-                .with_context(|| format!("tensor {} out of file bounds or misaligned", t.name))?;
+        let (start, len) = gb::tensor_span(
+            self.map.len() as u64,
+            self.data_start as u64,
+            t.offset,
+            numel,
+            blk as u64,
+            sz as u64,
+            self.align,
+        )
+        .with_context(|| format!("tensor {} out of file bounds or misaligned", t.name))?;
         Ok(&self.map[start as usize..(start + len) as usize])
     }
 }

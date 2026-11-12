@@ -35,7 +35,13 @@ fn h(b: &[u8], o: usize) -> f32 {
     f16::from_le_bytes([b[o], b[o + 1]]).to_f32()
 }
 
-fn check(t: u32, size: usize, elems: usize, halves: &[usize], rebuild: impl Fn(&[u8], usize) -> f32) {
+fn check(
+    t: u32,
+    size: usize,
+    elems: usize,
+    halves: &[usize],
+    rebuild: impl Fn(&[u8], usize) -> f32,
+) {
     for seed in [1u64, 0x9E37_79B9_7F4A_7C15, 42] {
         let src = blocks(seed, size, halves);
         let mut y = vec![0f32; elems * BLOCKS];
@@ -44,7 +50,11 @@ fn check(t: u32, size: usize, elems: usize, halves: &[usize], rebuild: impl Fn(&
             for i in 0..elems {
                 let want = y[bi * elems + i];
                 let got = rebuild(b, i);
-                assert_eq!(got.to_bits(), want.to_bits(), "type {t} block {bi} element {i}: parts {got} vs dequant_row {want}");
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "type {t} block {bi} element {i}: parts {got} vs dequant_row {want}"
+                );
             }
         }
     }
@@ -52,7 +62,9 @@ fn check(t: u32, size: usize, elems: usize, halves: &[usize], rebuild: impl Fn(&
 
 #[test]
 fn q8_0() {
-    check(quant::Q8_0, di::Q8_0_BYTES, di::QK8_0, &[0], |b, i| di::q8_0_quant(b, i) as f32 * h(b, 0));
+    check(quant::Q8_0, di::Q8_0_BYTES, di::QK8_0, &[0], |b, i| {
+        di::q8_0_quant(b, i) as f32 * h(b, 0)
+    });
 }
 
 #[test]

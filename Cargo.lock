@@ -1559,6 +1559,8 @@ dependencies = [
  "rayon",
  "serde_json",
  "tokenizers 0.20.4",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1570,6 +1572,8 @@ dependencies = [
  "lucina-rules",
  "memmap2",
  "rayon",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -15,9 +15,9 @@ pub mod seam;
 pub use seam::model::{BenchPlacement, SeamModel};
 pub mod diffusion;
 mod util;
-pub(crate) use util::*;
 /// The qwen35 pre-tokenizer regex, public for LucinaInference split-coverage tests.
 pub use util::QWEN35_PRE_RE;
+pub(crate) use util::*;
 mod kv;
 pub use kv::MoeConfig;
 pub mod grammar;

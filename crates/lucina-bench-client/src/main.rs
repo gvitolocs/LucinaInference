@@ -1,8 +1,10 @@
 //! lucina-bench-client: time streaming OpenAI chat completions identically against any server (llama-server, infr
 //! serve). Per request: time to first content token, decode tokens/s, token counts, the server's own `timings`.
 //!
+//! ```text
 //!   lucina-bench-client --url http://127.0.0.1:<bench port> --requests requests.jsonl --out results.json
 //!       [--api-key-file F] [--model NAME] [--repeat N] [--timeout-s 600]
+//! ```
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
@@ -23,15 +25,26 @@ pub struct Chunk {
 pub fn parse_line(line: &str) -> Option<Chunk> {
     let data = line.strip_prefix("data:")?.trim();
     if data == "[DONE]" {
-        return Some(Chunk { done: true, ..Default::default() });
+        return Some(Chunk {
+            done: true,
+            ..Default::default()
+        });
     }
     let v: Value = serde_json::from_str(data).ok()?;
     let mut c = Chunk::default();
     if let Some(choice) = v.get("choices").and_then(|c| c.get(0)) {
         let delta = choice.get("delta");
-        let nonempty = |k: &str| delta.and_then(|d| d.get(k)).and_then(|s| s.as_str()).is_some_and(|s| !s.is_empty());
+        let nonempty = |k: &str| {
+            delta
+                .and_then(|d| d.get(k))
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| !s.is_empty())
+        };
         c.content = nonempty("content") || nonempty("reasoning_content");
-        c.finish_reason = choice.get("finish_reason").and_then(|f| f.as_str()).map(String::from);
+        c.finish_reason = choice
+            .get("finish_reason")
+            .and_then(|f| f.as_str())
+            .map(String::from);
     }
     if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
         c.completion_tokens = u.get("completion_tokens").and_then(|x| x.as_u64());
@@ -69,7 +82,9 @@ fn args() -> Result<Args> {
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
-        let v = it.next().with_context(|| format!("missing value for {k}"))?;
+        let v = it
+            .next()
+            .with_context(|| format!("missing value for {k}"))?;
         match k.as_str() {
             "--url" => a.url = v,
             "--requests" => a.requests = v,
@@ -89,21 +104,33 @@ fn args() -> Result<Args> {
 
 fn run_one(client: &reqwest::blocking::Client, a: &Args, req: &Value) -> Result<Value> {
     let mut body = req.clone();
-    let obj = body.as_object_mut().context("request line is not an object")?;
+    let obj = body
+        .as_object_mut()
+        .context("request line is not an object")?;
     obj.remove("id");
     obj.insert("stream".into(), json!(true));
     obj.insert("model".into(), json!(a.model));
     obj.insert("stream_options".into(), json!({"include_usage": true}));
-    let mut rb = client.post(format!("{}/v1/chat/completions", a.url.trim_end_matches('/'))).json(&body);
+    let mut rb = client
+        .post(format!(
+            "{}/v1/chat/completions",
+            a.url.trim_end_matches('/')
+        ))
+        .json(&body);
     if let Some(k) = &a.key {
         rb = rb.bearer_auth(k);
     }
     let t0 = Instant::now();
     let resp = rb.send()?;
     if !resp.status().is_success() {
-        bail!("HTTP {}: {}", resp.status(), resp.text().unwrap_or_default());
+        bail!(
+            "HTTP {}: {}",
+            resp.status(),
+            resp.text().unwrap_or_default()
+        );
     }
-    let (mut ttft, mut n_events, mut ctoks, mut ptoks, mut finish, mut timings) = (None, 0u64, None, None, None, None);
+    let (mut ttft, mut n_events, mut ctoks, mut ptoks, mut finish, mut timings) =
+        (None, 0u64, None, None, None, None);
     for line in BufReader::new(resp).lines() {
         let line = line?;
         let Some(c) = parse_line(&line) else { continue };
@@ -122,19 +149,27 @@ fn run_one(client: &reqwest::blocking::Client, a: &Args, req: &Value) -> Result<
     let total = t0.elapsed().as_secs_f64();
     let ttft = ttft.unwrap_or(total);
     let tps = decode_tps(ctoks.unwrap_or(n_events), ttft, total);
-    Ok(json!({"ttft_s": ttft, "total_s": total, "n_events": n_events, "completion_tokens": ctoks,
-              "prompt_tokens": ptoks, "decode_tps": tps, "finish_reason": finish, "timings": timings}))
+    Ok(
+        json!({"ttft_s": ttft, "total_s": total, "n_events": n_events, "completion_tokens": ctoks,
+              "prompt_tokens": ptoks, "decode_tps": tps, "finish_reason": finish, "timings": timings}),
+    )
 }
 
 fn main() -> Result<()> {
     let a = args()?;
-    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(a.timeout)).build()?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(a.timeout))
+        .build()?;
     let lines = std::fs::read_to_string(&a.requests)?;
     let mut out = vec![];
     let mut failed = false;
     for line in lines.lines().filter(|l| !l.trim().is_empty()) {
         let req: Value = serde_json::from_str(line)?;
-        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let id = req
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
         for rep in 0..a.repeat {
             let mut r = match run_one(&client, &a, &req) {
                 Ok(v) => v,
@@ -145,12 +180,19 @@ fn main() -> Result<()> {
             };
             r["id"] = json!(id);
             r["rep"] = json!(rep);
+            // print-ok: the run's result line, one per request/rep — what the operator watches and
+            // what the gpuwin step logs collect. The machine-readable record goes to `--out`.
             println!(
                 "{id} {rep} ttft {:.3} s decode {} t/s tokens {} finish {}",
                 r["ttft_s"].as_f64().unwrap_or(f64::NAN),
-                r["decode_tps"].as_f64().map_or("-".into(), |v| format!("{v:.1}")),
+                r["decode_tps"]
+                    .as_f64()
+                    .map_or("-".into(), |v| format!("{v:.1}")),
                 r["completion_tokens"],
-                r["finish_reason"].as_str().or(r["error"].as_str()).unwrap_or("-")
+                r["finish_reason"]
+                    .as_str()
+                    .or(r["error"].as_str())
+                    .unwrap_or("-")
             );
             out.push(r);
         }
@@ -176,7 +218,9 @@ mod tests {
         assert!(!c.content, "empty content is not a token event");
         let c = parse_line(r#"data: {"choices":[{"delta":{"reasoning_content":"r"}}]}"#).unwrap();
         assert!(c.content);
-        let c = parse_line(r#"data: {"choices":[],"usage":{"completion_tokens":3,"prompt_tokens":9}}"#).unwrap();
+        let c =
+            parse_line(r#"data: {"choices":[],"usage":{"completion_tokens":3,"prompt_tokens":9}}"#)
+                .unwrap();
         assert_eq!((c.completion_tokens, c.prompt_tokens), (Some(3), Some(9)));
         let c = parse_line(r#"data: {"choices":[{"delta":{},"finish_reason":"length"}],"timings":{"predicted_per_second":42.0}}"#)
             .unwrap();

@@ -10,15 +10,17 @@
 //!    the half above it is scanned — that is test output, and `cargo test` captures it.
 //! 2. **`build.rs`.** `cargo:rerun-if-changed` is a build protocol, not logging. Not scanned.
 //! 3. **Program OUTPUT**, marked at the site with a `// print-ok: <reason>` comment: generated
-//!    tokens, `infr bench` / `infr compare` tables, `--json`, `infr devices`, the serve banner.
+//!    tokens, `infr bench` / `infr compare` tables, `--json`, `infr devices`, the serve banner, the
+//!    `lucina-parity` JSON and the `lucina-gate-check` verdict lines.
 //!    This is the CLI's contract — users pipe it, and a filterable logger would break it.
 //! 4. **Profiling REPORTS**, same marker, but only in [`REPORT_FILES`]: column-aligned tables the
 //!    user asked for by setting `INFR_PROFILE`/`INFR_PROF_OPS`, which a per-line `tracing` prefix
 //!    would destroy, and which partly run from a C `atexit` hook where no subscriber is left.
 //!
 //! The marker is deliberately per-SITE. A library crate cannot exempt itself with it: outside
-//! [`REPORT_FILES`] and [`OUTPUT_CRATES`] the marker is ignored and the print still fails the
-//! test. Adding a file to either list is a visible edit to this test, which is the point.
+//! [`REPORT_FILES`], [`OUTPUT_CRATES`] and [`OUTPUT_FILES`] the marker is ignored and the print
+//! still fails the test. Adding a file to any of these lists is a visible edit to this test, which
+//! is the point.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,20 @@ const REPORT_FILES: &[&str] = &[
     "infr-metal/src/shaders.rs",
     // The shared TEST harness: every caller of `SweepReport::assert_ok` is a `#[test]`.
     "infr-testkit/src/lib.rs",
+];
+
+/// Category 3's narrow form: `// print-ok:` honoured in this exact FILE rather than in a whole
+/// crate, for the tool entry points that share a crate with code the guard must keep shut —
+/// `lucina-rules/src/*.rs` is Verus input, `lucina-parity`'s report logic is a library. Listing the
+/// entry point by path buys the binary its marker without opening either.
+const OUTPUT_FILES: &[&str] = &[
+    // `lucina-parity`: the compare/gate JSON and tables, the tokens-diff report, the VRAM probe's
+    // numbers and the gate verdict line.
+    "lucina-parity/src/main.rs",
+    // `lucina-gate-check`: one `path: OK` / `path: VIOLATION` line per replayed GPU-window log.
+    "lucina-rules/src/bin/lucina-gate-check.rs",
+    // `lucina-bench-client`: one ttft/decode-tps line per timed request; the JSON goes to `--out`.
+    "lucina-bench-client/src/main.rs",
 ];
 
 /// The four macros. `write!`/`writeln!` to an explicit stream are fine — they name their sink.
@@ -126,7 +142,9 @@ fn scan_file(
         .to_string_lossy()
         .replace('\\', "/");
     // Category 3/4: whether a `// print-ok:` marker is honoured HERE at all.
-    let marker_honoured = OUTPUT_CRATES.contains(&crate_name) || REPORT_FILES.contains(&&*rel);
+    let marker_honoured = OUTPUT_CRATES.contains(&crate_name)
+        || OUTPUT_FILES.contains(&&*rel)
+        || REPORT_FILES.contains(&&*rel);
 
     let lines: Vec<&str> = text.lines().collect();
     // Category 1: cut at the first `#[cfg(test)]`; everything below it is test output.
@@ -173,7 +191,8 @@ fn scan_file(
             }
             out.push(format!(
                 "{}:{}: `{mac}` carries a `{MARKER}` marker, but {crate_name} is a LIBRARY — the \
-                 marker is only honoured in {OUTPUT_CRATES:?} and in this test's REPORT_FILES",
+                 marker is only honoured in {OUTPUT_CRATES:?}, in {OUTPUT_FILES:?} and in this \
+                 test's REPORT_FILES",
                 rel,
                 i + 1
             ));

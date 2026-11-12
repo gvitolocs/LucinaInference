@@ -125,7 +125,7 @@ pub struct K4Parts {
     pub sub: usize,
 }
 
-/// Element `i` of a Q4_K block { half d; half dmin; u8 scales[12]; u8 qs[128]; }.
+/// Element `i` of a Q4_K block `{ half d; half dmin; u8 scales[12]; u8 qs[128]; }`.
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     requires
         b.len() == Q4_K_BYTES,
@@ -159,7 +159,7 @@ pub fn q4_k_parts(b: &[u8], i: usize) -> K4Parts {
     K4Parts { quant, scale, min, qs_off, sub }
 }
 
-/// Element `i` of a Q5_K block { half d; half dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]; }. The fifth bit of
+/// Element `i` of a Q5_K block `{ half d; half dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]; }`. The fifth bit of
 /// element `i` is bit `i / 32` of `qh[i % 32]`.
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     requires
@@ -201,7 +201,7 @@ pub fn q5_k_parts(b: &[u8], i: usize) -> (K4Parts, usize) {
     (K4Parts { quant, scale, min, qs_off, sub }, qh_off)
 }
 
-/// Element `i` of a Q6_K block { u8 ql[128]; u8 qh[64]; i8 scales[16]; half d (at 208); }:
+/// Element `i` of a Q6_K block `{ u8 ql[128]; u8 qh[64]; i8 scales[16]; half d (at 208); }`:
 /// `y = d * scale * quant`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,7 +253,7 @@ pub fn q6_k_parts(b: &[u8], i: usize) -> Q6KParts {
     Q6KParts { quant: v as i32 - 32, scale: b[sc_off] as i8 as i32, ql_off, qh_off, sc_off }
 }
 
-/// Element `i` of a Q3_K block { u8 hmask[32]; u8 qs[64]; u8 scales[12]; half d (at 108); }:
+/// Element `i` of a Q3_K block `{ u8 hmask[32]; u8 qs[64]; u8 scales[12]; half d (at 108); }`:
 /// `y = d * (scale - 32) * quant`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -326,7 +326,7 @@ pub fn q3_k_parts(b: &[u8], i: usize) -> Q3KParts {
     Q3KParts { quant: qv - adj, scale, qs_off, shift, hm_off: l, hm_bit, group }
 }
 
-/// Element `i` of an IQ4_NL block { half d; u8 qs[16]; }: `y = d * KVALUES_IQ4NL[code]`. Element `j < 16` is the
+/// Element `i` of an IQ4_NL block `{ half d; u8 qs[16]; }`: `y = d * KVALUES_IQ4NL[code]`. Element `j < 16` is the
 /// low nibble of `qs[j]`, element `j >= 16` the high nibble of `qs[j - 16]`.
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     requires
@@ -348,7 +348,7 @@ pub fn iq4_nl_code(b: &[u8], i: usize) -> (u8, usize) {
     (if i < 16 { q & 0xF } else { q >> 4 }, off)
 }
 
-/// Element `i` of an IQ4_XS block { half d; u16 scales_h; u8 scales_l[4]; u8 qs[128]; }:
+/// Element `i` of an IQ4_XS block `{ half d; u16 scales_h; u8 scales_l[4]; u8 qs[128]; }`:
 /// `y = d * scale * KVALUES_IQ4NL[code]` with the 6-bit scale signed by `- 32`.
 #[cfg_attr(verus_keep_ghost, verus_spec(r =>
     requires
@@ -385,7 +385,7 @@ pub fn iq4_xs_parts(b: &[u8], i: usize) -> (u8, i32, usize) {
     (code, ls as i32 - 32, qs_off)
 }
 
-/// Element `i` of an IQ3_S block { half d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4]; }:
+/// Element `i` of an IQ3_S block `{ half d; u8 qs[64]; u8 qh[8]; u8 signs[32]; u8 scales[4]; }`:
 /// `y = d * (1 + 2 * scale_nib) * byte(IQ3S_GRID[grid], nib) * (sign ? -1 : 1)`.
 #[cfg_attr(verus_keep_ghost, verus_verify)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

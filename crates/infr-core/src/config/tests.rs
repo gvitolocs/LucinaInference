@@ -116,6 +116,8 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.serve.stats_interval_secs, 5);
     // `INFR_MTP` is the exact string "1"; unset ⇒ off, and the three MTP hatches default on.
     assert!(!d.spec.mtp);
+    // The parked MTP path stays shut by default (`INFR_MTP_MEASURE` opens it for measurement).
+    assert!(!d.spec.mtp_measure);
     assert!(d.spec.mtp_ckpt && d.spec.mtp_reprime && d.spec.mtp_draft_chain);
     assert_eq!(d.spec.k, 6);
     assert_eq!(d.spec.decode_chain, 8);
@@ -472,6 +474,17 @@ fn non_presence_grammars_are_preserved() {
         !Config::load_from_layers(&[env_layer(&[("INFR_MTP", "true")])])
             .spec
             .mtp
+    );
+    // …and the same exact-string grammar gates the parked path (`INFR_MTP_MEASURE`).
+    assert!(
+        Config::load_from_layers(&[env_layer(&[("INFR_MTP_MEASURE", "1")])])
+            .spec
+            .mtp_measure
+    );
+    assert!(
+        !Config::load_from_layers(&[env_layer(&[("INFR_MTP_MEASURE", "true")])])
+            .spec
+            .mtp_measure
     );
     // `INFR_API_KEY=` (empty) means NO auth — the opposite of the presence grammar.
     assert_eq!(
@@ -1316,6 +1329,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
         "INFR_LAYER_MAJOR",
+        "INFR_MTP_MEASURE",
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
     ];
@@ -1341,7 +1355,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
          list it here in the SAME commit"
     );
 }
-
 
 #[test]
 fn a_kv_format_named_by_set_counts_as_specified() {

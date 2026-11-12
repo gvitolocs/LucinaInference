@@ -28,9 +28,18 @@ impl Logits {
     pub fn read(path: &Path, n_vocab: usize) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         if bytes.len() % (4 * n_vocab) != 0 {
-            bail!("{}: {} bytes is not a whole number of {n_vocab}-wide rows", path.display(), bytes.len());
+            bail!(
+                "{}: {} bytes is not a whole number of {n_vocab}-wide rows",
+                path.display(),
+                bytes.len()
+            );
         }
-        let data = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let data = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
         Ok(Self { n_vocab, data })
     }
 
@@ -54,7 +63,12 @@ impl Logits {
 /// Read a token file: one id per line (logits mode) or ids separated by spaces.
 pub fn read_tokens(path: &Path) -> Result<Vec<u32>> {
     let s = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    s.split_whitespace().map(|t| t.parse::<u32>().with_context(|| format!("bad token id {t:?}"))).collect()
+    s.split_whitespace()
+        .map(|t| {
+            t.parse::<u32>()
+                .with_context(|| format!("bad token id {t:?}"))
+        })
+        .collect()
 }
 
 /// First index where two token-id sequences differ; `None` when they are equal. When one is a
@@ -82,7 +96,12 @@ pub struct RowStats {
 
 fn log_softmax(row: &[f32]) -> Vec<f64> {
     let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-    let lse = row.iter().map(|&x| ((x as f64) - m).exp()).sum::<f64>().ln() + m;
+    let lse = row
+        .iter()
+        .map(|&x| ((x as f64) - m).exp())
+        .sum::<f64>()
+        .ln()
+        + m;
     row.iter().map(|&x| x as f64 - lse).collect()
 }
 
@@ -104,14 +123,37 @@ pub fn compare_row(r: &[f32], t: &[f32]) -> RowStats {
     assert_eq!(r.len(), t.len());
     let lr = log_softmax(r);
     let lt = log_softmax(t);
-    let kl = lr.iter().zip(&lt).map(|(&a, &b)| a.exp() * (a - b)).sum::<f64>().max(0.0);
+    let kl = lr
+        .iter()
+        .zip(&lt)
+        .map(|(&a, &b)| a.exp() * (a - b))
+        .sum::<f64>()
+        .max(0.0);
     let mean = r.iter().map(|&x| x as f64).sum::<f64>() / r.len() as f64;
-    let spread = (r.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / r.len() as f64).sqrt();
-    let err = (r.iter().zip(t).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>() / r.len() as f64).sqrt();
-    let max_abs = r.iter().zip(t).map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let spread =
+        (r.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / r.len() as f64).sqrt();
+    let err = (r
+        .iter()
+        .zip(t)
+        .map(|(&a, &b)| ((a - b) as f64).powi(2))
+        .sum::<f64>()
+        / r.len() as f64)
+        .sqrt();
+    let max_abs = r
+        .iter()
+        .zip(t)
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
     let (i_r, v1, v2) = top2(r);
     let (i_t, _, _) = top2(t);
-    RowStats { kl, max_abs, rel_rms: err / spread.max(1e-12), top1_ref: i_r, top1_test: i_t, ref_margin: v1 - v2 }
+    RowStats {
+        kl,
+        max_abs,
+        rel_rms: err / spread.max(1e-12),
+        top1_ref: i_r,
+        top1_test: i_t,
+        ref_margin: v1 - v2,
+    }
 }
 
 /// Aggregate over all positions.
@@ -127,10 +169,19 @@ pub const NEAR_TIE: f32 = 0.5;
 impl Report {
     pub fn new(r: &Logits, t: &Logits) -> Result<Self> {
         if r.n_vocab != t.n_vocab || r.n_rows() != t.n_rows() {
-            bail!("shape mismatch: ref {}x{} vs test {}x{}", r.n_rows(), r.n_vocab, t.n_rows(), t.n_vocab);
+            bail!(
+                "shape mismatch: ref {}x{} vs test {}x{}",
+                r.n_rows(),
+                r.n_vocab,
+                t.n_rows(),
+                t.n_vocab
+            );
         }
         use rayon::prelude::*;
-        let rows = (0..r.n_rows()).into_par_iter().map(|i| compare_row(r.row(i), t.row(i))).collect();
+        let rows = (0..r.n_rows())
+            .into_par_iter()
+            .map(|i| compare_row(r.row(i), t.row(i)))
+            .collect();
         Ok(Self { rows })
     }
 
@@ -147,12 +198,25 @@ impl Report {
         self.rows.iter().map(|s| s.max_abs).fold(0.0, f32::max)
     }
     pub fn top1_all(&self) -> (usize, usize) {
-        (self.rows.iter().filter(|s| s.top1_ref == s.top1_test).count(), self.rows.len())
+        (
+            self.rows
+                .iter()
+                .filter(|s| s.top1_ref == s.top1_test)
+                .count(),
+            self.rows.len(),
+        )
     }
     /// argmax agreement on positions where the reference is not a near-tie
     pub fn top1_decisive(&self) -> (usize, usize) {
-        let d: Vec<_> = self.rows.iter().filter(|s| s.ref_margin >= NEAR_TIE).collect();
-        (d.iter().filter(|s| s.top1_ref == s.top1_test).count(), d.len())
+        let d: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|s| s.ref_margin >= NEAR_TIE)
+            .collect();
+        (
+            d.iter().filter(|s| s.top1_ref == s.top1_test).count(),
+            d.len(),
+        )
     }
 
     pub fn json(&self) -> serde_json::Value {
@@ -185,7 +249,11 @@ impl Tolerance {
     /// docs/lucina/stage1-parity.md records the spreads and the chosen `k`.
     pub fn from_self_spread(spreads: &[&Report], k: f64) -> Self {
         let f = |g: &dyn Fn(&Report) -> f64| spreads.iter().map(|r| g(r)).fold(0.0, f64::max) * k;
-        let flips = spreads.iter().map(|r| r.top1_decisive().1 - r.top1_decisive().0).max().unwrap_or(0);
+        let flips = spreads
+            .iter()
+            .map(|r| r.top1_decisive().1 - r.top1_decisive().0)
+            .max()
+            .unwrap_or(0);
         Self {
             kl_mean: f(&|r| r.kl_mean()),
             kl_max: f(&|r| r.kl_max()),
@@ -198,16 +266,27 @@ impl Tolerance {
         let (a, n) = r.top1_decisive();
         let mut bad = vec![];
         if r.kl_mean() > self.kl_mean {
-            bad.push(format!("kl_mean {:.3e} > {:.3e}", r.kl_mean(), self.kl_mean));
+            bad.push(format!(
+                "kl_mean {:.3e} > {:.3e}",
+                r.kl_mean(),
+                self.kl_mean
+            ));
         }
         if r.kl_max() > self.kl_max {
             bad.push(format!("kl_max {:.3e} > {:.3e}", r.kl_max(), self.kl_max));
         }
         if r.rel_rms_max() > self.rel_rms_max {
-            bad.push(format!("rel_rms_max {:.3e} > {:.3e}", r.rel_rms_max(), self.rel_rms_max));
+            bad.push(format!(
+                "rel_rms_max {:.3e} > {:.3e}",
+                r.rel_rms_max(),
+                self.rel_rms_max
+            ));
         }
         if n - a > self.decisive_flips {
-            bad.push(format!("top1 on decisive positions {a}/{n} (allowed flips {})", self.decisive_flips));
+            bad.push(format!(
+                "top1 on decisive positions {a}/{n} (allowed flips {})",
+                self.decisive_flips
+            ));
         }
         if bad.is_empty() {
             Ok(())
@@ -253,8 +332,14 @@ mod tests {
     #[test]
     fn near_tie_flips_do_not_count_as_decisive_failures() {
         let n_vocab = 3;
-        let r = Logits { n_vocab, data: vec![1.0, 1.1, -5.0, 9.0, 0.0, 0.0] };
-        let t = Logits { n_vocab, data: vec![1.1, 1.0, -5.0, 9.0, 0.0, 0.0] };
+        let r = Logits {
+            n_vocab,
+            data: vec![1.0, 1.1, -5.0, 9.0, 0.0, 0.0],
+        };
+        let t = Logits {
+            n_vocab,
+            data: vec![1.1, 1.0, -5.0, 9.0, 0.0, 0.0],
+        };
         let rep = Report::new(&r, &t).unwrap();
         assert_eq!(rep.top1_all(), (1, 2));
         assert_eq!(rep.top1_decisive(), (1, 1));
@@ -263,10 +348,21 @@ mod tests {
     #[test]
     fn tolerance_rejects_a_decisive_flip() {
         let n_vocab = 2;
-        let r = Logits { n_vocab, data: vec![5.0, 0.0] };
-        let t = Logits { n_vocab, data: vec![0.0, 5.0] };
+        let r = Logits {
+            n_vocab,
+            data: vec![5.0, 0.0],
+        };
+        let t = Logits {
+            n_vocab,
+            data: vec![0.0, 5.0],
+        };
         let rep = Report::new(&r, &t).unwrap();
-        let tol = Tolerance { kl_mean: 1e9, kl_max: 1e9, rel_rms_max: 1e9, decisive_flips: 0 };
+        let tol = Tolerance {
+            kl_mean: 1e9,
+            kl_max: 1e9,
+            rel_rms_max: 1e9,
+            decisive_flips: 0,
+        };
         assert!(tol.check(&rep).is_err());
     }
 

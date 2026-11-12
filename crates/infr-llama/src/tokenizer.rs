@@ -1,7 +1,8 @@
 //! GGUF-embedded tokenizer construction (byte-level BPE + SentencePiece).
 //! Mechanically split out of `lib.rs` (no logic change).
 use crate::{
-    DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE,
+    DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA4_PRE_RE, QWEN2_PRE_RE,
+    QWEN35_PRE_RE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};

@@ -4,9 +4,7 @@
 //! four bytes of an entry little-endian, exactly like `(const uint8_t *)(iq3s_grid + idx)`.
 
 /// `kmask_iq2xs`: sign bit masks, one per element of an 8-wide group.
-pub const KMASK_IQ2XS: [u8; 8] = [
-    1, 2, 4, 8, 16, 32, 64, 128,
-];
+pub const KMASK_IQ2XS: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 /// `kvalues_iq4nl`: the 16 nonlinear 4-bit values used by IQ4_NL and IQ4_XS.
 pub const KVALUES_IQ4NL: [i8; 16] = [

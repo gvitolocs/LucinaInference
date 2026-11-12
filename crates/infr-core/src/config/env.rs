@@ -333,6 +333,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // ── spec ─────────────────────────────────────────────────────────────────
     // The EXACT string "1"; `INFR_MTP=true` does nothing today.
     p.spec.mtp = get("INFR_MTP").map(|s| s == "1");
+    p.spec.mtp_measure = get("INFR_MTP_MEASURE").map(|s| s == "1");
     p.spec.mtp_ckpt = presence_inv(get, "INFR_NO_MTP_CKPT");
     p.spec.mtp_reprime = presence_inv(get, "INFR_NO_MTP_REPRIME");
     p.spec.mtp_draft_chain = presence_inv(get, "INFR_NO_MTP_DRAFT_CHAIN");

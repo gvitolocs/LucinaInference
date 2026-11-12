@@ -27,7 +27,7 @@ fn valid() -> (Vec<u8>, usize, usize, usize, usize) {
     b.extend_from_slice(&12u32.to_le_bytes()); // Q4_K
     let off_pos = b.len();
     b.extend_from_slice(&0u64.to_le_bytes());
-    while b.len() % 32 != 0 {
+    while !b.len().is_multiple_of(32) {
         b.push(0);
     }
     b.extend_from_slice(&[0x11u8; 144]);
@@ -97,7 +97,10 @@ fn too_many_dimensions_out_of_file_and_misaligned_offsets_are_refused() {
     assert!(open_and_read("offset-far", &x).is_err());
     let mut x = b.clone();
     put_u64(&mut x, off_pos, 32);
-    assert!(open_and_read("offset-past-end", &x).is_err(), "the 144 bytes would end past the file");
+    assert!(
+        open_and_read("offset-past-end", &x).is_err(),
+        "the 144 bytes would end past the file"
+    );
     let mut x = b.clone();
     put_u64(&mut x, off_pos, 1);
     assert!(open_and_read("offset-misaligned", &x).is_err());
@@ -107,7 +110,10 @@ fn too_many_dimensions_out_of_file_and_misaligned_offsets_are_refused() {
 fn every_truncation_is_an_error() {
     let (b, ..) = valid();
     for n in 0..b.len() {
-        assert!(open_and_read(&format!("trunc{n}"), &b[..n]).is_err(), "truncated at {n} was accepted");
+        assert!(
+            open_and_read(&format!("trunc{n}"), &b[..n]).is_err(),
+            "truncated at {n} was accepted"
+        );
     }
 }
 

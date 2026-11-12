@@ -31,7 +31,11 @@ fn check(model: PathBuf, tensor: &str) {
     let bin = oracle_bin();
     let model_path = model.as_path();
     if !model_path.is_file() || !bin.is_file() {
-        eprintln!("skip: {} or {} is missing", model_path.display(), bin.display());
+        eprintln!(
+            "skip: {} or {} is missing",
+            model_path.display(),
+            bin.display()
+        );
         return;
     }
 
@@ -58,9 +62,13 @@ fn check(model: PathBuf, tensor: &str) {
     assert!(status.success(), "ggml-dequant exited with {status}");
     let raw = std::fs::read(&out).expect("read ggml-dequant output");
     let _ = std::fs::remove_file(&out);
-    assert_eq!(raw.len(), ROWS * ne0 * 4, "ggml-dequant output size for {tensor}");
+    assert_eq!(
+        raw.len(),
+        ROWS * ne0 * 4,
+        "ggml-dequant output size for {tensor}"
+    );
     let mut expected = vec![0f32; ROWS * ne0];
-    for (i, c) in raw.chunks_exact(4).enumerate() {
+    for (i, c) in raw.as_chunks::<4>().0.iter().enumerate() {
         expected[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
     }
 

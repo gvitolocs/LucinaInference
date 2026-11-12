@@ -467,6 +467,9 @@ cfg_struct! {
         /// `INFR_MTP`: the EXACT string `"1"`. `INFR_MTP=true` does nothing today; the `== "1"`
         /// mapping is the behaviour-preserving one.
         mtp: bool = false,
+        /// `INFR_MTP_MEASURE`: the EXACT string `"1"`, same grammar as `INFR_MTP`. Opens the
+        /// PARKED MTP path for measurement only; `false` by default, so a plain run stays parked.
+        mtp_measure: bool = false,
         /// `INFR_NO_MTP_CKPT` (inverted).
         mtp_ckpt: bool = true,
         /// `INFR_NO_MTP_REPRIME` (inverted). ANDed with [`SpecCfg::mtp_ckpt`] at the site (R5).

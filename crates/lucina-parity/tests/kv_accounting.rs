@@ -17,7 +17,13 @@ fn infr_bytes(rows: u64) -> u64 {
 #[test]
 fn production_q4_0_kv_matches_the_proved_formula() {
     assert_eq!(infr_bytes(122_880), 2_264_924_160);
-    for rows in [1u64, 31, 32, 256, 4096, 32_768, 65_536, 81_920, 122_880, 262_144] {
-        assert_eq!(Some(infr_bytes(rows)), kv_q4_0_bytes(LAYERS, HEADS, HD, rows), "rows {rows}");
+    for rows in [
+        1u64, 31, 32, 256, 4096, 32_768, 65_536, 81_920, 122_880, 262_144,
+    ] {
+        assert_eq!(
+            Some(infr_bytes(rows)),
+            kv_q4_0_bytes(LAYERS, HEADS, HD, rows),
+            "rows {rows}"
+        );
     }
 }

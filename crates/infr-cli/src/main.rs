@@ -2139,7 +2139,7 @@ fn cmd_bench(
     // combined ingest+reply shape the MTP arm doesn't have an equivalent for). Models without a
     // head take the exact path above unchanged — `mtp` stays `None`, `print_bench_avg_mtp` falls
     // straight through to the pre-existing `print_bench_avg` line.
-    let mtp = if infr_llama::mtp::mtp_enabled()
+    let mtp = if infr_llama::mtp::mtp_enabled(cfg)
         && pg.is_none()
         && n_gen > 0
         && model.config().n_layer_nextn > 0
@@ -2355,9 +2355,15 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
         if p.ubatch_pinned { " pinned" } else { "" },
         match p.kv_named {
             Some((k, v)) => {
-                let name = |d: Option<infr_core::DType>| d.map_or("f16".to_string(), |d| format!("{d:?}").to_lowercase());
+                let name = |d: Option<infr_core::DType>| {
+                    d.map_or("f16".to_string(), |d| format!("{d:?}").to_lowercase())
+                };
                 let (k, v) = (name(k), name(v));
-                if k == v { k } else { format!("{k}/{v}") }
+                if k == v {
+                    k
+                } else {
+                    format!("{k}/{v}")
+                }
             }
             None => (if p.kv_q8 { "q8_0" } else { "f16" }).to_string(),
         },
@@ -2518,7 +2524,7 @@ fn cmd_bench_metal(
         // gets its self-speculative Metal decode (accept rate + phase split) measured alongside the
         // baseline tg above. `bench_mtp_tg` reads the resolved backend (Metal here, via INFR_DEV) to
         // route onto the Metal timed driver. Models without a head keep `mtp = None` → byte-identical.
-        let mtp = if infr_llama::mtp::mtp_enabled()
+        let mtp = if infr_llama::mtp::mtp_enabled(cfg)
             && pg.is_none()
             && n_gen > 0
             && model.config().n_layer_nextn > 0
@@ -2983,7 +2989,7 @@ fn cmd_compare_sweep(
         // MTP is PARKED (`infr_llama::mtp::mtp_enabled`'s doc) — the column stays in the table shape
         // (a blank row, same as any model without a head) so the sweep archive's columns keep lining
         // up with older archives, but neither engine is measured.
-        if infr_llama::mtp::mtp_enabled() && mb.has_mtp_head() {
+        if infr_llama::mtp::mtp_enabled(cfg) && mb.has_mtp_head() {
             let iv = mb.infr_mtp(&["-p", "0", "-n", "128"]);
             let lv = mb.llama_cli_mtp(128);
             print_sweep_cell(
@@ -4819,6 +4825,9 @@ mod tests {
             kv_named: Some((Some(infr_core::DType::Q4_0), Some(infr_core::DType::Q4_0))),
             ..base
         };
-        assert_eq!(placement_note(Some(&named)), " [ubatch 1024, kv q4_0, submit unlimited]");
+        assert_eq!(
+            placement_note(Some(&named)),
+            " [ubatch 1024, kv q4_0, submit unlimited]"
+        );
     }
 }

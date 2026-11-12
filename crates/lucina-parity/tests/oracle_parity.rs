@@ -36,12 +36,13 @@ fn q35_9b_default() -> String {
 
 #[test]
 fn qwen35_9b_cpu_logits_match_llama_cpp() {
-    let model =
-        std::env::var("LUCINA_PARITY_Q35_9B").unwrap_or_else(|_| q35_9b_default());
+    let model = std::env::var("LUCINA_PARITY_Q35_9B").unwrap_or_else(|_| q35_9b_default());
     let ref_dir: PathBuf = std::env::var("LUCINA_PARITY_REF_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join("work/ref")
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .join("work/ref")
         });
 
     let tokens_path = ref_dir.join("q35-9b-chat-b512.tokens.txt");
@@ -61,7 +62,12 @@ fn qwen35_9b_cpu_logits_match_llama_cpp() {
     if !ref_path.exists() {
         missing.push(format!("{}", ref_path.display()));
     }
-    missing.extend(self_paths.iter().filter(|p| !p.exists()).map(|p| p.display().to_string()));
+    missing.extend(
+        self_paths
+            .iter()
+            .filter(|p| !p.exists())
+            .map(|p| p.display().to_string()),
+    );
     if !missing.is_empty() {
         eprintln!("skip: missing {}", missing.join(", "));
         return;
@@ -71,7 +77,13 @@ fn qwen35_9b_cpu_logits_match_llama_cpp() {
     let reference = lucina_parity::Logits::read(&ref_path, N_VOCAB).unwrap();
     let spreads = self_paths
         .iter()
-        .map(|p| lucina_parity::Report::new(&reference, &lucina_parity::Logits::read(p, N_VOCAB).unwrap()).unwrap())
+        .map(|p| {
+            lucina_parity::Report::new(
+                &reference,
+                &lucina_parity::Logits::read(p, N_VOCAB).unwrap(),
+            )
+            .unwrap()
+        })
         .collect::<Vec<_>>();
     let tol = lucina_parity::Tolerance::from_self_spread(&spreads.iter().collect::<Vec<_>>(), 2.0);
 
@@ -79,7 +91,10 @@ fn qwen35_9b_cpu_logits_match_llama_cpp() {
     cfg.device.dev = Some("cpu".into());
     let m = infr_llama::SeamModel::load_with(Path::new(&model), None, Arc::new(cfg)).unwrap();
     let (logits, _h) = m.verify_logits_and_h_cpu(&tokens).unwrap();
-    let test = lucina_parity::Logits { n_vocab: N_VOCAB, data: logits };
+    let test = lucina_parity::Logits {
+        n_vocab: N_VOCAB,
+        data: logits,
+    };
 
     let rep = lucina_parity::Report::new(&reference, &test).unwrap();
     eprintln!("{}", serde_json::to_string_pretty(&rep.json()).unwrap());
@@ -90,7 +105,10 @@ fn qwen35_9b_cpu_logits_match_llama_cpp() {
     tol.check(&rep).unwrap();
 
     let (agree, total) = rep.top1_decisive();
-    assert_eq!(agree, total, "argmax flips on decisive positions: {agree}/{total}");
+    assert_eq!(
+        agree, total,
+        "argmax flips on decisive positions: {agree}/{total}"
+    );
     assert_eq!(rep.rows.len(), tokens.len(), "one row per prompt token");
 }
 
@@ -100,12 +118,14 @@ fn qwen35_9b_cpu_logits_match_llama_cpp() {
 /// Self-skips when the f64 file or the oracle files are missing.
 #[test]
 fn qwen35_9b_cpu_logits_within_2x_of_llama_cpp_distance_from_f64() {
-    let model =
-        std::env::var("LUCINA_PARITY_Q35_9B").unwrap_or_else(|_| q35_9b_default());
+    let model = std::env::var("LUCINA_PARITY_Q35_9B").unwrap_or_else(|_| q35_9b_default());
     let work = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../work");
     let f64_path = work.join("f64/q35-9b-chat.logits.f32");
     let tokens_path = work.join("ref/q35-9b-chat-b512.tokens.txt");
-    let llama = [work.join("ref/q35-9b-chat-b512.logits.f32"), work.join("ref/q35-9b-chat-seq.logits.f32")];
+    let llama = [
+        work.join("ref/q35-9b-chat-b512.logits.f32"),
+        work.join("ref/q35-9b-chat-seq.logits.f32"),
+    ];
     let missing: Vec<String> = std::iter::once(PathBuf::from(&model))
         .chain([f64_path.clone(), tokens_path.clone()])
         .chain(llama.iter().cloned())
@@ -119,7 +139,10 @@ fn qwen35_9b_cpu_logits_within_2x_of_llama_cpp_distance_from_f64() {
     let exact = lucina_parity::Logits::read(&f64_path, N_VOCAB).unwrap();
     let spreads: Vec<_> = llama
         .iter()
-        .map(|p| lucina_parity::Report::new(&exact, &lucina_parity::Logits::read(p, N_VOCAB).unwrap()).unwrap())
+        .map(|p| {
+            lucina_parity::Report::new(&exact, &lucina_parity::Logits::read(p, N_VOCAB).unwrap())
+                .unwrap()
+        })
         .collect();
     let tol = lucina_parity::Tolerance::from_self_spread(&spreads.iter().collect::<Vec<_>>(), 2.0);
     let tokens = lucina_parity::read_tokens(&tokens_path).unwrap();
@@ -127,7 +150,14 @@ fn qwen35_9b_cpu_logits_within_2x_of_llama_cpp_distance_from_f64() {
     cfg.device.dev = Some("cpu".into());
     let m = infr_llama::SeamModel::load_with(Path::new(&model), None, Arc::new(cfg)).unwrap();
     let (logits, _h) = m.verify_logits_and_h_cpu(&tokens).unwrap();
-    let rep = lucina_parity::Report::new(&exact, &lucina_parity::Logits { n_vocab: N_VOCAB, data: logits }).unwrap();
+    let rep = lucina_parity::Report::new(
+        &exact,
+        &lucina_parity::Logits {
+            n_vocab: N_VOCAB,
+            data: logits,
+        },
+    )
+    .unwrap();
     eprintln!("engine vs f64: {}", rep.json());
     tol.check(&rep).unwrap();
 }

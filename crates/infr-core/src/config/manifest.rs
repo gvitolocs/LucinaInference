@@ -272,6 +272,7 @@ knobs! {
 
     // ── spec ─────────────────────────────────────────────────────────────────
     "INFR_MTP"                => "spec.mtp",             Literal,     Ignored, "1",         migrated;
+    "INFR_MTP_MEASURE"        => "spec.mtp_measure",     Literal,     Ignored, "1",         migrated;
     "INFR_NO_MTP_CKPT"        => "spec.mtp_ckpt",        PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_REPRIME"     => "spec.mtp_reprime",     PresenceInv, Ignored, "1",         migrated;
     "INFR_NO_MTP_DRAFT_CHAIN" => "spec.mtp_draft_chain", PresenceInv, Ignored, "1",         migrated;

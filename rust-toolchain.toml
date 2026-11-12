@@ -1,0 +1,7 @@
+# Pinned because `fmt`, `clippy` and `doc` gate on rustfmt output and the lint set, both of which
+# move between rustc releases: without this file CI resolves `stable`, which is a different toolchain
+# every week. `actions-rust-lang/setup-rust-toolchain` reads it when no `toolchain:` input is given.
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

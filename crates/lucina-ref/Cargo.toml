@@ -12,6 +12,8 @@ lucina-rules = { path = "../lucina-rules" }
 half.workspace = true
 memmap2.workspace = true
 rayon.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [[bin]]
 name = "lucina-ref-logits"
