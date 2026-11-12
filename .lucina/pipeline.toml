@@ -1,0 +1,33 @@
+# Local merge gates for LucinaInference, declared the way LucinaOS declares its own in
+# `.lucina/pipeline.toml`: a `[merge]` block plus one `[[gate]]` per check the local merge
+# pipeline runs before a change lands. A `[[gate]]` runs its `run` command from the repository
+# root after the merge is staged; the merge proceeds only if every gate whose `paths` match the
+# change exits 0 (`paths = []` means the gate always runs). This is a LOCAL gate, not GitHub
+# Actions — see docs/ci.md for what CI runs and why these checks are not there.
+
+[merge]
+# The pipeline's own language/build defaults apply; this repo adds no cargo/diffgate gate here
+# yet. Only the gates declared below are enforced by the merge pipeline.
+timeout_min = 30
+
+# Tools and files the gates judge with. A change that touches one of these cannot certify
+# itself: the merge pipeline treats an edit here as the gate changing its own rules and
+# requires an explicit allow reason. `.lucina/` and the `run` commands below are protected
+# automatically; the entries here are the wider set that would let a gate lie.
+gate_files = [
+    "scripts/check-private-strings.sh",
+    "scripts/public-sync.sh",
+    "scripts/local.env.example",
+    "docs/ci/PUBLIC-SYNC.md",
+]
+
+# Private strings — host names, the home path, service ports, local tool names — must never
+# reach a tracked file or a commit message. The regex lives only in the gitignored
+# scripts/local.env (LI_PRIVATE_PATTERNS) and is deliberately absent from the repository, so
+# the gate exits 2 (a hard stop, never a silent pass) when it is not configured. The scrubbed
+# public copy is rebuilt from this invariant; see docs/ci/PUBLIC-SYNC.md.
+[[gate]]
+name = "no private strings in tracked files"
+paths = []
+run = "scripts/check-private-strings.sh --tree"
+timeout_min = 2

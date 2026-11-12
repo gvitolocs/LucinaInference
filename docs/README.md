@@ -84,6 +84,13 @@ at that index. It holds:
   runs natively on Linux, macOS and Windows, which jobs stay single-platform and
   why, and the `target-cpu=native` and `msvc`-vs-`gnu` traps to know before
   editing the workflow.
+- [ci.md](ci.md) — every CI job and runner (`.github/workflows/ci.yml` and
+  `cron.yml`), what is deliberately **not** run in CI (GPU tests, the llama.cpp
+  parity oracle, Verus proofs, real-model coverage beyond the CPU goldens) and
+  where each runs instead, plus the local merge gates.
+- [ci/PUBLIC-SYNC.md](ci/PUBLIC-SYNC.md) — how the private `main` becomes the
+  public one: the private-string gate, the external scrub tool and pattern that
+  are kept out of the repository on purpose, and how to recover a bad sync.
 
 ## Audit
 
