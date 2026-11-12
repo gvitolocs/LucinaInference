@@ -917,6 +917,13 @@ impl SeamModel {
             .to_vec())
     }
 
+    /// [`encode`](Self::encode) plus llama.cpp's `/completion` BOS rule — `infr run --raw`'s
+    /// prompt, i.e. bare text with BOS prepended iff the GGUF sets `add_bos_token` and still no
+    /// chat template. See [`crate::tokenize_raw`] for the cited reference lines.
+    pub fn encode_raw(&self, text: &str) -> Result<Vec<u32>> {
+        crate::tokenize_raw(&self.gguf, &self.tokenizer, text)
+    }
+
     /// Raw tokenizer accessor for callers outside this module that need incremental detok (the
     /// diffusion decode loop, Phase 3) via the shared [`crate::stream_token`] helper.
     pub(crate) fn tokenizer(&self) -> &Tokenizer {

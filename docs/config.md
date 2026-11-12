@@ -168,6 +168,14 @@ also on `bench`); `infr <cmd> --help` is the authority.
 `device.threads` has no `INFR_*` twin — it is published as `RAYON_NUM_THREADS`,
 because rayon's global pool has no other input.
 
+`infr run` also takes four parity switches that map to NO config path and no env,
+because they change what the command *is* rather than how it is tuned: `--raw`
+tokenizes the prompt as bare text (BOS iff the GGUF sets `add_bos_token`, no chat
+template, no `think` stripping — llama.cpp's `/completion` behavior),
+`--prompt-file PATH` reads that prompt as the file's exact bytes, and
+`--print-ids PATH` / `--print-prompt-ids PATH` write the generated and tokenized
+token ids, one per line. See `infr run --help`.
+
 ## What is tunable
 
 The authority is

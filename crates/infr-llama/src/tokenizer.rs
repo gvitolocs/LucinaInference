@@ -323,6 +323,59 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     Ok(tok)
 }
 
+/// Tokenize `text` the way llama.cpp's `/completion` tokenizes a prompt — the tokenization a parity
+/// test against `llama-server` / `llama-tokenize` has to reproduce, and deliberately not the chat
+/// path: no template, no `think` tags.
+///
+/// The reference is llama.cpp `3612199ed`: `/completion` calls
+/// `tokenize_input_prompts(vocab, mctx, prompt, /*add_special*/ true, /*parse_special*/ true, ..)`
+/// (`tools/server/server-context.cpp:4327`; the CLI path `:2239` is identical), which reaches
+/// `common_tokenize(vocab, s, add_special, parse_special)` at `tools/server/server-common.cpp:880`.
+/// The `llama-tokenize` tool defaults `parse_special` to true "like the old tokenize tool"
+/// (`common/arg.cpp:1407`), so it is the same reference for a bare file.
+///
+/// * **BOS iff the GGUF says so.** `add_special` reaches a bare prompt as BOS and nothing else:
+///   `src/llama-vocab.cpp:2616` loads `add_bos` from `tokenizer.ggml.add_bos_token` (key name
+///   `src/llama-arch.cpp:391`; a GGUF without the key leaves it `false` — `:1824`), and every vocab
+///   family's `tokenize` prepends `special_bos_id` on `add_special && add_bos` — SPM
+///   `src/llama-vocab.cpp:3412`, UGM `:3523`, and the BPE arm's `append_bos` `:3470`, which applies
+///   the same key (`:579`). So: prepend the id from `tokenizer.ggml.bos_token_id`, exactly once.
+///   llama.cpp would also append EOS / SEP for `add_special` when `tokenizer.ggml.add_eos_token` /
+///   `add_sep_token` are set (`:3449`, `:3547`); the GGUFs these runs target set neither, and
+///   appending EOS would end the prompt before a token is generated — this implements the BOS half,
+///   which is what the key names.
+/// * **Specials ARE parsed out of the text.** `parse_special = true` makes `tokenizer_st_partition`
+///   (`src/llama-vocab.cpp:3225`) cut every literal occurrence of a CONTROL or USER_DEFINED vocab
+///   entry out of the prompt and emit its id, so `<|im_start|>` written in a prompt is the
+///   `<|im_start|>` token, not the characters it is spelled with. The shared tokenizer already does
+///   exactly that: [`register_token_types`] adds type 3 as special and type 4 as added tokens, and
+///   `encode` with the default `encode_special_tokens = false` matches both atomically. No second
+///   pass is needed.
+///
+/// The second argument of `encode` is NOT the `add_special` flag: in `tokenizers` it only reaches the
+/// post-processor, and a GGUF-derived tokenizer has none (`build_tokenizer` never sets one), so
+/// BOS is added here from the GGUF keys instead.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn tokenize_raw(g: &Gguf, tok: &Tokenizer, text: &str) -> Result<Vec<u32>> {
+    let md = g.metadata();
+    let encoded = tok
+        .encode(text, false)
+        .map_err(|e| anyhow!("encode: {e}"))?;
+    let mut ids: Vec<u32> = encoded.get_ids().to_vec();
+    if matches!(
+        md.get("tokenizer.ggml.add_bos_token"),
+        Some(MetaValue::Bool(true))
+    ) {
+        let bos = md.u64("tokenizer.ggml.bos_token_id").ok_or_else(|| {
+            anyhow!("tokenizer.ggml.add_bos_token is true and the GGUF has no tokenizer.ggml.bos_token_id")
+        })?;
+        let bos =
+            u32::try_from(bos).map_err(|_| anyhow!("invalid tokenizer.ggml.bos_token_id {bos}"))?;
+        ids.insert(0, bos);
+    }
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tokenizer_tests {
     use super::*;
@@ -606,5 +659,429 @@ mod tokenizer_tests {
         // template tokenizer: <|im_end|> matched as the special id; user tokenizer: NOT.
         assert!(tok.encode(s, false).unwrap().get_ids().contains(&im_end));
         assert!(!user.encode(s, false).unwrap().get_ids().contains(&im_end));
+    }
+
+    // ── `infr run --raw` tokenization ([`tokenize_raw`]) ──────────────────────────────────────
+    //
+    /// The bytes of a GGUF carrying exactly the `tokenizer.ggml.*` keys [`build_tokenizer`] reads
+    /// for the byte-level BPE family, with a vocab small enough to reason about by hand.
+    ///
+    /// Vocab (id = index): 0 `<unk>`, 1 `<s>`, 2 `a`, 3 `b`, 4 `ab`, 5 `<ctrl>`, 6 `<ud>`;
+    /// `bos_token_id` = 1; `merges` = the one line `a b`, so `"ab"` encodes to exactly `[4]` — the id
+    /// vector every assertion below is written against. `token_type` marks 0, 1 and 5 CONTROL and 6
+    /// USER_DEFINED, so a literal `<ctrl>` or `<ud>` in the text must come out as its single id
+    /// (llama.cpp's `parse_special = true`, which `/completion` uses).
+    ///
+    /// `add_bos` is the `tokenizer.ggml.add_bos_token` value — `None` omits the key entirely, which
+    /// is llama.cpp's `false` by default and the state an instruct GGUF ships in. `bos_id` picks
+    /// whether `bos_token_id` is present at all.
+    fn raw_tokenizer_gguf(add_bos: Option<bool>, bos_id: bool) -> Vec<u8> {
+        fn u32le(b: &mut Vec<u8>, v: u32) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        fn u64le(b: &mut Vec<u8>, v: u64) {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        fn s(b: &mut Vec<u8>, v: &str) {
+            u64le(b, v.len() as u64);
+            b.extend_from_slice(v.as_bytes());
+        }
+        fn kv_str(b: &mut Vec<u8>, key: &str, value: &str) {
+            s(b, key);
+            u32le(b, 8); // GGUF_TYPE_STRING
+            s(b, value);
+        }
+        fn kv_u32(b: &mut Vec<u8>, key: &str, value: u32) {
+            s(b, key);
+            u32le(b, 4); // GGUF_TYPE_UINT32
+            u32le(b, value);
+        }
+        fn kv_bool(b: &mut Vec<u8>, key: &str, value: bool) {
+            s(b, key);
+            u32le(b, 7); // GGUF_TYPE_BOOL
+            b.push(u8::from(value));
+        }
+        fn kv_str_arr(b: &mut Vec<u8>, key: &str, values: &[&str]) {
+            s(b, key);
+            u32le(b, 9); // GGUF_TYPE_ARRAY
+            u32le(b, 8); // element type: STRING
+            u64le(b, values.len() as u64);
+            for v in values {
+                s(b, v);
+            }
+        }
+        fn kv_u32_arr(b: &mut Vec<u8>, key: &str, values: &[u32]) {
+            s(b, key);
+            u32le(b, 9); // GGUF_TYPE_ARRAY
+            u32le(b, 4); // element type: UINT32
+            u64le(b, values.len() as u64);
+            for v in values {
+                u32le(b, *v);
+            }
+        }
+
+        // One entry per KV below. The count must match exactly or the tensor-table parse starts in
+        // the middle of the metadata.
+        let mut kv: Vec<Vec<u8>> = Vec::new();
+        let mut b = Vec::new();
+        kv_str(&mut b, "tokenizer.ggml.model", "gpt2");
+        kv.push(b);
+        let mut b = Vec::new();
+        kv_str_arr(
+            &mut b,
+            "tokenizer.ggml.tokens",
+            &["<unk>", "<s>", "a", "b", "ab", "<ctrl>", "<ud>"],
+        );
+        kv.push(b);
+        let mut b = Vec::new();
+        kv_str_arr(&mut b, "tokenizer.ggml.merges", &["a b"]);
+        kv.push(b);
+        let mut b = Vec::new();
+        kv_u32_arr(&mut b, "tokenizer.ggml.token_type", &[3, 3, 1, 1, 1, 3, 4]);
+        kv.push(b);
+        if bos_id {
+            let mut b = Vec::new();
+            kv_u32(&mut b, "tokenizer.ggml.bos_token_id", 1);
+            kv.push(b);
+        }
+        if let Some(v) = add_bos {
+            let mut b = Vec::new();
+            kv_bool(&mut b, "tokenizer.ggml.add_bos_token", v);
+            kv.push(b);
+        }
+
+        let mut bytes = Vec::new();
+        u32le(&mut bytes, 0x4655_4747); // GGUF magic
+        u32le(&mut bytes, 3); // version
+        u64le(&mut bytes, 0); // tensor count: a tokenizer-only fixture never reaches the data region
+        u64le(&mut bytes, kv.len() as u64); // metadata count
+        for entry in &kv {
+            bytes.extend_from_slice(entry);
+        }
+        bytes
+    }
+
+    /// Write a fixture, open it, build the GGUF-derived tokenizer, run `f`, then remove the file —
+    /// the byte-level precedent of `crate::config`'s `config_from_fixture` (`tempfile` is not a
+    /// dev-dependency here, and pid + counter keeps parallel tests off one path).
+    fn with_raw_tokenizer<T>(
+        name: &str,
+        bytes: &[u8],
+        f: impl FnOnce(&Gguf, &Tokenizer) -> T,
+    ) -> T {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "infr-llama-raw-tok-{name}-{}-{n}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).expect("write GGUF fixture");
+        let g = Gguf::open(&path).expect("open GGUF fixture");
+        let tok = build_tokenizer(&g).expect("build tokenizer from GGUF fixture");
+        let out = f(&g, &tok);
+        std::fs::remove_file(&path).expect("remove GGUF fixture");
+        out
+    }
+
+    /// The bare-text ids of `text` on this tokenizer, specials matched as the vocab's flag says.
+    fn bare_ids(tok: &Tokenizer, text: &str) -> Vec<u32> {
+        tok.encode(text, false).unwrap().get_ids().to_vec()
+    }
+
+    #[test]
+    fn raw_tokenize_adds_bos_only_when_the_gguf_asks_for_it() {
+        with_raw_tokenizer("bos", &raw_tokenizer_gguf(Some(true), true), |g, tok| {
+            // The shared tokenizer on bare text: `"ab"` is the one merge, so `[4]`, no BOS. Nothing
+            // a chat template would have added is in here — that is `--raw`'s whole point.
+            assert_eq!(bare_ids(tok, "ab"), vec![4], "bare ids");
+            // `add_bos_token=true` → llama.cpp prepends `bos_token_id` and changes nothing else.
+            assert_eq!(tokenize_raw(g, tok, "ab").unwrap(), vec![1, 4]);
+            assert_eq!(tokenize_raw(g, tok, "a").unwrap(), vec![1, 2]);
+            // An empty prompt is BOS alone — the case llama.cpp's own comment at
+            // src/llama-vocab.cpp:3406 spells out for `add_special = true`.
+            assert_eq!(tokenize_raw(g, tok, "").unwrap(), vec![1]);
+        });
+
+        // The two ways a GGUF says "no BOS": the key set false, and the key absent, which leaves
+        // llama.cpp's `add_bos` at its `false` initial value (src/llama-vocab.cpp:1824, :2616).
+        for (case, add_bos) in [("false", Some(false)), ("absent", None)] {
+            with_raw_tokenizer(case, &raw_tokenizer_gguf(add_bos, true), |g, tok| {
+                assert_eq!(tokenize_raw(g, tok, "ab").unwrap(), vec![4]);
+            });
+        }
+
+        // `add_bos_token=true` with no `bos_token_id` is a broken GGUF — llama.cpp GGML_ASSERTs on
+        // it (src/llama-vocab.cpp:3413). A named error beats answering a shifted prompt.
+        with_raw_tokenizer(
+            "no-bos-id",
+            &raw_tokenizer_gguf(Some(true), false),
+            |g, tok| {
+                let err = tokenize_raw(g, tok, "ab").unwrap_err().to_string();
+                assert!(
+                    err.contains("bos_token_id"),
+                    "expected the missing-id error, got: {err}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn raw_tokenize_parses_specials_out_of_the_prompt() {
+        with_raw_tokenizer(
+            "parse-special",
+            &raw_tokenizer_gguf(Some(true), true),
+            |g, tok| {
+                let control = tok.token_to_id("<ctrl>").unwrap();
+                // `/completion` runs with `parse_special = true`: a CONTROL marker written in the
+                // prompt is its one id, with the text around it tokenized on either side.
+                assert_eq!(tokenize_raw(g, tok, "<ctrl>").unwrap(), vec![1, control]);
+                assert_eq!(
+                    tokenize_raw(g, tok, "a<ctrl>b").unwrap(),
+                    vec![1, 2, control, 3]
+                );
+                assert_eq!(
+                    tokenize_raw(g, tok, "<ctrl>ab<ctrl>").unwrap(),
+                    vec![1, control, 4, control]
+                );
+            },
+        );
+    }
+
+    /// USER_DEFINED markers are cut out too (`tokenizer_st_partition`, `src/llama-vocab.cpp:3225`):
+    /// `<ud>` is one id with the text around it tokenized on either side of it.
+    #[test]
+    fn raw_tokenize_cuts_user_defined_tokens_out_of_the_prompt() {
+        with_raw_tokenizer(
+            "user-defined",
+            &raw_tokenizer_gguf(Some(true), true),
+            |g, tok| {
+                let ud = tok.token_to_id("<ud>").unwrap();
+                assert_eq!(tokenize_raw(g, tok, "a<ud>b").unwrap(), vec![1, 2, ud, 3]);
+                assert_eq!(tokenize_raw(g, tok, "<ud>").unwrap(), vec![1, ud]);
+                assert_eq!(
+                    tokenize_raw(g, tok, "<ud>ab<ud>").unwrap(),
+                    vec![1, ud, 4, ud]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn raw_tokenize_follows_the_gguf_flags_on_a_real_model_too() {
+        // The same two rules on a real vocab, asserted against the GGUF's own metadata rather than a
+        // hand-written id vector. Self-skips without the model, like
+        // `embedded_tokenizer_matches_sidecar`.
+        let Some(gguf) = crate::test_qwen3_06b() else {
+            eprintln!("skip: Qwen3-0.6B not in the HF cache");
+            return;
+        };
+        let g = Gguf::open(&gguf).unwrap();
+        let tok = build_tokenizer(&g).unwrap();
+        let md = g.metadata();
+        let add_bos = matches!(
+            md.get("tokenizer.ggml.add_bos_token"),
+            Some(MetaValue::Bool(true))
+        );
+        // Ordinary prose: no special string in it, so the two flags are the only difference from
+        // what the chat path tokenizes.
+        let bare = bare_ids(&tok, "The capital of France is");
+        let raw = tokenize_raw(&g, &tok, "The capital of France is").unwrap();
+        if add_bos {
+            let bos =
+                md.u64("tokenizer.ggml.bos_token_id")
+                    .expect("add_bos_token=true must carry a bos_token_id") as u32;
+            assert_eq!(raw, [vec![bos], bare].concat());
+        } else {
+            assert_eq!(raw, bare, "no add_bos_token means no BOS, ever");
+        }
+    }
+
+    // ── `tokenize_raw` against llama.cpp itself, on the real model ─────────────────────────────
+    //
+    /// The check the fixture tests cannot make: they assert what the GGUF keys SAY, this one asserts
+    /// what llama.cpp DOES with them. It runs `llama-tokenize` over the same prompt files a parity
+    /// run feeds the engine and compares the id lists with [`tokenize_raw`], on the real model.
+    ///
+    /// `#[ignore]`d because it needs a llama.cpp build, the ~17 GB GGUF and the Hipfire prompt tree,
+    /// none of which belongs in a CI run. All four come from the environment so no host path enters
+    /// the repo, and anything missing prints a `skip:` line and passes — a test that fails for want
+    /// of a 17 GB file teaches nobody anything:
+    ///
+    /// ```text
+    /// LI_RAW_PARITY_GGUF=<model.gguf> LI_LLAMA_TOKENIZE=<llama-tokenize> \
+    /// LI_RAW_PARITY_DIR=<prompt dir> LI_RAW_PARITY_FILES=<a.txt,b.txt> \
+    ///   cargo test -p infr-llama raw_tokenize_matches_llama_cpp -- --ignored --nocapture
+    /// ```
+    ///
+    /// `LI_RAW_PARITY_FILES` splits on `,` and whitespace (paths containing either are not
+    /// supported) and resolves each entry against `LI_RAW_PARITY_DIR` unless it is absolute.
+    /// `LD_LIBRARY_PATH` is inherited by the child, which is how a reference binary that needs the
+    /// libs it was linked against gets them.
+    ///
+    /// The reference side is `llama-tokenize -m <gguf> -f <file> --ids --log-disable --no-escape`,
+    /// and it is `/completion`'s tokenization of the same bytes, by its own source at `3612199ed`
+    /// (`tools/tokenize/tokenize.cpp`):
+    ///
+    /// * `-f` reads the file VERBATIM — the tool's comment says it skips common's trailing-newline
+    ///   strip because "a trailing newline is itself a token". The same bytes `--prompt-file` takes.
+    /// * `--no-escape` is not optional: `common_params::escape` defaults to `true`
+    ///   (`common/common.h:565`) and the tool runs `string_process_escapes` over the file, so without
+    ///   it a literal backslash-n in a code prompt becomes a newline on the reference side ONLY.
+    /// * `parse_special` is TRUE on both sides: `/completion` calls
+    ///   `tokenize_input_prompts(.., add_special = true, parse_special = true)`
+    ///   (`tools/server/server-context.cpp:4327`), and the tokenize tool defaults it to true
+    ///   "like the old tokenize tool" (`common/arg.cpp:1407`). So `<|im_start|>` written in a
+    ///   prompt file is the special id on the reference side. A `tokenize_raw` that keeps specials
+    ///   as plain text FAILS this test on any prompt containing one, by design of the oracle.
+    /// * BOS: the tool passes `llama_vocab_get_add_bos(vocab) && !--tokenize-no-bos` (flag left off)
+    ///   as `add_special` — the model's own `add_bos_token`, i.e. [`tokenize_raw`]'s rule.
+    ///   `/completion` passes `add_special = true` unconditionally, so the two references differ only
+    ///   for a GGUF that sets `add_eos_token` / `add_sep_token`, which llama.cpp would append and
+    ///   this tool would not. All three keys print below so a failure can be read against them, and
+    ///   so does `tokenizer.ggml.pre`: the reference build on this host predates the pinned commit,
+    ///   and between the two the only tokenizer changes are two new pre-tokenizer families, so a
+    ///   prompt tokenized under any other `pre` is tokenized identically by both.
+    ///
+    /// [`Gguf::open`] maps the file and reads the KV metadata and the tensor table; the weights are
+    /// never read, and the tokenizer path has no device to read them into.
+    #[test]
+    #[ignore = "needs a llama.cpp build, the parity GGUF and the prompt files (env vars)"]
+    fn raw_tokenize_matches_llama_cpp() {
+        fn env(name: &str) -> Option<String> {
+            std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+        }
+        const NEEDED: [&str; 4] = [
+            "LI_RAW_PARITY_GGUF",
+            "LI_LLAMA_TOKENIZE",
+            "LI_RAW_PARITY_DIR",
+            "LI_RAW_PARITY_FILES",
+        ];
+        for name in NEEDED {
+            if env(name).is_none() {
+                eprintln!("skip: {name} is unset — see the doc comment on this test");
+                return;
+            }
+        }
+
+        /// The five ids either side of `at`, which is what a mismatch has to show: the index alone
+        /// says nothing about whether one side lost a token or merged two.
+        fn around(ids: &[u32], at: usize) -> Vec<u32> {
+            let lo = at.saturating_sub(5);
+            ids[lo..(at + 6).min(ids.len())].to_vec()
+        }
+
+        /// `llama-tokenize --ids` prints the whole list as one bracketed, comma-separated line.
+        fn llama_ids(
+            tool: &std::path::Path,
+            model: &std::path::Path,
+            prompt: &std::path::Path,
+        ) -> Vec<u32> {
+            let out = std::process::Command::new(tool)
+                .arg("-m")
+                .arg(model)
+                .arg("-f")
+                .arg(prompt)
+                .args(["--ids", "--log-disable", "--no-escape"])
+                .output()
+                .unwrap_or_else(|e| panic!("run {}: {e}", tool.display()));
+            if !out.status.success() {
+                panic!(
+                    "{} failed on {} ({}): {}",
+                    tool.display(),
+                    prompt.display(),
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let body = text
+                .strip_prefix('[')
+                .and_then(|t| t.strip_suffix(']'))
+                .unwrap_or_else(|| {
+                    panic!("unexpected --ids output from {}: {text:?}", tool.display())
+                });
+            body.split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<u32>()
+                        .unwrap_or_else(|e| panic!("bad id {s:?} from {}: {e}", tool.display()))
+                })
+                .collect()
+        }
+
+        let gguf_path = std::path::PathBuf::from(env("LI_RAW_PARITY_GGUF").unwrap());
+        let tool = std::path::PathBuf::from(env("LI_LLAMA_TOKENIZE").unwrap());
+        let dir = std::path::PathBuf::from(env("LI_RAW_PARITY_DIR").unwrap());
+        let prompts: Vec<std::path::PathBuf> = env("LI_RAW_PARITY_FILES")
+            .unwrap()
+            .split([',', ' ', '\t', '\r', '\n'])
+            .filter(|s| !s.is_empty())
+            .map(std::path::Path::new)
+            .map(|p| {
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    dir.join(p)
+                }
+            })
+            .collect();
+        assert!(!prompts.is_empty(), "LI_RAW_PARITY_FILES named no file");
+
+        let g = Gguf::open(&gguf_path).expect("open the parity GGUF");
+        let tok = build_tokenizer(&g).expect("build the tokenizer from the parity GGUF");
+        let md = g.metadata();
+        println!("parity model: {}", gguf_path.display());
+        println!(
+            "  tokenizer.ggml.pre         = {:?}",
+            md.get("tokenizer.ggml.pre").and_then(MetaValue::as_str)
+        );
+        for key in ["add_bos_token", "add_eos_token", "add_sep_token"] {
+            let full = format!("tokenizer.ggml.{key}");
+            println!("  {full:30} = {:?}", md.get(&full));
+        }
+        println!(
+            "  reference = {} (LD_LIBRARY_PATH = {:?})",
+            tool.display(),
+            env("LD_LIBRARY_PATH").unwrap_or_default()
+        );
+
+        let mut total = 0usize;
+        for prompt in &prompts {
+            let bytes = std::fs::read(prompt)
+                .unwrap_or_else(|e| panic!("read prompt {}: {e}", prompt.display()));
+            let text = String::from_utf8(bytes).unwrap_or_else(|e| {
+                panic!(
+                    "{} is not valid UTF-8 ({} bytes), and tokenize_raw takes &str: {e}",
+                    prompt.display(),
+                    e.utf8_error().valid_up_to()
+                )
+            });
+            let want = llama_ids(&tool, &gguf_path, prompt);
+            let got = tokenize_raw(&g, &tok, &text).expect("tokenize_raw");
+            let first_diff = got
+                .iter()
+                .zip(want.iter())
+                .position(|(mine, theirs)| mine != theirs)
+                .unwrap_or(got.len().min(want.len()));
+            if first_diff != got.len() || got.len() != want.len() {
+                panic!(
+                    "{}: the two id lists differ at index {first_diff} (infr {} ids, llama.cpp {})\n  \
+                     infr      [{first_diff}]: {:?}\n  llama.cpp [{first_diff}]: {:?}",
+                    prompt.display(),
+                    got.len(),
+                    want.len(),
+                    around(&got, first_diff),
+                    around(&want, first_diff),
+                );
+            }
+            let name = prompt.file_name().unwrap_or_default().to_string_lossy();
+            println!("  {name}: {} ids, identical", got.len());
+            total += got.len();
+        }
+        println!(
+            "{} prompts, {total} ids: tokenize_raw is llama.cpp's, byte for byte",
+            prompts.len()
+        );
     }
 }

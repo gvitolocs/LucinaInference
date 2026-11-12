@@ -355,6 +355,27 @@ enum Cmd {
             hide_env = true
         )]
         diffusion_visual: String,
+        /// Parity mode: tokenize the prompt as BARE TEXT and generate from those ids — no chat
+        /// template, no `think` handling, and BOS prepended iff the GGUF sets
+        /// `tokenizer.ggml.add_bos_token`. That is exactly llama.cpp's `common_tokenize(…, true)`
+        /// (see `infr_llama::tokenize_raw` for the cited lines), so a harness can diff infr against
+        /// `llama-completion` prompt for prompt. One-shot: needs a message or `--prompt-file`.
+        #[arg(long)]
+        raw: bool,
+        /// Read the prompt from `PATH` as its EXACT bytes instead of from the MESSAGE argument — no
+        /// trailing-newline stripping, because a dropped newline is one id fewer and one id fewer is
+        /// the kind of difference a parity run should not have to hunt for.
+        #[arg(long, value_name = "PATH")]
+        prompt_file: Option<PathBuf>,
+        /// Write the GENERATED token ids, one per line, to `PATH`. The prompt's ids are not in it
+        /// (`--print-prompt-ids` writes those), and the terminating EOS is not: it is emitted
+        /// nowhere else either. `--raw` only.
+        #[arg(long, value_name = "PATH")]
+        print_ids: Option<PathBuf>,
+        /// Write the tokenized PROMPT ids, one per line, to `PATH` — with `--raw` these are the ids
+        /// llama.cpp would prefill for the same text, which is the half to compare first.
+        #[arg(long, value_name = "PATH")]
+        print_prompt_ids: Option<PathBuf>,
         #[command(flatten)]
         device: DeviceOpts,
         #[command(flatten)]
@@ -653,11 +674,21 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             model,
             message,
             diffusion_visual,
+            raw,
+            prompt_file,
+            print_ids,
+            print_prompt_ids,
             ..
         } => cmd_run(
             &model,
             message.as_deref(),
             &diffusion_visual,
+            &RunRaw {
+                raw,
+                prompt_file: prompt_file.as_deref(),
+                print_ids: print_ids.as_deref(),
+                print_prompt_ids: print_prompt_ids.as_deref(),
+            },
             cfg,
             specified,
         ),
@@ -1082,14 +1113,71 @@ fn build_chat_model(
     }
 }
 
+/// `infr run`'s prompt-parity switches (`--raw`, `--prompt-file`, `--print-ids`,
+/// `--print-prompt-ids`), grouped so `cmd_run`'s argument list stays readable.
+struct RunRaw<'a> {
+    /// `--raw`: tokenize the prompt as bare text and generate from those ids.
+    raw: bool,
+    /// `--prompt-file`: take the prompt from this file's exact bytes instead of MESSAGE.
+    prompt_file: Option<&'a Path>,
+    /// `--print-ids`: write the GENERATED token ids, one per line, here.
+    print_ids: Option<&'a Path>,
+    /// `--print-prompt-ids`: write the tokenized PROMPT ids, one per line, here.
+    print_prompt_ids: Option<&'a Path>,
+}
+
+/// The combination rules of [`RunRaw`], checked before anything resolves or downloads so a wrong
+/// invocation fails on its own message.
+fn check_run_raw_opts(raw: &RunRaw<'_>, message: Option<&str>) -> anyhow::Result<()> {
+    if raw.prompt_file.is_some() && message.is_some() {
+        anyhow::bail!("pass the prompt either as MESSAGE or with --prompt-file, not both");
+    }
+    if !raw.raw && (raw.print_ids.is_some() || raw.print_prompt_ids.is_some()) {
+        // The id files are the raw forward's output. The chat path streams detokenized text through
+        // the `think` renderer and never hands its token ids to the caller at all, so it has nothing
+        // true to write here.
+        anyhow::bail!(
+            "--print-ids / --print-prompt-ids report the raw forward's token ids: add --raw"
+        );
+    }
+    if raw.raw && raw.prompt_file.is_none() && message.is_none() {
+        anyhow::bail!("--raw is one-shot: pass the prompt as MESSAGE or with --prompt-file");
+    }
+    Ok(())
+}
+
+/// `--prompt-file`: the file's exact bytes as the prompt. Deliberately no trim and no
+/// trailing-newline strip — llama.cpp tokenizes the prompt it is handed byte for byte, so dropping
+/// one newline here would shift every id the harness is trying to compare.
+fn read_prompt_file(path: &Path) -> anyhow::Result<String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| anyhow!("read --prompt-file {}: {e}", path.display()))?;
+    String::from_utf8(bytes)
+        .map_err(|e| anyhow!("--prompt-file {}: not valid UTF-8: {e}", path.display()))
+}
+
+/// Write token ids one per line, newline-terminated including the last, so an empty generation is
+/// an empty file and the result reads the same to `wc -l`, `comm` and `f.read().split()`.
+fn write_token_ids(path: &Path, ids: &[u32]) -> anyhow::Result<()> {
+    let mut buf = String::with_capacity(ids.len() * 4 + 1);
+    for id in ids {
+        buf.push_str(&id.to_string());
+        buf.push('\n');
+    }
+    std::fs::write(path, buf).map_err(|e| anyhow!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 fn cmd_run(
     model: &str,
     message: Option<&str>,
     diffusion_visual: &str,
+    raw: &RunRaw<'_>,
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
     use std::io::Write;
+    check_run_raw_opts(raw, message)?;
     let (gguf, tok) = resolve(model, cfg)?;
     // Stamped next to the mapping it guards, then checked before every turn below.
     let watch = infr_llama::WeightWatch::open_model(&gguf)?;
@@ -1114,6 +1202,76 @@ fn cmd_run(
     } else {
         2048
     };
+
+    // `--prompt-file` is only another SOURCE for MESSAGE — the file's exact bytes — so resolving it
+    // here (shadowing the argument) hands it to every branch below, one-shot and REPL alike, instead
+    // of the parity path needing its own copy of the generate calls.
+    let file_prompt = raw.prompt_file.map(read_prompt_file).transpose()?;
+    let message = message.or(file_prompt.as_deref());
+
+    // `--raw` — the llama.cpp `/completion` parity path. It deliberately does NOT go through
+    // `build_chat_model` + `Chat` below: that re-renders the whole history through the model's chat
+    // template (exactly what a parity run keeps OUT of the prompt) and strips `think` blocks from
+    // what it prints (exactly what a parity run keeps IN). One prompt, one forward, ids next to the
+    // text — and the ids come from the forward's own token stream, not from re-tokenizing anything.
+    if raw.raw {
+        let text = message.expect("check_run_raw_opts requires a prompt for --raw");
+        // The multi-GPU forwards do have id twins (`generate_pipeline_ids`, `generate_tp_ids`,
+        // `generate_ep_ids`), but a parity run against llama.cpp is single-device by construction —
+        // refuse rather than silently answer the prompt through a forward `infr run` never uses.
+        if infr_llama::seam::pipeline_devices(cfg).is_some()
+            || infr_llama::seam::tensor_parallel_devices(cfg).is_some()
+            || infr_llama::seam::expert_parallel_devices(cfg).is_some()
+        {
+            anyhow::bail!(
+                "--raw is the single-device parity path — not compatible with \
+                 INFR_PIPELINE / INFR_TENSOR_PARALLEL / INFR_EXPERT_PARALLEL"
+            );
+        }
+        if is_dg {
+            anyhow::bail!(
+                "--raw is autoregressive; diffusion-gemma denoises fixed blocks through its own \
+                 template and has no token-id stream to print"
+            );
+        }
+        let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
+        let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+        let prompt_ids = loaded.encode_raw(text)?;
+        if let Some(p) = raw.print_prompt_ids {
+            write_token_ids(p, &prompt_ids)?;
+        }
+        // Same mapping guard as `run_chat_turn`, at both ends of the turn.
+        watch.check()?;
+        // `on_id` sees every token the forward EMITS. The vector these primitives return additionally
+        // carries the terminating EOS (the runner pushes the sampled id before checking it,
+        // `seam/runner.rs:5925`) while `on_id` is not called for it (`:5929`), so collecting from the
+        // callback is what keeps the ids file and the printed text describing the SAME tokens — and
+        // what makes an EOS-terminated generation line up with llama.cpp, which never detokenizes
+        // its EOG either.
+        let mut emitted: Vec<u32> = Vec::new();
+        match selected_backend(&cfg)? {
+            Backend::Vulkan(_) => {
+                loaded.generate_vulkan_ids(&prompt_ids, max_new, |id| emitted.push(id))?
+            }
+            Backend::Cpu => loaded.generate_cpu_ids(&prompt_ids, max_new, |id| emitted.push(id))?,
+            // The Metal chat primitives return text only; inventing an ids twin for a backend no
+            // parity harness here runs is not worth an untested macOS path.
+            Backend::Metal => anyhow::bail!(
+                "--raw reports token ids and the Metal backend has no id-level forward yet \
+                 (INFR_DEV=vulkan or INFR_DEV=cpu do)"
+            ),
+        };
+        watch.check()?;
+        // One decode of the whole span, not a per-token stream: `stream_token` — every other path's
+        // detokenizer — decodes the accumulated ids and prints only the suffix past what it already
+        // printed, so the bytes it emits ARE this call's output.
+        // print-ok: program OUTPUT — the `--raw` reply, the point of the command.
+        println!("{}", loaded.decode(&emitted)?);
+        if let Some(p) = raw.print_ids {
+            write_token_ids(p, &emitted)?;
+        }
+        return Ok(());
+    }
 
     // Multi-GPU PIPELINE (layer-split): `INFR_PIPELINE=Vulkan0,Vulkan1` splits ONE model's layers
     // across the listed devices (weights + KV per-layer resident on their device, the residual
@@ -4580,6 +4738,10 @@ mod tests {
             model: "m".to_string(),
             message: None,
             diffusion_visual: String::new(),
+            raw: false,
+            prompt_file: None,
+            print_ids: None,
+            print_prompt_ids: None,
             device: device_opts(None),
             sampling: no_sampling_opts(),
         })
@@ -4838,5 +5000,140 @@ mod tests {
             placement_note(Some(&named)),
             " [ubatch 1024, kv q4_0, submit unlimited]"
         );
+    }
+
+    // ── `infr run --raw` / `--print-ids`: the parity switches ─────────────────────────────────
+    //
+    // Real `clap` parsing, not a hand-built `Cmd::Run`: these four flags exist for a harness that
+    // shells out to `infr`, so what the harness types is the thing under test.
+    fn run_args(args: &[&str]) -> (bool, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) {
+        let mut full = vec!["infr", "run"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)
+            .unwrap()
+            .cmd
+            .expect("a subcommand")
+        {
+            Cmd::Run {
+                raw,
+                prompt_file,
+                print_ids,
+                print_prompt_ids,
+                ..
+            } => (raw, prompt_file, print_ids, print_prompt_ids),
+            // `Cmd` carries no Debug, so the failure names the expectation rather than dumping the
+            // value — which the arm above already pins down.
+            _ => panic!("`run` expected"),
+        }
+    }
+
+    #[test]
+    fn run_raw_flags_parse_into_their_fields() {
+        // Bare `--raw`, positional prompt kept.
+        assert_eq!(
+            run_args(&["--raw", "qwen.gguf", "hi"]),
+            (true, None, None, None)
+        );
+        // Every switch at once, with the model and prompt after them.
+        assert_eq!(
+            run_args(&[
+                "--raw",
+                "--prompt-file",
+                "p.txt",
+                "--print-ids",
+                "out.ids",
+                "--print-prompt-ids",
+                "in.ids",
+                "qwen.gguf",
+            ]),
+            (
+                true,
+                Some(PathBuf::from("p.txt")),
+                Some(PathBuf::from("out.ids")),
+                Some(PathBuf::from("in.ids"))
+            )
+        );
+        // None of them set: all four default off/absent, so the chat path is untouched.
+        assert_eq!(run_args(&["qwen.gguf", "hi"]), (false, None, None, None));
+        // They are `run`-only flags.
+        assert!(Cli::try_parse_from(["infr", "serve", "--raw", "m"]).is_err());
+    }
+
+    /// The same four switches as the command sees them, for the rules below.
+    fn raw_opts<'a>(
+        raw: bool,
+        prompt_file: Option<&'a str>,
+        print_ids: Option<&'a str>,
+        print_prompt_ids: Option<&'a str>,
+    ) -> RunRaw<'a> {
+        RunRaw {
+            raw,
+            prompt_file: prompt_file.map(Path::new),
+            print_ids: print_ids.map(Path::new),
+            print_prompt_ids: print_prompt_ids.map(Path::new),
+        }
+    }
+
+    #[test]
+    fn raw_id_files_need_raw_and_raw_needs_exactly_one_prompt_source() {
+        // The id files describe the raw forward; without `--raw` they would be a lie.
+        let err = check_run_raw_opts(&raw_opts(false, None, Some("out.ids"), None), Some("hi"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("add --raw"), "got: {err}");
+        // `--raw` with no prompt at all would drop into the REPL, which has no id stream to print.
+        let err = check_run_raw_opts(&raw_opts(true, None, None, None), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--prompt-file"), "got: {err}");
+        // Two prompt sources is a coin flip on which one the harness diffed.
+        let err = check_run_raw_opts(&raw_opts(true, Some("p.txt"), None, None), Some("hi"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not both"), "got: {err}");
+        // The combinations that are legal: message-only, file-only, and a file with nothing else.
+        assert!(
+            check_run_raw_opts(&raw_opts(true, None, Some("o"), Some("i")), Some("hi")).is_ok()
+        );
+        assert!(check_run_raw_opts(&raw_opts(true, Some("p.txt"), None, None), None).is_ok());
+        // And the chat path still takes a plain message with no flags at all.
+        assert!(check_run_raw_opts(&raw_opts(false, None, None, None), Some("hi")).is_ok());
+        assert!(check_run_raw_opts(&raw_opts(false, None, None, None), None).is_ok());
+    }
+
+    #[test]
+    fn raw_token_id_files_are_one_id_per_line_with_a_final_newline() {
+        let dir = std::env::temp_dir().join(format!("infr-cli-ids-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ids.txt");
+        write_token_ids(&path, &[1, 4096, 0]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\n4096\n0\n");
+        // An empty generation is an empty file, not a file with a newline in it.
+        write_token_ids(&path, &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        std::fs::remove_file(&path).expect("remove ids file");
+        std::fs::remove_dir(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn raw_prompt_file_reads_exact_bytes_and_rejects_a_missing_or_binary_file() {
+        let dir = std::env::temp_dir().join(format!("infr-cli-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // The trailing newline is part of the prompt — that is the whole reason this flag exists.
+        let path = dir.join("p.txt");
+        std::fs::write(&path, b"hello\n").expect("write prompt file");
+        assert_eq!(read_prompt_file(&path).unwrap(), "hello\n");
+        // Not UTF-8 is an error, not a lossy substitution: a mangled prompt is a mangled id list.
+        std::fs::write(&path, [0xff, 0xfe]).expect("write bytes");
+        assert!(read_prompt_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("not valid UTF-8"));
+        std::fs::remove_file(&path).expect("remove prompt file");
+        assert!(read_prompt_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("read --prompt-file"));
+        std::fs::remove_dir(&dir).expect("remove temp dir");
     }
 }
