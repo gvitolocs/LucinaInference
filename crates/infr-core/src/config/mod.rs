@@ -301,6 +301,16 @@ cfg_struct! {
         flash_warp: bool = true,
         /// `INFR_NO_NC_FA` (inverted).
         nc_fa: bool = true,
+        /// `INFR_NC_FA_WIDE` (`set_not_zero`: set and `!= "0"` turns the reroute ON; unset or `=0`
+        /// leaves the old route) — opt-in: route a prefill the coopmat flash geometry cannot serve
+        /// because `hd > 128` to the non-coopmat flash kernel instead of the non-FA coopmat
+        /// pipeline, which materializes a `[nh, mpad, kv_pad]` f16 scores matrix. DEFAULT OFF: the
+        /// reroute is the CLOSER leg to the exact f64 oracle (max error 1.5e-6 / 8.8e-6 at kv 4k /
+        /// 32k vs nonfa's 1.9e-4 / 2.7e-4, 7900 XTX) and allocates no attention scratch (vs 96 /
+        /// 432 MiB, 1410 MiB at 120k), but measures 2.2x SLOWER prefill at 32k (512 @d32k: 555 →
+        /// 253 t/s). A/B switch for that reroute; see
+        /// `infr_vulkan::adapter::prefill_attn_tier`.
+        nc_fa_wide: bool = false,
         /// `INFR_NO_QK_WARP` (inverted).
         qk_warp: bool = true,
         /// `INFR_NO_PV_WARP` (inverted).

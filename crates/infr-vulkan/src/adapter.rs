@@ -862,6 +862,115 @@ fn split_k_plan(m: usize, in_f: usize, out_f: usize) -> usize {
     }
 }
 
+/// The inputs of [`prefill_attn_tier`]. The caller has already resolved the mask, the KV dtypes and
+/// the buffer kinds, plus `flash_ok` — which also drives the dequant-in-flash MODE, a kernel choice
+/// rather than a tier choice. Everything here is a plain value, so the ladder is testable with no
+/// GPU and no device.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrefillTierIn {
+    pub rows: usize,
+    pub kv_len: usize,
+    pub hd: usize,
+    /// Row capacity of the bound cache (`att_cap_rows` at the call site).
+    pub att_cap_rows: usize,
+    /// `kernels.vulkan.flash_min_rows`, shared with `flash_geom` — both tiers floor on it.
+    pub flash_min_rows: usize,
+    /// The coopmat flash tier is servable (geometry + KV-dtype facts).
+    pub flash_ok: bool,
+    /// `AttnMask::Canvas`: only the split-K tier carries its fixed `lo`.
+    pub canvas: bool,
+    /// A side is read as native planar Q8 — the tile kernels would misread it.
+    pub kv_q8_eff: bool,
+    pub f16_coopmat: bool,
+    /// q and dst are both `Internal`, i.e. 64-row-padded, which the coopmat tile kernels require.
+    pub internal_q_dst: bool,
+    pub nc_fa: bool,
+    /// `kernels.vulkan.nc_fa_wide` — the hd>128 reroute switch, OFF by default (see below).
+    pub nc_fa_wide: bool,
+}
+
+/// The prefill attention tier `Op::Attention` dispatches. `Split` means "neither coopmat tier nor
+/// nc_fa serves this shape" — the caller's own `split_ok` then chooses between split-K and the
+/// scalar floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefillTier {
+    Flash,
+    NonFa,
+    NcFa,
+    Split,
+}
+
+/// The `flash_ok` → `nonfa_ok` → `nc_fa_ok` → split-K prefill ladder, as one pure decision.
+///
+/// `nc_fa_wide` (the hd>128 reroute, OFF by default — see the measurement below) is the only
+/// behavioural difference from the ladder this function was extracted from: when the coopmat FLASH
+/// geometry cannot serve the shape purely because `hd > 128`, prefer the fused non-coopmat flash
+/// kernel `attn_nc_fa` over the non-FA coopmat pipeline. Reason (llama.cpp is the source of truth
+/// here): at `3612199ed` an hd-256 causal q4_0 prefill on RADV runs a fused online-softmax
+/// coopmat-1 flash kernel that keeps its S/P tiles in LDS —
+/// `ggml/src/ggml-vulkan/ggml-vulkan.cpp:3922-3923` selects `FA_COOPMAT1` for non-NVIDIA/RADV, and
+/// `vulkan-shaders/flash_attn_cm1.comp:50-52` packs the scores tile specifically so `hsk == 256`
+/// fits 48 KB of shared memory, with no global scores scratch. infr's coopmat flash builds stop at
+/// hd 128 (`shaders/attn_flash.comp:6`, `attn_flash_partial.comp:7`, `Os[BM * 128u]`), so hd 256
+/// fell to `attention_prefill_nonfa`, which materializes a `[nh, mpad, kv_pad]` f16 scores matrix —
+/// 1,410 MiB for Qwen3.8-27B (nh=24, hd=256, rows=256) at 120k depth, 10.7× the bytes of the q4_0
+/// KV it is computed from, and the allocation the 256 MiB VRAM guard refuses. `attn_nc_fa` already
+/// has an hd-256 build (`build.rs` `attn_nc_fa_hd256`) and allocates NO pool scratch.
+///
+/// Why it still defaults off, measured on the 7900 XTX (27B, q4_0 KV, one run each): the reroute
+/// WINS on accuracy and on memory — against the exact f64 oracle its max error is 1.5e-6 at kv
+/// 4096 and 8.8e-6 at 32768 where nonfa sits at 1.9e-4 and 2.7e-4, and it needs 0 MiB of attention
+/// scratch where nonfa needs 96 and 432 MiB (1,410 MiB at 120k) — but it LOSES badly on speed at
+/// long depth: prefill 512 @d4k 911 → 712 t/s and @d32k 555 → 253 t/s (2.2× slower), decode a wash
+/// (32.8/32.8 and 24.5/25.5). The route stays in the tree so the fused kernel does not rot; making
+/// it fast at hd 256 is the next optimisation, and the reference for what that means is the
+/// `flash_attn_cm1.comp` shape cited above.
+///
+/// The reroute is confined to shapes nonfa WOULD have served (`nc_fa_wide_ok` requires
+/// `nonfa_base`), so everything that previously fell through to split-K — `cap_short`, ring-past,
+/// rows<64, hd not a multiple of 64 — still falls there, and hd<=128 routing is untouched.
+///
+/// `attn_nc_fa.comp` was written for devices with NO usable f16 coopmat (Intel Arc/ANV), where it
+/// replaced a scalar per-row `attention_kv` that cost 31% of knob pp512 on Qwen3-14B; on coopmat
+/// hardware it was only ever reachable through `INFR_NO_COOPMAT=1`, which also un-coopmat-izes the
+/// prefill GEMMs. `INFR_NO_NC_FA=1` disables the arm entirely (A/B against the scalar/split floor).
+pub(crate) fn prefill_attn_tier(i: &PrefillTierIn) -> PrefillTier {
+    // The non-FA coopmat pipeline (attn_qk → softmax → attn_pv) is hd-general (hd%64, ≤512) and
+    // ~an order faster than the scalar `attention_kv` floor, but pays for it with the materialized
+    // scores matrix above.
+    let nonfa_base = !i.flash_ok
+        && !i.canvas
+        && i.rows >= 64
+        // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax, but still a
+        // real global read) — those rows must exist in the cache.
+        && i.kv_len.div_ceil(256) * 256 <= i.att_cap_rows
+        && i.hd.is_multiple_of(64)
+        && i.hd <= 512
+        && !i.kv_q8_eff
+        && i.f16_coopmat
+        && i.internal_q_dst;
+    // The shared-memory fma flash tile: flash's row floor, hd%4 ≤ 512, f16 KV only, and unlike
+    // flash/nonfa it can carry SWA/ring shapes (so no `internal_q_dst` requirement).
+    let nc_fa_geom = (i.rows >= 64 || (i.rows >= i.flash_min_rows && i.kv_len >= 8192))
+        && !i.canvas
+        && i.hd.is_multiple_of(4)
+        && i.hd <= 512
+        && !i.kv_q8_eff
+        && i.nc_fa;
+    let nc_fa_wide_ok = i.nc_fa_wide && i.hd > 128 && nonfa_base && nc_fa_geom;
+    let nonfa_ok = nonfa_base && !nc_fa_wide_ok;
+    let nc_fa_ok = !i.flash_ok && !nonfa_ok && (!i.f16_coopmat || nc_fa_wide_ok) && nc_fa_geom;
+    if i.flash_ok {
+        PrefillTier::Flash
+    } else if nonfa_ok {
+        PrefillTier::NonFa
+    } else if nc_fa_ok {
+        PrefillTier::NcFa
+    } else {
+        PrefillTier::Split
+    }
+}
+
 /// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
 /// arm and its arena-addressed streamed twin (`streamed_prefill_gemm`): the A_GLOBAL f16-A cast,
 /// the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from `w_addr`
@@ -3049,10 +3158,6 @@ fn lower_op(
                 // buffer_reference coopmat base), so it stays off by default; kept for other silicon.
                 let kv_coopmat_bda = matches!(flash_stage, crate::recorder::FlashStage::Off)
                     && be_.cfg().kv.coopmat_bda;
-                // Prefill at hd≠128 (qwen35/gemma hd=256): the non-FA coopmat pipeline
-                // (attn_qk → softmax → attn_pv) is hd-general and ~an order faster than the scalar
-                // attention_kv. Needs 64-row-padded q/dst (Internal buffers are row-padded), so
-                // require both to be Internal.
                 // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): bidirectional, fixed
                 // `[lo, kv_len)` reach per row — neither the flash kernel (Causal-only, already
                 // excluded above) nor `attention_prefill_nonfa`'s per-row causal-end window
@@ -3063,43 +3168,34 @@ fn lower_op(
                     AttnMask::Canvas { lo } => Some(*lo),
                     _ => None,
                 };
-                let nonfa_ok = !flash_ok
-                    && canvas_lo.is_none()
-                    && rows >= 64
-                    // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax) —
-                    // a ring cache past its wrap has neither those rows nor a direct position →
-                    // row mapping the tile loads could use, so fall to the split path (which has
-                    // the row-modulo mapping). Full-context caches only hit this within 256 rows
-                    // of their very end, where the split path is equally correct.
-                    && kv_len.div_ceil(256) * 256 <= att_cap_rows
-                    && hd % 64 == 0
-                    && hd <= 512
-                    && !(k_q8_eff || v_q8_eff)
-                    && be_.caps().f16_coopmat()
-                    && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
-                    && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
-                // NON-COOPMAT flash tier (`attn_nc_fa.comp`, the attention companion of the
-                // `nc_mmq`/`nc_fma` GEMM tier): flash/nonfa above are coopmat SPIR-V, so a device
-                // without the feature (Intel Arc/ANV) previously ran ALL prefill attention on the
-                // scalar per-row `attention_kv` (31% of knob pp512 on Qwen3-14B) or, for rows<64 /
-                // ring-past shapes, the split-K path. This shared-memory fma tile (no subgroup
-                // ops, ≤54 KB shared) takes the flash tier's row floor; unlike flash/nonfa it
-                // handles SWA windows AND ring caches (attn_partial's `cap` row-modulo mapping),
-                // so ring-past prefill rides it too. f16 KV only — quantized KV was already
-                // dequanted to the f16 ring-layout scratch above at rows>1 (`k/v_q8_eff` false by
-                // construction), and the gate keeps the exclusion explicit. No Internal-buffer
-                // requirement: the kernel guards pad-row reads/writes itself. Exercisable on
-                // coopmat hardware via INFR_NO_COOPMAT=1; INFR_NO_NC_FA=1 disables the arm (A/B
-                // against the scalar/split floor).
-                let nc_fa_ok = !flash_ok
-                    && !nonfa_ok
-                    && !be_.caps().f16_coopmat()
-                    && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
-                    && canvas_lo.is_none()
-                    && hd % 4 == 0
-                    && hd <= 512
-                    && !(k_q8_eff || v_q8_eff)
-                    && be_.cfg().kernels.vulkan.nc_fa;
+                // The rest of the prefill ladder (the hd-general non-FA coopmat pipeline, the
+                // non-coopmat fma flash tile, the split-K floor) is ONE pure decision — see
+                // `prefill_attn_tier` for each tier's requirements and for the hd>128 reroute
+                // (`kernels.vulkan.nc_fa_wide`, opt-in: `INFR_NC_FA_WIDE=1` to take it, unset/`=0`
+                // keeps the nonfa route it would replace — 2.2x slower prefill at 32k depth).
+                let tier = prefill_attn_tier(&PrefillTierIn {
+                    rows,
+                    kv_len,
+                    hd,
+                    att_cap_rows,
+                    flash_min_rows,
+                    flash_ok,
+                    canvas: canvas_lo.is_some(),
+                    kv_q8_eff: k_q8_eff || v_q8_eff,
+                    f16_coopmat: be_.caps().f16_coopmat(),
+                    // Internal buffers are 64-row-padded, which the coopmat tile kernels need.
+                    internal_q_dst: matches!(
+                        graph.tensors[q.0 as usize].kind,
+                        TensorKind::Internal
+                    ) && matches!(
+                        graph.tensors[dst.0 as usize].kind,
+                        TensorKind::Internal
+                    ),
+                    nc_fa: be_.cfg().kernels.vulkan.nc_fa,
+                    nc_fa_wide: be_.cfg().kernels.vulkan.nc_fa_wide,
+                });
+                let nonfa_ok = tier == PrefillTier::NonFa;
+                let nc_fa_ok = tier == PrefillTier::NcFa;
                 // Decode (rows==1) AND small-m suffix prefill (rows 2..63, below the flash/nonfa
                 // floor): flash-decoding split-K — each (row, head)'s KV range splits across ~32
                 // chunks of workgroups instead of the scalar attention_kv's rows*nh (= nh at
@@ -6359,6 +6455,155 @@ mod tests {
             }
         }
         panic!("`#define {name}` not found in the shader source");
+    }
+
+    /// The prefill ladder at a Qwen3.8-27B-shaped point: coopmat device, Internal (row-padded)
+    /// q/dst, causal, f16 KV (already dequanted), no Canvas, and BOTH nc_fa knobs at their shipped
+    /// defaults — `nc_fa` on, `nc_fa_wide` OFF, i.e. the old route. [`route_wide`] turns the reroute
+    /// switch on. `flash_ok` is an INPUT, so every case below states the geometry verdict the caller
+    /// reached.
+    fn route(rows: usize, kv_len: usize, hd: usize, att_cap_rows: usize) -> PrefillTierIn {
+        PrefillTierIn {
+            rows,
+            kv_len,
+            hd,
+            att_cap_rows,
+            flash_min_rows: 24,
+            flash_ok: false,
+            canvas: false,
+            kv_q8_eff: false,
+            f16_coopmat: true,
+            internal_q_dst: true,
+            nc_fa: true,
+            nc_fa_wide: false,
+        }
+    }
+
+    /// The same, with the hd>128 reroute switched ON (`kernels.vulkan.nc_fa_wide=true`,
+    /// `INFR_NC_FA_WIDE=1`) — what the parity test drives directly, and what the hd-256 speedup work
+    /// will turn back on.
+    fn route_wide(rows: usize, kv_len: usize, hd: usize, att_cap_rows: usize) -> PrefillTierIn {
+        let mut i = route(rows, kv_len, hd, att_cap_rows);
+        i.nc_fa_wide = true;
+        i
+    }
+
+    /// hd <= 128 routing must be byte-for-byte what it was before the `nc_fa_wide` reroute, WITH
+    /// THE SWITCH IN EITHER STATE: the coopmat flash tier when its geometry holds, the non-FA coopmat
+    /// pipeline otherwise, and the non-coopmat flash tier only on a device without the feature (as
+    /// `INFR_NO_COOPMAT=1` gives). This is the proof that defaulting the switch off — and turning it
+    /// on — both leave narrow heads alone.
+    #[test]
+    fn route_head_dim_128_is_unchanged() {
+        for wide in [true, false] {
+            let mut i = if wide {
+                route_wide(256, 120_256, 128, 122_880)
+            } else {
+                route(256, 120_256, 128, 122_880)
+            };
+            i.flash_ok = true;
+            assert_eq!(prefill_attn_tier(&i), PrefillTier::Flash, "wide={wide}");
+            i.flash_ok = false;
+            assert_eq!(
+                prefill_attn_tier(&i),
+                PrefillTier::NonFa,
+                "wide={wide}: hd 128 keeps the coopmat nonfa pipeline"
+            );
+            i.f16_coopmat = false;
+            assert_eq!(
+                prefill_attn_tier(&i),
+                PrefillTier::NcFa,
+                "wide={wide}: a non-coopmat device still gets the fma flash tile"
+            );
+            // Below both tiers' floor (a short-turn suffix at shallow kv) it still falls through
+            // to split-K.
+            i.rows = 32;
+            i.kv_len = 4096;
+            assert_eq!(prefill_attn_tier(&i), PrefillTier::Split, "wide={wide}");
+        }
+    }
+
+    /// The reroute itself, switch ON: hd 256 with the coopmat flash geometry refused takes
+    /// `attn_nc_fa` — zero pool scratch — instead of `attention_prefill_nonfa`'s `[nh, mpad,
+    /// kv_pad]` f16 scores matrix (1,410 MiB for this shape at 120k). `INFR_NO_NC_FA=1` restores the
+    /// old route even with the switch on; `INFR_NC_FA_WIDE=0` (the shipped default) does too.
+    #[test]
+    fn route_wide_head_dim_prefers_nc_fa() {
+        let i = route_wide(256, 120_256, 256, 122_880);
+        assert_eq!(prefill_attn_tier(&i), PrefillTier::NcFa);
+
+        // The default: the same shape, switch off, old route.
+        assert_eq!(
+            prefill_attn_tier(&route(256, 120_256, 256, 122_880)),
+            PrefillTier::NonFa,
+            "`nc_fa_wide` defaults off, so hd 256 keeps nonfa"
+        );
+        let mut no_nc = i;
+        no_nc.nc_fa = false;
+        assert_eq!(
+            prefill_attn_tier(&no_nc),
+            PrefillTier::NonFa,
+            "INFR_NO_NC_FA=1 keeps the coopmat tier it replaces"
+        );
+        // hd 512 (the other hd-general nonfa shape) reroutes too.
+        assert_eq!(
+            prefill_attn_tier(&route_wide(256, 120_256, 512, 122_880)),
+            PrefillTier::NcFa
+        );
+        let mut no_cm = route(256, 120_256, 256, 122_880);
+        no_cm.f16_coopmat = false;
+        assert_eq!(
+            prefill_attn_tier(&no_cm),
+            PrefillTier::NcFa,
+            "a non-coopmat device reaches hd 256 through this tier with or without the switch — \
+             nonfa needs coopmat, so the switch only ever ADDS work to the nc_fa side"
+        );
+    }
+
+    /// The 27B prefill shape the parity test drives, decided both ways at 32k depth: `nc_fa_wide`
+    /// ON must select the fused non-coopmat tile (rows 256, hd 256, coopmat flash refused by head
+    /// width), and OFF must select nonfa — so the switch, not the hardware, is what the parity test
+    /// is exercising when it calls the nc_fa kernel directly.
+    #[test]
+    fn route_wide_head_dim_256_at_32k_takes_nc_fa() {
+        assert_eq!(
+            prefill_attn_tier(&route_wide(256, 32_768, 256, 122_880)),
+            PrefillTier::NcFa
+        );
+        assert_eq!(
+            prefill_attn_tier(&route(256, 32_768, 256, 122_880)),
+            PrefillTier::NonFa
+        );
+    }
+
+    /// The reroute must stay confined to shapes nonfa would actually have served: everything that
+    /// already fell through to the split-K floor (padded K-tile read past the cache rows, ring-past,
+    /// rows below the floor, an hd nonfa rejects, a Canvas mask) still falls there — WITH THE
+    /// SWITCH ON, since with it off there is no reroute to confine.
+    #[test]
+    fn route_wide_reroute_leaves_the_split_floor_alone() {
+        // kv_pad = 320 > a tightly-sized 364-row cache (MTP whole-prompt verify shape).
+        assert_eq!(
+            prefill_attn_tier(&route_wide(256, 3591, 256, 3637)),
+            PrefillTier::Split
+        );
+        // Below the tier's row floor, and a head dim nonfa never serves (144 % 64 != 0).
+        assert_eq!(
+            prefill_attn_tier(&route_wide(32, 4096, 256, 122_880)),
+            PrefillTier::Split
+        );
+        assert_eq!(
+            prefill_attn_tier(&route_wide(256, 4096, 144, 122_880)),
+            PrefillTier::Split
+        );
+        // q/dst not row-padded (nonfa's requirement) — the kernel guard, not a shape, so no
+        // reroute; and Canvas is excluded from every fused tier.
+        let mut external = route_wide(256, 4096, 256, 122_880);
+        external.internal_q_dst = false;
+        assert_eq!(prefill_attn_tier(&external), PrefillTier::Split);
+        let mut canvas = route_wide(256, 4096, 256, 122_880);
+        canvas.canvas = true;
+        assert_eq!(prefill_attn_tier(&canvas), PrefillTier::Split);
     }
 
     /// `MLA_MAX_KEY_LEN` / `MLA_MAX_KV_LORA_RANK` are the host's copy of `mla.comp`'s shared-array

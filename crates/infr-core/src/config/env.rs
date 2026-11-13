@@ -244,6 +244,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.flash_dequant = presence(get, "INFR_FLASH_DEQUANT");
     v.flash_warp = presence_inv(get, "INFR_NO_FLASH_WARP");
     v.nc_fa = presence_inv(get, "INFR_NO_NC_FA");
+    // Positive spelling of a default-OFF field: set and `!= "0"` turns the hd>128 reroute on;
+    // unset or `=0` keeps the non-FA coopmat route.
+    v.nc_fa_wide = set_not_zero(get, "INFR_NC_FA_WIDE");
     v.qk_warp = presence_inv(get, "INFR_NO_QK_WARP");
     v.pv_warp = presence_inv(get, "INFR_NO_PV_WARP");
     v.pv_splits = opt_num(get, "INFR_PV_SPLITS");
