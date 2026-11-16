@@ -443,7 +443,7 @@ impl Backend for ExpertParallelBackend {
         Ok(())
     }
 
-    /// The windowed form of [`copy_buffer`]: every rank holds a REPLICATED KV cache under EP (only
+    /// The windowed form of `Backend::copy_buffer`: every rank holds a REPLICATED KV cache under EP (only
     /// the experts are split), so every rank is given the identical window — no divisor, exactly as
     /// the length-less-of-`W` prefix copy above.
     fn copy_buffer_at(

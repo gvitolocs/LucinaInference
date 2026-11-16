@@ -10678,26 +10678,63 @@ mod tests {
         VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
     }
 
-    /// #1 drift guard: `kernels.vulkan.gemv` must resolve, for any env state, EXACTLY what the
-    /// pre-config per-call `std::env::var` reads in the GEMV dispatchers would have returned — so
-    /// neither the (deleted) `OnceLock<GemvKnobs>` memo nor its replacement can change a
-    /// kernel-selection decision.
+    /// #1 drift guard: `kernels.vulkan.gemv` must resolve, for any env state the layer ACCEPTS,
+    /// what the pre-config per-call `std::env::var` reads in the GEMV dispatchers returned — EXCEPT
+    /// where the switch sweep changed a grammar on purpose, see the third paragraph. So neither the
+    /// (deleted) `OnceLock<GemvKnobs>` memo nor its replacement can change a kernel-selection
+    /// decision.
     ///
     /// The struct under test is now `infr_core::config::GemvCfg`, resolved through the config
     /// ENV LAYER with an injected reader — the same `HashMap` states as before, and still zero
     /// contact with the process environment (R7).
+    ///
+    /// The three `INFR_NO_GEMV_*` DISABLE flags were once `presence` reads, where an EMPTY value
+    /// meant ON. They are `Bool` value reads now, so the oracle below is the GRAMMAR itself — written
+    /// out here, not imported, because a drift guard that reuses the helper under test drifts with
+    /// it. A state that spells one of them `""`/`"2"` would be a startup error, so it cannot appear
+    /// in `states`; what the grammar adds over the old read is that `=0` means DO NOT disable, and
+    /// the last state below is exactly that case. `config::tests::bool_knobs_are_value_reads` pins
+    /// the eight spellings and the refusals for every switch, this test that the GEMV dispatchers
+    /// read the resolved fields the same way.
+    ///
+    /// `INFR_NO_GEMV_REG` is not a switch but a `PresenceClears` marker, so its oracle stays
+    /// `.is_some()` and its empty value still means "clear the variant" — which is what this test
+    /// drives it with.
     #[test]
     fn gemv_knobs_resolve_matches_env_reads() {
         use std::collections::HashMap;
+        /// The `Bool` grammar, spelled out: unset ⇒ the field keeps its default `false`, an OFF
+        /// spelling ⇒ `false`, any other ACCEPTED spelling ⇒ `true`. A value outside the eight is
+        /// the layer's job to refuse, and this asserts it never reaches an oracle.
+        fn bool_read(raw: Option<String>) -> bool {
+            let Some(value) = raw else { return false };
+            let off = ["0", "false", "off", "no"]
+                .iter()
+                .any(|w| value.eq_ignore_ascii_case(w));
+            assert!(
+                off || ["1", "true", "on", "yes"]
+                    .iter()
+                    .any(|w| value.eq_ignore_ascii_case(w)),
+                "{value:?} must be refused by the layer, not reach the oracle"
+            );
+            !off
+        }
         let states: Vec<HashMap<&str, &str>> = vec![
             // all defaults
             HashMap::new(),
-            // every disable flag set (value present, even empty)
+            // every disable flag set (the three `Bool` ones truthy; the marker may stay empty)
             HashMap::from([
-                ("INFR_NO_GEMV_RM", ""),
-                ("INFR_NO_GEMV_SG", ""),
-                ("INFR_NO_GEMV_ID_SG", ""),
+                ("INFR_NO_GEMV_RM", "1"),
+                ("INFR_NO_GEMV_SG", "1"),
+                ("INFR_NO_GEMV_ID_SG", "1"),
                 ("INFR_NO_GEMV_REG", ""),
+            ]),
+            // the disable flags MENTIONED but turned OFF, in three different spellings: the
+            // presence oracle called all three ON, the value oracle cannot
+            HashMap::from([
+                ("INFR_NO_GEMV_RM", "0"),
+                ("INFR_NO_GEMV_SG", "off"),
+                ("INFR_NO_GEMV_ID_SG", "NO"),
             ]),
             // explicit overrides on the numeric knobs + a variant
             HashMap::from([
@@ -10725,7 +10762,7 @@ mod tests {
             } else {
                 get("INFR_GEMV_VARIANT").or_else(|| Some("reg".to_string()))
             };
-            assert_eq!(k.no_rm, get("INFR_NO_GEMV_RM").is_some());
+            assert_eq!(k.no_rm, bool_read(get("INFR_NO_GEMV_RM")));
             assert_eq!(
                 k.rm_maxout,
                 get("INFR_GEMV_RM_MAXOUT")
@@ -10744,8 +10781,8 @@ mod tests {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(2u32)
             );
-            assert_eq!(k.no_sg, get("INFR_NO_GEMV_SG").is_some());
-            assert_eq!(k.no_id_sg, get("INFR_NO_GEMV_ID_SG").is_some());
+            assert_eq!(k.no_sg, bool_read(get("INFR_NO_GEMV_SG")));
+            assert_eq!(k.no_id_sg, bool_read(get("INFR_NO_GEMV_ID_SG")));
             assert_eq!(
                 k.sg_minout,
                 get("INFR_GEMV_SG_MINOUT")

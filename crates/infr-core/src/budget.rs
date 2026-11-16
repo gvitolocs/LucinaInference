@@ -14,8 +14,8 @@
 //! - [`kv_fmt_bytes`] — the EXACT allocation size of a KV buffer of `elems` elements, and
 //!   [`kv_bytes_per_elem`] — the same thing as a fractional per-element rate, which is what the
 //!   context-fit ESTIMATES divide by. The two must agree; a test pins them against each other.
-//! - [`flag_from`] / [`mib_bytes`] / [`reserve_bytes`] — the grammars and accessors the spill
-//!   knobs share (`empty`/`0` = off; a MiB count → bytes; the 12%-of-VRAM-floored-at-2-GiB
+//! - [`mib_bytes`] / [`reserve_bytes`] — the accessors the spill
+//!   knobs share (a MiB count → bytes; the 12%-of-VRAM-floored-at-2-GiB
 //!   reserve). The VALUES come from the backend's [`Config`](crate::config::Config); nothing here
 //!   reads the environment (R3).
 //! - [`SpillTally`] / [`SpillCounts`] / [`spill_report_line`] — the VRAM-first placement
@@ -224,16 +224,7 @@ pub fn kv_bytes_per_elem(dt: DType) -> f64 {
     bytes as f64 / elems as f64
 }
 
-// ── grammars + accessors shared by the spill knobs ───────────────────────────
-
-/// The boolean-flag grammar every overflow knob uses, over an explicit value: `Some(v)` with `v`
-/// neither empty nor `"0"` ⇒ on; unset ⇒ off. (`INFR_KV_OVERFLOW`.)
-/// NOT the same as the `is_ok()` presence grammar, where an empty
-/// value is ON — `config::env`'s `flag` reader calls this so the difference survives the
-/// migration; the read sites take the resolved `bool` off their backend's `Config`.
-pub fn flag_from(raw: Option<&str>) -> bool {
-    raw.is_some_and(|v| !v.is_empty() && v != "0")
-}
+// ── accessors shared by the spill knobs ──────────────────────────────────────
 
 /// A MiB-valued knob's CONFIG field in bytes. (`Some(0)` stays `Some(0)` — the diagnostic caps use
 /// it to mean "nothing resident", which is NOT the same as "no cap".)
@@ -621,35 +612,32 @@ mod tests {
         }
     }
 
-    /// `empty`/`0`/unset = off; anything else = on — over explicit values via [`flag_from`], so
-    /// no test in this binary has to touch the process environment.
+    /// The spill switch is a `Bool` knob now: `1` on, `0` off, and the empty value — which used to
+    /// mean OFF under `budget::flag_from` and ON under every presence read — is a startup error.
+    /// This is the grammar the spill sites' `cfg.kv.overflow` reads come from.
     #[test]
-    fn flag_grammar() {
-        assert!(!flag_from(None));
-        for (raw, want) in [
-            ("", false),
-            ("0", false),
-            ("1", true),
-            ("00", true), // only the exact string "0" is off — matches the shipped grammar
-            ("true", true),
-            ("no", true),
-        ] {
-            assert_eq!(flag_from(Some(raw)), want, "raw={raw:?}");
-        }
-    }
-
-    /// The same grammar as the CONFIG layer resolves it: `config::env`'s `flag` reader is
-    /// `flag_from`, so a `Config` built from these spellings carries exactly the booleans above —
-    /// which is what the spill sites now read.
-    #[test]
-    fn kv_overflow_config_field_follows_the_flag_grammar() {
+    fn kv_overflow_config_field_follows_the_bool_grammar() {
         use crate::config::Config;
-        for (raw, want) in [("", false), ("0", false), ("1", true), ("true", true)] {
-            let key = "INFR_KV_OVERFLOW";
+        let key = "INFR_KV_OVERFLOW";
+        for (raw, want) in [
+            ("1", true),
+            ("on", true),
+            ("YES", true),
+            ("0", false),
+            ("off", false),
+            ("No", false),
+        ] {
             let layer =
                 crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).expect(key);
             let cfg = Config::load_from_layers(&[layer]);
             assert_eq!(cfg.kv.overflow, want, "{key}={raw:?}");
+        }
+        for raw in ["", "maybe"] {
+            let err = crate::config::env::parse(&|k| (k == key).then(|| raw.to_string())).err();
+            match err {
+                Some(crate::config::ConfigError::Env { key: bad, .. }) => assert_eq!(bad, key),
+                other => panic!("{key}={raw:?} must be refused, got {other:?}"),
+            }
         }
         // Unset ⇒ the shipped default, off.
         assert!(!Config::default().kv.overflow);

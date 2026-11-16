@@ -317,9 +317,9 @@ fn render_core(
 /// The `enable_thinking` a render gets, from `sampling.no_think` ([`render_core`] used to
 /// read the `INFR_NO_THINK` variable from the process environment right here).
 ///
-/// `INFR_NO_THINK=1` turns thinking OFF and `INFR_NO_THINK=0` is a NO-OP, matching the other
-/// `INFR_NO_*` toggles — that is the `SetNotZero` env grammar the config layer parses, so the
-/// polarity lives in exactly one place and this is a plain negation.
+/// `INFR_NO_THINK=1` turns thinking OFF and `INFR_NO_THINK=0` turns it back ON — a `Bool`
+/// value read, like every other switch, so the polarity lives in exactly one place and this
+/// is a plain negation.
 fn thinking_enabled(cfg: &Config) -> bool {
     !cfg.sampling.no_think
 }

@@ -747,12 +747,12 @@ fn probe_uma_overflow_type(mp: &vk::PhysicalDeviceMemoryProperties) -> Option<u3
 /// (the KV read seam is 100% `bufferDeviceAddress`, so off-device bytes need no shader change). So a
 /// context whose KV overflows VRAM by a modest amount keeps most layers resident and pays PCIe only
 /// on the spilled tail; a context that overflows entirely spills entirely (slice-1 whole-host as the
-/// limiting case). `INFR_KV_OVERFLOW=1` (config `kv.overflow`). Default OFF (empty or `0` = off) =
+/// limiting case). `INFR_KV_OVERFLOW=1` (config `kv.overflow`). Default OFF (`=0`/`off` = off) =
 /// today's VRAM-only behavior, unchanged. See [`VulkanBackend::alloc_kv_host`],
 /// [`VulkanBackend::vram_budget_fits`], and the ctx-clamp ladder's last rung.
 ///
-/// Read off the backend's `Config`, not the process environment; `budget::flag_from`'s grammar
-/// (empty and `"0"` are OFF, unlike every `is_ok()` knob) is preserved by the config layer.
+/// Read off the backend's `Config`, not the process environment; `INFR_KV_OVERFLOW` is a `Bool`
+/// switch now, so `=0` is OFF and an unrecognizable value stops the run at startup.
 fn kv_overflow_enabled(cfg: &infr_core::config::Config) -> bool {
     cfg.kv.overflow
 }
@@ -4359,7 +4359,7 @@ impl Backend for VulkanBackend {
         })
     }
 
-    /// The region form of [`copy_buffer`]: one `vkCmdCopyBuffer` region at each side's caller-named
+    /// The region form of `Backend::copy_buffer`: one `vkCmdCopyBuffer` region at each side's caller-named
     /// byte offset, plus that side's `sub_offset` exactly as `copy_buffer` folds it in. This is what
     /// makes seeding a PLANAR Q8_0 cache possible — see
     /// [`infr_core::backend::Backend::copy_buffer_at`] for why a prefix copy cannot do it, and

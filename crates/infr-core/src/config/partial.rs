@@ -32,8 +32,8 @@ pub enum SetPathError {
 
 /// A config leaf's value grammar: how `--set`/the TOML file spell it, and how it prints back.
 ///
-/// This is NOT the env grammar — env spellings (`INFR_NO_*` inversion, presence, `flag_from`) live
-/// in [`super::env`], because they are per-KEY, not per-TYPE.
+/// This is NOT the env grammar — which env KEY inverts its value, and which one is a marker, is
+/// per-KEY and lives in [`super::env`] and [`super::manifest::Grammar`], not per-TYPE.
 pub trait ConfigValue: Sized {
     /// Parse a `--set` / TOML scalar into the field's type.
     fn parse_set(raw: &str) -> Result<Self, String>;

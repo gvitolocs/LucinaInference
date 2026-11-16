@@ -26,25 +26,36 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
-### B1 — `INFR_DN_CHUNK_SCAN` has inverted polarity
+### B1 — `kernels.vulkan.dn_chunk_scan` is named for the path it excludes
 
-**Tag:** CR-N10 · **Blocked on:** a breaking-change sweep
-
-`crates/infr-core/src/config/env.rs`:
+**Tag:** CR-N10 · **Blocked on:** a file-format breaking sweep
 
 ```rust
-v.dn_chunk_scan = presence_inv(get, "INFR_DN_CHUNK_SCAN");
+// crates/infr-core/src/config/env.rs
+v.dn_chunk_scan = boolean_inv(get, "INFR_DN_CHUNK_SCAN")?;
 ```
 
-The key is spelled positively but its presence _disables_ the chunked scan — the
-only key in that file whose name means the opposite of what it does. It is
-R1-frozen (the config campaign pinned existing spellings), so renaming it is a
-breaking change for anyone who has it set.
+What is inverted is the FIELD, not the key. `kernels.vulkan.dn_chunk_scan == true`
+gates the arm that runs `deltanet_seq_split` — the SERIAL scan (`adapter.rs`'s
+chunked-prefill dispatch) — and `false` falls through to `deltanet_chunked_split`,
+the chunked scan the field is named after. So the env key tells the truth:
+`INFR_DN_CHUNK_SCAN=1` selects the chunked scan (the pre-slice-3a A/B baseline),
+`=0` keeps the serial one, unset keeps the serial one too. It is `BoolInv` only
+because the field it drives means the reverse.
 
-**When the next breaking sweep happens:** rename to `INFR_NO_DN_CHUNK_SCAN`,
-which makes it match the `presence_inv` grammar every other `INFR_NO_*` key
-uses. No alias — the project's env policy is to drop old spellings cleanly
-rather than carry them.
+**Closed as filed.** This entry asked to rename `INFR_DN_CHUNK_SCAN` to
+`INFR_NO_DN_CHUNK_SCAN`. That would be the wrong fix: `=1` already turns the
+chunked scan ON, so a `NO_` spelling would label a selection as a disable and make
+the one honest name in the pair lie. The grammar stays `BoolInv`, and the switch
+sweep left its behaviour exactly where it was (`=1` stored `false` before under
+`presence_inv`, and stores `false` now); what the sweep added is that `=0` means
+the serial path instead of also meaning the chunked one.
+
+**Still open, if anyone wants the field to read honestly:** rename
+`kernels.vulkan.dn_chunk_scan` to something like `dn_seq_scan`, which flips the
+`BoolInv` row to `Bool` and the default to `false`. That breaks the config file
+and `--set` for anyone who pins the field, so it waits for a file-format sweep.
+No env alias — the project's policy is to drop old spellings cleanly.
 
 ### B3 — the VNNI kernel family's bounds assertions are unexercised
 

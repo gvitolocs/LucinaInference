@@ -23,7 +23,10 @@ Two consequences worth knowing:
 
 - **Every documented `INFR_*` variable still works.** The campaign that
   introduced `Config` changed _where the value goes_, not what you type. Your
-  existing `INFR_PROF_OPS=1 infr bench …` scripts are unaffected.
+  existing `INFR_PROF_OPS=1 infr bench …` scripts are unaffected. (What a value
+  MEANS is now what it says: a boolean switch reads `0` as off and `1` as on,
+  with the polarity of its manifest row. See
+  [Environment value grammars](#environment-value-grammars).)
 - **A flag beats an inherited environment variable**, because the CLI layer sits
   above the env layer. `INFR_CTX=32k infr run … --ctx 8192` runs at 8192.
 
@@ -98,14 +101,87 @@ A **known** key given a value that does not parse into its type is a hard error:
 Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "banana")
 ```
 
-Note the asymmetry with the environment, which is frozen at today's behaviour:
-`ctx = "banana"` in a file fails to load, while `INFR_CTX=banana` is silently
-ignored and falls back. Six environment keys do reject a bad value loudly, at
-startup, on every subcommand: `INFR_SG`, `INFR_SUBMIT_DISPATCHES`,
-`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`, and
-`INFR_FLASH_CM1` — the one env knob whose grammar is a plain boolean (the same
-spellings the file and `--set` accept, `=2` refused), which is how a default-OFF
-opt-in switch is spelled positively instead of under an `INFR_NO_*` name.
+Note the asymmetry with the environment's **value** knobs, which is frozen at
+today's behaviour: `ctx = "banana"` in a file fails to load, while
+`INFR_CTX=banana` is silently ignored and falls back. Some environment keys
+reject a bad value loudly at startup, on every subcommand: `INFR_SG`,
+`INFR_SUBMIT_DISPATCHES`, `INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`,
+`INFR_EXPERT_PARALLEL` — and every boolean switch, below.
+
+## Environment value grammars
+
+The `INFR_*` names were never renamed, but what a value MEANS is per-key, and
+[`manifest.rs`](../crates/infr-core/src/config/manifest.rs) records each key's
+grammar next to it. **Every on/off switch reads its value now** — all 111 of
+them, in one of four grammars that differ only in which way the key points and
+whether the field has a third state:
+
+| `INFR_X=`                     | `Bool` (47)       | `BoolInv` (60) | `BoolOpt` (3) | `BoolOptInv` (1) |
+| ----------------------------- | ----------------- | -------------- | ------------- | ---------------- |
+| _unset_                       | the knob's default | the default   | `None`: decide | `None`: decide  |
+| `1` `true` `on` `yes`         | ON                | OFF            | ON            | OFF              |
+| `0` `false` `off` `no`        | OFF               | ON             | OFF           | ON               |
+| anything else, empty included | a startup error   | a startup error | a startup error | a startup error |
+
+Every spelling is matched ASCII case-insensitively, and the error names the
+variable:
+
+```
+Error: INFR_KV_INLINE: expected a boolean — 1/true/on/yes or 0/false/off/no (got "maybe")
+```
+
+**`Bool`** is a switch whose key points the same way the word does:
+`INFR_KV_INLINE`, `INFR_KV_Q8`, `INFR_IGNORE_EOS`, `INFR_CM_8X8`,
+`INFR_PROF_OPS`, `INFR_KV_OVERFLOW`, `INFR_NC_FA_WIDE`, `INFR_FLASH_CM1`,
+`INFR_NO_THINK`, every `INFR_DEBUG_*`. Note `INFR_NO_THINK`: the name is not the
+polarity, the manifest row is — `=1` means "no thinking", because
+`sampling.no_think` is itself a negative field. A default-OFF opt-in is spelled
+positively (`INFR_FLASH_CM1=1` turns the hd-256 cm1 flash prefill on), never
+under an `INFR_NO_*` name whose `=1` would mean the opposite.
+
+**`BoolInv`** is the `INFR_NO_*` family that names the DISABLE of a positive
+field — `INFR_NO_MMV`, `INFR_NO_GEMM_WARP`, the `INFR_METAL_NO_*` set,
+`INFR_CPU_NO_SPINPOOL`, 60 keys. `=1` answers exactly what presence used to
+answer, so a script that switched something off keeps switching it off. `=0` is
+the half that changes: it means **do not disable**, where it used to disable just
+the same as `=1`. To keep such a feature on from the environment, write
+`INFR_NO_MMV=0`; from a file or `--set`, write the positive field
+(`kernels.vulkan.mmv = true`). Four of them have no `NO_` in their name
+(`INFR_DN_CHUNK_SCAN`, `INFR_PIPELINE_HOST`, `INFR_TP_HOST`, `INFR_EP_HOST`) and
+point the same way all the same: `INFR_DN_CHUNK_SCAN=1` stores `false` in
+`kernels.vulkan.dn_chunk_scan`, which is what SELECTS the chunked DeltaNet scan —
+the field is named for the opposite path, not the key.
+
+**`BoolOpt`** and **`BoolOptInv`** drive an `Option<bool>` field, whose `None` is
+the third state the knob exists for: "no opinion, decide from the hardware" —
+`INFR_LAYER_MAJOR`, `INFR_MMV_MW`, `INFR_MROWS_ATTN` and its disable twin
+`INFR_NO_MROWS_ATTN`. Unset is the only thing that still leaves it undecided: the
+first two used to go ON for any value that was not exactly `"0"`, the empty one
+included, and the mrows-attn pair went its fixed way for ANY value. The pair keeps
+its asymmetry: the `NO_` key wins when both are set.
+
+These switches were read four different ways before, and only one of them read
+the value: plain PRESENCE (any value at all turned them the one way they always
+turned them, so an A/B of `INFR_KV_INLINE=0` against `=1` measured the same arm
+twice), `flag` (`""` and `"0"` OFF, everything else ON), `set_not_zero` (`"0"`
+OFF, everything else — the empty value included — ON) and the tri-state (`"0"`
+forces off, any other value forces on). What they all did with a typo'd value
+was guess. That is why a value outside the table is now an error rather than a
+silent fallback: a switch that reads the wrong way is invisible in the numbers,
+and visible in a message. The config file and `--set` took real booleans all
+along, so this only aligns the environment with them.
+
+**What is NOT a switch, and keeps its own grammar.** The three `*_specified`
+markers (`INFR_UBATCH`, `INFR_KV_TYPE_K`/`_V`) and `INFR_NO_GEMV_REG`: mentioning
+them is the whole message, and the value they carry belongs to the key's own type
+(`Int`, `Dtype`, `Text`). The exact-literal comparisons — `INFR_MTP` and
+`INFR_MTP_MEASURE` count only `"1"`, `INFR_FLASH_BM` only `"32"`, `INFR_SG` only
+`16`/`32` — name a MODE rather than a direction. And every numeric, size, path
+and name key, which is not a boolean at all.
+`config::tests::bool_knobs_match_the_manifest` fails any boolean field whose
+grammar is not one of the four above, unless the row is on the exact-literal
+excuse list, so a presence-read switch cannot come back without deleting the
+check first.
 
 ### Diagnostics announce themselves
 

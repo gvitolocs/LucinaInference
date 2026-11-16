@@ -807,12 +807,13 @@ impl Backend for TensorParallelBackend {
         Ok(())
     }
 
-    /// The windowed form of [`copy_buffer`] — every rank copies the SAME window of its own shard.
+    /// The windowed form of `Backend::copy_buffer` — every rank copies the SAME window of its own
+    /// shard.
     ///
     /// A window's OFFSETS divide by the world exactly like its length does: byte `N` of the logical
     /// cache is byte `N/W` of this rank's copy, because the head split takes 1/W of every row and
     /// `prepare` lowers the KV decl's `numel` to `numel/W` so the per-rank planar scale base really
-    /// is `cap/W` (see [`shard_kv_bytes`]). That is what lets the seam name spans in LOGICAL bytes —
+    /// is `cap/W` (see `shard_kv_bytes`). That is what lets the seam name spans in LOGICAL bytes —
     /// a planar Q8_0 seed's scale span starts at the logical `cap` — and have them land on each
     /// rank's own regions. A span that does not divide is an error, never a truncation, for the same
     /// reason a non-divisible length is.

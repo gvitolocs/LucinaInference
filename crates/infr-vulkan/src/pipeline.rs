@@ -592,7 +592,7 @@ impl Backend for PipelineBackend {
         }
     }
 
-    /// The windowed form of [`copy_buffer`], same device-sharing rules: the window is a plain
+    /// The windowed form of `Backend::copy_buffer`, same device-sharing rules: the window is a plain
     /// `vkCmdCopyBuffer` region pair on the one device that owns both buffers, or the identical
     /// window on every device of a replicated set.
     fn copy_buffer_at(

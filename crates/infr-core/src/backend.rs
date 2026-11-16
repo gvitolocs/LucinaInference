@@ -587,7 +587,7 @@ pub trait Backend: Send + Sync {
         self.download(src, &mut tmp)?;
         self.upload(dst, &tmp)
     }
-    /// Copy `bytes` from `src[src_off..]` into `dst[dst_off..]`. [`copy_buffer`] is the
+    /// Copy `bytes` from `src[src_off..]` into `dst[dst_off..]`. [`Self::copy_buffer`] is the
     /// `src_off == dst_off == 0` case.
     ///
     /// A state cache whose layout is PLANAR — codes in one region, scales in another (the Vulkan

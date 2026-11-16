@@ -91,7 +91,7 @@ fn default_config_matches_documented_defaults() {
     assert_eq!(d.kernels.vulkan.canvas_chunk_n, 3);
     assert!(
         d.kernels.vulkan.dn_chunk_scan,
-        "positively spelled, read is_err()"
+        "unset keeps the serial seq-scan path"
     );
     // `variant` is COMPUTED and defaults to Some("reg"), not None.
     assert_eq!(d.kernels.vulkan.gemv.variant.as_deref(), Some("reg"));
@@ -481,88 +481,373 @@ fn device_lists_reach_their_fields() {
     assert!(none.multi.pipeline_p2p && none.multi.tp_p2p && none.multi.ep_p2p);
 }
 
-// ── Polarity ─────────────────────────────────────────────────────────────────
+// ── Switch knobs: every `Bool*` grammar ─────────────────────────────────────
 
-/// The `presence-inv` truth table, for EVERY inverted knob in the manifest.
+/// The `Bool` spellings for ON, and for OFF — matched ASCII case-insensitively.
+const BOOL_ON: &[&str] = &["1", "true", "on", "yes"];
+const BOOL_OFF: &[&str] = &["0", "false", "off", "no"];
+
+/// Values every switch must REJECT. All three read as ON under the old `presence` grammar, which
+/// is the whole bug: `INFR_KV_INLINE=0` measured the `=1` arm, and a dropped or typo'd value was
+/// indistinguishable from an intentional one.
+const BOOL_REJECTED: &[&str] = &["", "2", "maybe"];
+
+/// Every `Grammar::Bool` knob — a switch whose key pushes its field the same way the word does —
+/// with what its field reads when the variable is UNSET.
 ///
-/// `INFR_NO_FOO` unset ⇒ the field is `true` (feature ON); set to `""`, `"0"` or `"1"` ⇒ the field
-/// is `false` (feature OFF). The `"0"` row is the one that catches a wrong-grammar migration:
-/// only PRESENCE matters, so `INFR_NO_GEMM_WARP=0` still turns warp GEMM off.
+/// The second column is not decoration: "defaults stay exactly what they are" is the one half of
+/// this grammar that a wrong conversion can break silently, and the value lives in `impl Default`
+/// rather than in the manifest. [`bool_knobs_are_value_reads`] pins it against `Config::default()`,
+/// and [`bool_knobs_match_the_manifest`] keeps these four lists and the manifest's rows the same
+/// sets, in both directions.
+const BOOL_KNOBS: &[(&str, &str)] = &[
+    ("INFR_IGNORE_EOS", "false"),
+    ("INFR_NO_THINK", "false"),
+    ("INFR_KV_Q8", "false"),
+    ("INFR_KV_INLINE", "false"),
+    ("INFR_KV_COOPMAT_BDA", "false"),
+    ("INFR_KV_OVERFLOW", "false"),
+    ("INFR_PAGER_STATS", "false"),
+    ("INFR_DRAM_BYPASS", "false"),
+    ("INFR_CM_8X8", "false"),
+    ("INFR_BF16_COOPMAT", "false"),
+    ("INFR_F8_COOPMAT", "false"),
+    ("INFR_F8_PREPACK", "false"),
+    ("INFR_I8_COOPMAT", "false"),
+    ("INFR_I8_ROW_SCALE", "false"),
+    ("INFR_GEMM_WIDE_TILE", "false"),
+    ("INFR_GEMM_DIRECT_A", "false"),
+    ("INFR_MMV_DECODE", "false"),
+    ("INFR_MMV_FUSE_QUANT", "false"),
+    ("INFR_FLASH_STAGE", "false"),
+    ("INFR_FLASH_DEQUANT", "false"),
+    ("INFR_NC_FA_WIDE", "false"),
+    ("INFR_FLASH_CM1", "false"),
+    ("INFR_NO_ATTN_HD", "false"),
+    ("INFR_DELTA_STRIDED", "false"),
+    ("INFR_NO_VRAM_GUARD", "false"),
+    ("INFR_NO_MOE_SM_POOL", "false"),
+    ("INFR_SEAM_NO_REPLAY", "false"),
+    ("INFR_NO_GEMV_RM", "false"),
+    ("INFR_NO_GEMV_SG", "false"),
+    ("INFR_NO_GEMV_ID_SG", "false"),
+    ("INFR_METAL_LMHEAD_MRV", "false"),
+    ("INFR_SPEC_DEBUG", "false"),
+    ("INFR_PROF_OPS", "false"),
+    ("INFR_PROF_OP_SHAPES", "false"),
+    ("INFR_PROF_STAGES", "false"),
+    ("INFR_PROF_VRAM", "false"),
+    ("INFR_PROF_DIFFUSION_TRACE", "false"),
+    ("INFR_PROF_METAL_DEBUG", "false"),
+    ("INFR_DEBUG_BDA_CHUNK", "false"),
+    ("INFR_DEBUG_COOPMAT", "false"),
+    ("INFR_DEBUG_WIDE_DISPATCH", "false"),
+    ("INFR_DEBUG_CHAT", "false"),
+    ("INFR_MOE_COUNTS_DEBUG", "false"),
+    ("INFR_MOE_COUNTS_DUMP", "false"),
+    ("INFR_POISON_UNINIT", "false"),
+    ("INFR_NOBARRIER", "false"),
+    ("INFR_FULLBARRIER", "false"),
+];
+
+/// Every `Grammar::BoolInv` knob: the key NAMES the DISABLE (`INFR_NO_*`, `INFR_CPU_NO_SPINPOOL`),
+/// so its value is inverted on the way to the field. Unset here is `true` for every entry, because
+/// each of these fields is a feature that ships ON.
+const BOOL_INV_KNOBS: &[(&str, &str)] = &[
+    ("INFR_NO_KV_RING", "true"),
+    ("INFR_NO_COOPMAT", "true"),
+    ("INFR_NO_F16", "true"),
+    ("INFR_NO_I8DOT", "true"),
+    ("INFR_NO_GEMM_WARP", "true"),
+    ("INFR_NO_SMALL_BM", "true"),
+    ("INFR_NO_BM16", "true"),
+    ("INFR_NO_MMQ", "true"),
+    ("INFR_NO_MMQ_FALLBACK", "true"),
+    ("INFR_NO_MMV", "true"),
+    ("INFR_NO_MMV_M4", "true"),
+    ("INFR_NO_MMV_O4", "true"),
+    ("INFR_NO_MROW", "true"),
+    ("INFR_NO_MROW16", "true"),
+    ("INFR_NO_F32_MROW", "true"),
+    ("INFR_NO_F32_V4", "true"),
+    ("INFR_NO_FLASH_WARP", "true"),
+    ("INFR_NO_NC_FA", "true"),
+    ("INFR_NO_QK_WARP", "true"),
+    ("INFR_NO_PV_WARP", "true"),
+    ("INFR_NO_ATTN_DECODE", "true"),
+    ("INFR_NO_MLA_SG", "true"),
+    ("INFR_DN_CHUNK_SCAN", "true"),
+    ("INFR_NO_DN_CHUNK", "true"),
+    ("INFR_NO_DN_SPLIT", "true"),
+    ("INFR_NO_PUSH_DESC", "true"),
+    ("INFR_NO_PIPELINE_CACHE", "true"),
+    ("INFR_NO_GPU_POS", "true"),
+    ("INFR_NO_FUSE_ADD", "true"),
+    ("INFR_METAL_NO_F16_NATIVE", "true"),
+    ("INFR_METAL_NO_F32_NATIVE", "true"),
+    ("INFR_METAL_NO_BF16_NATIVE", "true"),
+    ("INFR_METAL_NO_F16_CMM", "true"),
+    ("INFR_METAL_NO_BF16_CMM", "true"),
+    ("INFR_METAL_NO_F32_CMM", "true"),
+    ("INFR_METAL_NO_F16_RT", "true"),
+    ("INFR_METAL_NO_BF16_RT", "true"),
+    ("INFR_METAL_NO_F32_RT", "true"),
+    ("INFR_METAL_NO_KQUANT_NATIVE", "true"),
+    ("INFR_METAL_NO_Q5K_RT", "true"),
+    ("INFR_METAL_NO_RMSNORM_VEC4", "true"),
+    ("INFR_METAL_NO_CONV1D_PAR", "true"),
+    ("INFR_METAL_NO_DN_GATE_PREP", "true"),
+    ("INFR_METAL_NO_DN_NORM_PREP", "true"),
+    ("INFR_METAL_NODELTA", "true"),
+    ("INFR_METAL_NOMOE", "true"),
+    ("INFR_CPU_NO_SPINPOOL", "true"),
+    ("INFR_NO_QKV_FUSE", "true"),
+    ("INFR_NO_GATED_RMSNORM", "true"),
+    ("INFR_NO_MTP_CKPT", "true"),
+    ("INFR_NO_MTP_REPRIME", "true"),
+    ("INFR_NO_MTP_DRAFT_CHAIN", "true"),
+    ("INFR_NO_GPU_DRAFT_PROB", "true"),
+    ("INFR_NO_GPU_MTP_ACCEPT", "true"),
+    ("INFR_NO_GPU_ARGMAX", "true"),
+    ("INFR_NO_GPU_SAMPLE", "true"),
+    ("INFR_NO_GPU_EMBED", "true"),
+    ("INFR_PIPELINE_HOST", "true"),
+    ("INFR_TP_HOST", "true"),
+    ("INFR_EP_HOST", "true"),
+];
+
+/// Every `Grammar::BoolOpt` knob. The field is an `Option<bool>`, so it has a third state —
+/// `None`, "this layer has no opinion, decide from the hardware" — and unset is the ONLY thing that
+/// leaves it there. Used to be `TriState`, where any value that was not exactly `"0"` — the empty
+/// one included — forced the field ON.
+const BOOL_OPT_KNOBS: &[(&str, &str)] = &[
+    ("INFR_LAYER_MAJOR", "none"),
+    ("INFR_MMV_MW", "none"),
+    ("INFR_MROWS_ATTN", "none"),
+];
+
+/// Every `Grammar::BoolOptInv` knob: an `Option<bool>` switch whose key names the DISABLE
+/// (`INFR_NO_MROWS_ATTN`, the negative half of that asymmetric pair).
+const BOOL_OPT_INV_KNOBS: &[(&str, &str)] = &[("INFR_NO_MROWS_ATTN", "none")];
+
+/// One value-read class: the grammar's name, its knobs with what each field reads when UNSET, and
+/// what `=1` and `=0` must put on the field.
+type SwitchClass = (
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+    &'static str,
+);
+
+/// The four value-read classes as ONE table.
+///
+/// The `one` column is the polarity test the inverted families need: it is exactly what the old
+/// presence read answered for `INFR_X=1`, and `zero` is the opposite of it. `INFR_NO_GEMM_WARP=1`
+/// still turns warp GEMM off; `=0` now keeps it on, which is the half that used to be a lie.
+const SWITCH_TABLES: &[SwitchClass] = &[
+    ("Bool", BOOL_KNOBS, "true", "false"),
+    ("BoolInv", BOOL_INV_KNOBS, "false", "true"),
+    ("BoolOpt", BOOL_OPT_KNOBS, "true", "false"),
+    ("BoolOptInv", BOOL_OPT_INV_KNOBS, "false", "true"),
+];
+
+/// The truth table for EVERY switch in the manifest, whichever way its key points: unset ⇒ its
+/// default and an env layer that says nothing, `1/true/on/yes` ⇒ the value the key means,
+/// `0/false/off/no` ⇒ the opposite, and anything else — the empty value included — ⇒ a startup
+/// error naming that variable and listing the accepted spellings.
 #[test]
-fn presence_inverted_knobs_have_the_right_polarity() {
+fn bool_knobs_are_value_reads() {
     let defaults = Config::default();
-    for key in KEYS {
-        let (unset_repr, set_repr) = match key.grammar {
-            Grammar::PresenceInv => ("true", "false"),
-            Grammar::PresenceOptFalse => ("none", "false"),
-            _ => continue,
-        };
-        assert_eq!(
-            defaults.get_path(key.path).as_deref(),
-            Some(unset_repr),
-            "{} unset must leave `{}` at {unset_repr}",
-            key.env,
-            key.path
-        );
-        for value in ["", "0", "1"] {
-            let cfg = Config::load_from_layers(&[env_layer(&[(key.env, value)])]);
+    for &(grammar, table, one, zero) in SWITCH_TABLES {
+        for &(env, unset) in table {
+            let key = KEYS
+                .iter()
+                .find(|k| k.env == env)
+                .unwrap_or_else(|| panic!("{env} is in {grammar}'s table but not in the manifest"));
             assert_eq!(
-                cfg.get_path(key.path).as_deref(),
-                Some(set_repr),
-                "{}={value:?} must set `{}` to {set_repr} — presence, not value",
+                key.grammar,
+                match grammar {
+                    "Bool" => Grammar::Bool,
+                    "BoolInv" => Grammar::BoolInv,
+                    "BoolOpt" => Grammar::BoolOpt,
+                    _ => Grammar::BoolOptInv,
+                },
+                "{} is in the {grammar} table but the manifest calls it {:?}",
                 key.env,
+                key.grammar
+            );
+            assert_eq!(
+                defaults.get_path(key.path).as_deref(),
+                Some(unset),
+                "{env} unset must leave `{}` at {unset} — the conversion may not move a default",
                 key.path
+            );
+            assert!(
+                !env_layer(&[]).is_path_set(key.path),
+                "{env} unset must leave `{}` unspecified by the env layer",
+                key.path
+            );
+
+            for (spelling, want) in BOOL_ON.iter().zip([one]).chain(BOOL_OFF.iter().zip([zero])) {
+                for value in [spelling.to_string(), spelling.to_uppercase()] {
+                    let cfg = Config::load_from_layers(&[env_layer(&[(env, value.as_str())])]);
+                    assert_eq!(
+                        cfg.get_path(key.path).as_deref(),
+                        Some(want),
+                        "{env}={value:?} must set `{}` to {want}",
+                        key.path
+                    );
+                }
+            }
+
+            for &value in BOOL_REJECTED {
+                let err = try_env_layer(&[(env, value)]).err().unwrap_or_else(|| {
+                    panic!("{env}={value:?} was accepted — it is not a boolean")
+                });
+                match err {
+                    ConfigError::Env { key: bad, message } => {
+                        assert_eq!(bad, env, "the error must name the variable");
+                        for &accepted in BOOL_ON.iter().chain(BOOL_OFF.iter()) {
+                            assert!(
+                                message.contains(accepted),
+                                "{env}={value:?} error must list the accepted values, and \
+                                 {accepted} is missing from: {message}"
+                            );
+                        }
+                    }
+                    other => panic!("{env}={value:?}: expected an env error, got {other:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// `Grammar::Presence` knobs that are NOT switches and so stay presence reads. Empty today: every
+/// on/off switch went value-reading, and the three remaining `presence` reads in `env.rs` are the
+/// `*_specified` MARKERS of value knobs (`INFR_UBATCH`, `INFR_KV_TYPE_K`/`_V`), whose own manifest
+/// grammar is that value's. A new `Presence` row has to earn a line here — with the reason — or
+/// [`bool_knobs_match_the_manifest`] fails.
+const PRESENCE_IS_A_VALUE_KNOB: &[(&str, &str)] = &[];
+
+/// `Grammar::PresenceClears` rows: markers on a value knob, excused from the value-read class for
+/// the same reason. Same rule — an unlisted row fails the check.
+const CLEARS_IS_A_VALUE_KNOB: &[(&str, &str)] = &[(
+    "INFR_NO_GEMV_REG",
+    "carries no boolean: mentioning it means 'drop the GEMV variant', and the value it takes is \
+         irrelevant by design",
+)];
+
+/// The three grammars that are NOT a value read and NOT a marker: keys compared to an exact string.
+/// They are switches in the colloquial sense, so each one is excused here with the reason, and a
+/// new `Literal` row on a boolean field has to join them.
+const LITERAL_IS_AN_EXACT_SPELLING: &[(&str, &str)] = &[
+    (
+        "INFR_MTP",
+        "a MODE selector whose only spellings are the levels, not a boolean",
+    ),
+    (
+        "INFR_MTP_MEASURE",
+        "a MODE selector whose only spellings are the levels, not a boolean",
+    ),
+    (
+        "INFR_FLASH_BM",
+        "compares against a block size, `\"32\"`, which is not a boolean",
+    ),
+];
+
+/// The tables above and the manifest are ONE fact, checked in both directions — and the manifest is
+/// checked for a presence-style SWITCH grammar sneaking back. Every row is one of: a value-reading
+/// switch (`Bool*`, in a table), a value knob whose marker grammar says so, an exact-literal key
+/// excused above, or a plain value. Nothing else may land on a boolean field.
+#[test]
+fn bool_knobs_match_the_manifest() {
+    for &(grammar, table, _, _) in SWITCH_TABLES {
+        let mut want: Vec<&str> = table.iter().map(|(env, _)| *env).collect();
+        want.sort_unstable();
+        let g = match grammar {
+            "Bool" => Grammar::Bool,
+            "BoolInv" => Grammar::BoolInv,
+            "BoolOpt" => Grammar::BoolOpt,
+            _ => Grammar::BoolOptInv,
+        };
+        let mut have: Vec<&str> = KEYS
+            .iter()
+            .filter(|k| k.grammar == g)
+            .map(|k| k.env)
+            .collect();
+        have.sort_unstable();
+        assert_eq!(
+            want, have,
+            "the {grammar} table and the manifest's {grammar} rows disagree — an on/off switch \
+             that is missing from the table has to be added there as well"
+        );
+    }
+
+    let justified: Vec<&str> = PRESENCE_IS_A_VALUE_KNOB
+        .iter()
+        .map(|(env, _)| *env)
+        .collect();
+    for key in KEYS.iter().filter(|k| k.grammar == Grammar::Presence) {
+        assert!(
+            justified.contains(&key.env),
+            "{} is a `Presence` knob: either it is an on/off switch, in which case it belongs in \
+             the manifest as `Bool`/`BoolInv`/`BoolOpt`/`BoolOptInv` (and in that table), or it is \
+             really a value — then list it in PRESENCE_IS_A_VALUE_KNOB with the reason.",
+            key.env
+        );
+    }
+    let clears: Vec<&str> = CLEARS_IS_A_VALUE_KNOB.iter().map(|(env, _)| *env).collect();
+    for key in KEYS.iter().filter(|k| k.grammar == Grammar::PresenceClears) {
+        assert!(
+            clears.contains(&key.env),
+            "{} clears a value knob; list the reason in CLEARS_IS_A_VALUE_KNOB if that is really \
+             what it does, and give it a `Bool*` grammar if it is a switch.",
+            key.env
+        );
+    }
+    let literal: Vec<&str> = LITERAL_IS_AN_EXACT_SPELLING
+        .iter()
+        .map(|(env, _)| *env)
+        .collect();
+    let defaults = Config::default();
+    for key in KEYS.iter().filter(|k| !k.grammar.is_switch()) {
+        let repr = defaults.get_path(key.path);
+        let on_a_boolean = matches!(repr.as_deref(), Some("true") | Some("false"));
+        assert!(
+            !on_a_boolean || literal.contains(&key.env),
+            "{} ({:?}) lands on a boolean field but is not a value-reading switch — that is the \
+             `INFR_X=0`-means-ON bug waiting to happen again. Give it a `Bool*` grammar, or excuse \
+             the exact-spelling comparison in LITERAL_IS_AN_EXACT_SPELLING.",
+            key.env,
+            key.grammar
+        );
+    }
+    let still_there: Vec<&str> = KEYS.iter().map(|k| k.env).collect();
+    for table in [
+        PRESENCE_IS_A_VALUE_KNOB,
+        CLEARS_IS_A_VALUE_KNOB,
+        LITERAL_IS_AN_EXACT_SPELLING,
+    ] {
+        for (env, _) in table {
+            assert!(
+                still_there.contains(env),
+                "{env} is excused from the value-read class but no longer in the manifest — drop \
+                 the excuse"
             );
         }
     }
 }
 
-/// The three grammars that are NOT plain presence, spelled out because getting any of them wrong
-/// is invisible to the goldens.
+/// `INFR_FLASH_CM1` (the hd-256 cm1 flash prefill, OFF by default so hd 256 keeps the non-FA coopmat
+/// route) is a `Bool` knob, so its accepted spellings and its refusals are `BOOL_KNOBS`' job. What
+/// the table cannot see is the LAYERING the key was added for: unset must leave the field
+/// UNSPECIFIED, so a `flash_cm1 = true` written in the file survives an empty environment.
 #[test]
-fn non_presence_grammars_are_preserved() {
-    // `budget::flag_from`: empty and "0" are OFF here, unlike every `is_ok()` knob.
-    for (value, want) in [("", false), ("0", false), ("1", true), ("yes", true)] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_KV_OVERFLOW", value)])]);
-        assert_eq!(cfg.kv.overflow, want, "INFR_KV_OVERFLOW={value:?}");
-    }
-    // Set AND != "0".
-    for (value, want) in [("", true), ("0", false), ("1", true)] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_NO_THINK", value)])]);
-        assert_eq!(cfg.sampling.no_think, want, "INFR_NO_THINK={value:?}");
-    }
-    // …and its inverted twin.
-    for (value, want) in [("", false), ("0", true), ("1", false)] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_CPU_NO_SPINPOOL", value)])]);
-        assert_eq!(
-            cfg.kernels.cpu.spinpool, want,
-            "INFR_CPU_NO_SPINPOOL={value:?}"
-        );
-    }
-    // `Grammar::Bool` — the one env grammar whose VALUE means what it says and whose bad values
-    // are refused. `INFR_FLASH_CM1` is the hd-256 cm1 flash prefill, OFF by default so hd 256 keeps
-    // the non-FA coopmat route. Unset must leave the field UNSPECIFIED, so a file value survives an
-    // empty environment.
+fn flash_cm1_unset_leaves_the_file_value() {
     assert!(
         !Config::default().kernels.vulkan.flash_cm1,
         "cm1 flash prefill defaults off"
     );
-    for (value, want) in [
-        ("1", true),
-        ("true", true),
-        ("on", true),
-        ("yes", true),
-        ("0", false),
-        ("false", false),
-        ("off", false),
-        ("no", false),
-    ] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_FLASH_CM1", value)])]);
-        assert_eq!(
-            cfg.kernels.vulkan.flash_cm1, want,
-            "INFR_FLASH_CM1={value:?}"
-        );
-    }
     assert!(
         Config::load_from_layers(&[
             file_layer("[kernels.vulkan]\nflash_cm1 = true\n"),
@@ -573,18 +858,14 @@ fn non_presence_grammars_are_preserved() {
         .flash_cm1,
         "unset INFR_FLASH_CM1 must not clobber the file"
     );
-    for value in ["2", "", "banana"] {
-        assert!(
-            try_env_layer(&[("INFR_FLASH_CM1", value)]).is_err(),
-            "INFR_FLASH_CM1={value:?} is not a boolean and must be refused, not guessed"
-        );
-    }
-    // Tri-state: unset = vendor default, "0" = force off, anything else = force on.
-    assert_eq!(Config::default().kernels.vulkan.mmv_mw, None);
-    for (value, want) in [("0", Some(false)), ("1", Some(true)), ("", Some(true))] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_MMV_MW", value)])]);
-        assert_eq!(cfg.kernels.vulkan.mmv_mw, want, "INFR_MMV_MW={value:?}");
-    }
+}
+
+/// The grammars that are NOT switches, spelled out because getting any of them wrong is invisible
+/// to the goldens. The four keys this test used to carry — `INFR_KV_OVERFLOW`, `INFR_NO_THINK`,
+/// `INFR_CPU_NO_SPINPOOL`, `INFR_MMV_MW` — are value-reading switches now and live in the tables
+/// above; what is left here is the grammar that genuinely is not a boolean.
+#[test]
+fn non_switch_grammars_are_preserved() {
     // Exact string literals: `INFR_FLASH_BM` is compared to "32", not parsed.
     assert!(
         Config::load_from_layers(&[env_layer(&[("INFR_FLASH_BM", "32")])])
@@ -681,7 +962,8 @@ fn non_presence_grammars_are_preserved() {
     );
 }
 
-/// The asymmetric mrows-attn pair: `INFR_NO_MROWS_ATTN` WINS when both are set.
+/// The mrows-attn pair: ONE `Option<bool>` field, two value-reading keys, and `INFR_NO_MROWS_ATTN`
+/// still WINS when both are set. Unset on both is the third state the field exists for.
 #[test]
 fn mrows_attn_pair_is_asymmetric() {
     let both = Config::load_from_layers(&[env_layer(&[
@@ -692,6 +974,26 @@ fn mrows_attn_pair_is_asymmetric() {
     let opt_in = Config::load_from_layers(&[env_layer(&[("INFR_MROWS_ATTN", "1")])]);
     assert_eq!(opt_in.kernels.vulkan.mrows_attn, Some(true));
     assert_eq!(Config::default().kernels.vulkan.mrows_attn, None);
+    assert_eq!(
+        Config::load_from_layers(&[env_layer(&[("INFR_MROWS_ATTN", "0")])])
+            .kernels
+            .vulkan
+            .mrows_attn,
+        Some(false),
+        "the opt-in key reads its value, so `=0` forces the path off"
+    );
+    assert_eq!(
+        Config::load_from_layers(&[env_layer(&[("INFR_NO_MROWS_ATTN", "0")])])
+            .kernels
+            .vulkan
+            .mrows_attn,
+        Some(true),
+        "and the disable key's OFF spelling forces it on"
+    );
+    assert!(
+        try_env_layer(&[("INFR_MROWS_ATTN", "")]).is_err(),
+        "an empty value is no longer 'mentioned, direction unknown'"
+    );
 }
 
 /// `INFR_NO_GEMV_REG` silently wins over `INFR_GEMV_VARIANT` — R1-frozen.

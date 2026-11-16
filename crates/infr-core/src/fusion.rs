@@ -461,9 +461,10 @@ mod tests {
         assert_eq!(on.linear_add.len(), 1);
         assert!(on.skip.contains(&1));
 
-        // The `NO_FUSE` keys clear their POSITIVE field on PRESENCE — value irrelevant,
-        // including `=0` (the presence-inv truth table).
-        for raw in ["", "0", "1"] {
+        // The `NO_FUSE` key names the DISABLE and reads its VALUE: an ON spelling clears the
+        // positive field, an OFF spelling keeps it. (`=0` used to clear it too — that was the
+        // `presence-inv` truth table, where only mention counted.)
+        for raw in ["1", "true", "on", "yes"] {
             let layer =
                 crate::config::env::parse(&|k| (k == "INFR_NO_FUSE_ADD").then(|| raw.to_string()))
                     .expect("INFR_NO_FUSE_ADD");
@@ -473,6 +474,22 @@ mod tests {
                 "INFR_NO_FUSE_ADD={raw:?} must clear its fusion field"
             );
         }
+        for raw in ["0", "false", "off", "no"] {
+            let layer =
+                crate::config::env::parse(&|k| (k == "INFR_NO_FUSE_ADD").then(|| raw.to_string()))
+                    .expect("INFR_NO_FUSE_ADD");
+            let cfg = Config::load_from_layers(&[layer]);
+            assert!(
+                cfg.kernels.vulkan.fuse_add,
+                "INFR_NO_FUSE_ADD={raw:?} says do-not-disable, so the field keeps its default"
+            );
+        }
+        // The empty value is neither: it is a startup error, not a silent ON.
+        let empty = crate::config::env::parse(&|k| (k == "INFR_NO_FUSE_ADD").then(String::new));
+        assert!(
+            empty.is_err(),
+            "an empty `NO_` value must be refused, not read as ON"
+        );
 
         // Cleared field => nothing planned, nothing skipped: both ops dispatch.
         let off = plan_with(false);

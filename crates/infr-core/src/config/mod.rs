@@ -6,6 +6,12 @@
 //! `PartialConfig` — every leaf `Option`-wrapped — and the layers are folded, so a layer only
 //! overrides a field it actually specifies.
 //!
+//! A boolean `INFR_*` switch reads its VALUE (`env::boolean`, `manifest::Grammar::Bool`): unset
+//! leaves the knob at its default, `1`/`true`/`on`/`yes` and `0`/`false`/`off`/`no` (ASCII
+//! case-insensitive) say which way, and anything else — the empty value included — is a startup
+//! error. Reading a switch for PRESENCE instead was what made `INFR_KV_INLINE=0` turn inline decode
+//! ON; only the `*_specified` markers of value knobs are still presence reads.
+//!
 //! ```no_run
 //! # use infr_core::config::{Config, ConfigOverrides};
 //! let cfg = std::sync::Arc::new(Config::load(&ConfigOverrides::default())?);
@@ -69,8 +75,8 @@ cfg_struct! {
         /// rather than `ubatch.is_some()`, because the two consumers disagree about an unusable
         /// value: `INFR_UBATCH=0` and `INFR_UBATCH=abc` yield NO chunk height (the value site is
         /// `.parse().ok().filter(|&v| v > 0)`) yet still count as "the user pinned a height", which
-        /// is what the seam's dense placement sweeps read to skip themselves (`is_err()` at
-        /// `seam/mod.rs`'s three sweep gates). Collapsing the two onto one `Option` would silently
+        /// is what the seam's dense placement sweeps read to skip themselves (the three sweep gates
+        /// in `seam/mod.rs` test this flag). Collapsing the two onto one `Option` would silently
         /// re-enable the sweep for `-u 0`, a shipped CLI spelling (R1).
         ubatch_specified: bool = false,
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
@@ -104,7 +110,8 @@ cfg_struct! {
         max_new: usize = 2048,
         /// `INFR_IGNORE_EOS`.
         ignore_eos: bool = false,
-        /// `INFR_NO_THINK`: suppress the model's thinking block. Set AND `!= "0"`.
+        /// `INFR_NO_THINK`: suppress the model's thinking block. A `Bool` switch on a field that is
+        /// itself named for the suppression, so `=1`/`on` suppresses and `=0`/`off` thinks.
         no_think: bool = false,
     }
 }
@@ -129,12 +136,14 @@ cfg_struct! {
         slots: usize = 4,
         /// `INFR_NO_KV_RING` (inverted): the SWA ring cache.
         ring: bool = true,
-        /// `INFR_KV_INLINE`.
+        /// `INFR_KV_INLINE`: the inline K/V decode read path. `Bool` grammar — unset keeps it off,
+        /// `=0`/`off` turns it OFF (which is exactly what the old presence read could not do).
         inline_decode: bool = false,
         /// `INFR_KV_COOPMAT_BDA`.
         coopmat_bda: bool = false,
-        /// `INFR_KV_OVERFLOW`: spill KV to host RAM. `budget::flag_from` grammar — `""` and `"0"`
-        /// are OFF here, unlike every `is_ok()` knob.
+        /// `INFR_KV_OVERFLOW`: spill KV to host RAM. A `Bool` switch — `=0`/`off` is OFF and the
+        /// empty value is a startup error, where `budget::flag_from` used to read `""` as OFF and
+        /// anything else as ON.
         overflow: bool = false,
         /// `INFR_KV_OVERFLOW_VRAM_MB`, in MiB (the byte conversion is the accessor's).
         overflow_vram_mb: Option<u64> = None,
@@ -256,8 +265,8 @@ cfg_struct! {
         mmq: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
-        /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
-        /// this backwards disables the mmv tier for everyone.
+        /// `INFR_NO_MMV`, a `BoolInv` switch: `=1` stores `false` and disables the mmv tier, `=0`
+        /// keeps it. Getting the polarity wrong here disables the tier for everyone.
         mmv: bool = true,
         /// `INFR_MMV_DECODE`. The site is `mmv_decode && mmv`.
         mmv_decode: bool = false,
@@ -265,8 +274,9 @@ cfg_struct! {
         mmv_m4: bool = true,
         /// `INFR_NO_MMV_O4` (inverted).
         mmv_o4: bool = true,
-        /// `INFR_MMV_MW`, TRI-state: `None` = vendor default, `Some(false)` = `"0"` (force off),
-        /// `Some(true)` = any other value (force on). Three different dtype lists.
+        /// `INFR_MMV_MW`, a `BoolOpt` switch on a tri-state field: unset/`None` = the vendor default,
+        /// an OFF spelling = force off, an ON spelling = force on; any other value is a startup
+        /// error. Three different dtype lists.
         mmv_mw: Option<bool> = None,
         /// `INFR_MMV_MW_WARPS`.
         mmv_mw_warps: Option<usize> = None,
@@ -301,8 +311,9 @@ cfg_struct! {
         flash_warp: bool = true,
         /// `INFR_NO_NC_FA` (inverted).
         nc_fa: bool = true,
-        /// `INFR_NC_FA_WIDE` (`set_not_zero`: set and `!= "0"` turns the reroute ON; unset or `=0`
-        /// leaves the old route) — opt-in: route a prefill the coopmat flash geometry cannot serve
+        /// `INFR_NC_FA_WIDE` — a `Bool` switch: `=1`/`on` turns the reroute ON, `=0`/`off` and unset
+        /// leave the old route, any other value (the empty one included) is a startup error
+        /// — opt-in: route a prefill the coopmat flash geometry cannot serve
         /// because `hd > 128` to the non-coopmat flash kernel instead of the non-FA coopmat
         /// pipeline, which materializes a `[nh, mpad, kv_pad]` f16 scores matrix. DEFAULT OFF: the
         /// reroute is the CLOSER leg to the exact f64 oracle (max error 1.5e-6 / 8.8e-6 at kv 4k /
@@ -326,8 +337,8 @@ cfg_struct! {
         pv_warp: bool = true,
         /// `INFR_PV_SPLITS`.
         pv_splits: Option<usize> = None,
-        /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
-        /// field.
+        /// `INFR_NO_ATTN_HD`: a `Bool` switch despite the `NO_` spelling — sanctioned negative
+        /// field, so `=1` disables the specialization and `=0` keeps it.
         no_attn_hd_spec: bool = false,
         /// `INFR_NO_ATTN_DECODE` (inverted) — the decode-only split-K pass-1 specialization
         /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
@@ -344,8 +355,10 @@ cfg_struct! {
         /// the summation order differs.
         mla_sg: bool = true,
 
-        /// `INFR_DN_CHUNK_SCAN` — spelled POSITIVELY but read with `.is_err()`: setting it
-        /// DISABLES the chunked scan. The name lies about its polarity; R2 freezes it.
+        /// `INFR_DN_CHUNK_SCAN`, a `BoolInv` switch — and the key means what it says while the FIELD
+        /// does not: `=1` stores `false`, which is what SELECTS the chunked scan
+        /// (`deltanet_chunked_split`), because `dn_chunk_scan == true` is the arm that runs the
+        /// serial `deltanet_seq_split` instead. Unset keeps that serial path.
         dn_chunk_scan: bool = true,
         /// `INFR_NO_DN_CHUNK` (inverted).
         dn_chunk: bool = true,
@@ -361,8 +374,8 @@ cfg_struct! {
         no_vram_guard: bool = false,
         /// `INFR_NO_MOE_SM_POOL` — sanctioned negative field.
         no_moe_sm_pool: bool = false,
-        /// `INFR_SEAM_NO_REPLAY` — sanctioned negative field. Read `is_ok()` in the Vulkan
-        /// adapter and `is_err()` in the llama runner; ONE field, the llama site becomes
+        /// `INFR_SEAM_NO_REPLAY` — sanctioned negative field, and a `Bool` value read: `=1` forces
+        /// the static path, `=0` keeps replay. ONE field, the llama runner site becomes
         /// `!cfg.no_replay`.
         no_replay: bool = false,
         /// `INFR_NO_GPU_POS` (inverted). Also read in `infr-llama`'s runner.
@@ -400,8 +413,9 @@ cfg_struct! {
 }
 
 cfg_struct! {
-    /// Metal kernel-tier selection. Fifteen of these are `INFR_METAL_NO_*` disable-switches read
-    /// with `.is_err()`; the fields are POSITIVE and default `true`.
+    /// Metal kernel-tier selection. Fifteen of these are `INFR_METAL_NO_*` disable-switches on a
+    /// `BoolInv` key — `=1` turns the kernel off, `=0` keeps it — and the fields are POSITIVE and
+    /// default `true`.
     ///
     /// Metal cannot be run on the dev box — its slice is compile-checked
     /// (`cargo check -p infr-metal --target x86_64-apple-darwin`) and validated by macOS CI.
@@ -436,11 +450,12 @@ cfg_struct! {
         dn_gate_prep: bool = true,
         /// `INFR_METAL_NO_DN_NORM_PREP` (inverted).
         dn_norm_prep: bool = true,
-        /// `INFR_METAL_LMHEAD_MRV`: PRESENCE lifts the mrv `out_f` ceiling (the site reads
-        /// `.is_err()` to keep the cap).
+        /// `INFR_METAL_LMHEAD_MRV`: a `Bool` switch — `=1`/`on` lifts the mrv `out_f` ceiling,
+        /// `=0`/`off` and unset keep it.
         lmhead_mrv_uncapped: bool = false,
-        /// `INFR_METAL_NODELTA`: read BOTH ways in `exec.rs` (`is_ok()` at three sites,
-        /// `is_err()` at two) with the SAME meaning — set ⇒ DeltaNet off. One positive field.
+        /// `INFR_METAL_NODELTA`, a `BoolInv` switch: `=1` stores `false` ⇒ DeltaNet off, `=0` keeps
+        /// it. `exec.rs` used to read the same key BOTH ways (`is_ok()` at three sites, `is_err()`
+        /// at two) with the SAME meaning; it is one positive field now.
         deltanet: bool = true,
         /// `INFR_METAL_NOMOE`: as [`MetalCfg::deltanet`].
         moe: bool = true,
@@ -838,9 +853,12 @@ pub enum ConfigError {
         /// The repeated path.
         path: String,
     },
-    /// An environment variable held a value the engine rejects LOUDLY today (`INFR_SG`,
-    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists, `INFR_FLASH_CM1`). Those keep
-    /// erroring — that is the behaviour being preserved, not an `unwrap_or` (R1).
+    /// An environment variable held a value the engine rejects LOUDLY: the five keys that already
+    /// did (`INFR_SG`, `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists), which R1 keeps,
+    /// and every switch — the `Bool`/`BoolInv`/`BoolOpt`/`BoolOptInv` grammars of
+    /// `manifest::Grammar`, `INFR_FLASH_CM1` among them — whose value is neither an ON nor an OFF
+    /// spelling. A switch that silently read garbage as ON is how `INFR_KV_INLINE=0` measured the
+    /// `=1` arm.
     #[error("{key}: {message}")]
     Env {
         /// The `INFR_*` variable.

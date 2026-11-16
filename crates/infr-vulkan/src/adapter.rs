@@ -171,10 +171,10 @@ fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
-    // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`) forces the static per-execute path
-    // (INFR_PROF_OPS timestamps work there; the replay path can't report them). ONE field read
-    // `is_ok()` here and `!no_replay` in the llama runner — both halves now come off the same
-    // `Config`.
+    // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`, a `Bool` switch on a field that is itself
+    // named for the refusal) forces the static per-execute path
+    // (INFR_PROF_OPS timestamps work there; the replay path can't report them). ONE field read here
+    // and its negation in the llama runner — both halves come off the same `Config`.
     if be_.cfg().kernels.vulkan.no_replay {
         return false;
     }
@@ -423,8 +423,8 @@ const MROW16_BAND: usize = 1;
 /// GEMV; the mmv kernels stay reachable for A/B + future re-tuning. (The m≥3 mrow PREFILL mmv is
 /// UNAFFECTED — it still wins: E2B pp4@d4096 loses 5.3% under `INFR_NO_MMV`.)
 ///
-/// The two knobs are DIFFERENT grammars and interact here — `INFR_MMV_DECODE` is `presence`
-/// (`mmv_decode`, default `false`), `INFR_NO_MMV` is `presence-inv` (`mmv`, default `true`), and the
+/// The two knobs are DIFFERENT polarities and interact here — `INFR_MMV_DECODE` is a `Bool` switch
+/// (`mmv_decode`, default `false`), `INFR_NO_MMV` a `BoolInv` one (`mmv`, default `true`), and the
 /// site is `mmv_decode && mmv`.
 fn mmv_decode_enabled(vk: &infr_core::config::VulkanCfg) -> bool {
     vk.mmv_decode && vk.mmv
@@ -530,8 +530,9 @@ fn mmv_int8_decode_dtypes(
     vk: &infr_core::config::VulkanCfg,
 ) -> &'static [infr_core::DType] {
     use infr_core::DType::{Iq4Nl, Q2K, Q3K, Q4K, Q4_0, Q4_1, Q5K, Q5_0, Q5_1, Q6K, Q8_0};
-    // `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is the exact
-    // string `"0"`, `Some(true)` any other value, and `None` (unset) the unified default below.
+    // `INFR_MMV_MW` is TRI-state — `mmv_mw: Option<bool>`, where `Some(false)` is an OFF spelling
+    // (`0`/`false`/`off`/`no`), `Some(true)` an ON spelling, and `None` (unset) the unified default
+    // below.
     match vk.mmv_mw {
         Some(false) => &[], // force-off everywhere
         // Explicit opt-in: every dtype with an int8 decode arm, any vendor (the A/B measurement
@@ -789,8 +790,8 @@ fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
     infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
             weight_ok: &LINEAR_ADD_WEIGHT_OK,
-            // `INFR_NO_FUSE_ADD` (config `kernels.vulkan.fuse_add`, positive polarity): PRESENCE
-            // of the env key — including `INFR_NO_FUSE_ADD=0` — turns the fold off.
+            // `INFR_NO_FUSE_ADD` (config `kernels.vulkan.fuse_add`) names the disable and reads its
+            // VALUE: `=1` turns the fold off, `=0` keeps it on.
             enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
         rmsnorm_linear: None,
@@ -3264,7 +3265,9 @@ fn lower_op(
                 // The pair is ONE asymmetric tri-state field (`kernels.vulkan.mrows_attn`):
                 // `Some(false)` = the `NO_` key, which wins unconditionally; `Some(true)` = the
                 // opt-in, which bypasses the rows/kv_len heuristic; `None` = let the heuristic
-                // decide. Reproduces the old `is_err()`/`is_ok()` pair exactly.
+                // decide. Each key reads its VALUE (`BoolOpt` / `BoolOptInv`), so
+                // `INFR_MROWS_ATTN=0` says what `INFR_NO_MROWS_ATTN=1` says; the old pair turned
+                // the same way for ANY value, `""` included.
                 let mrows_attn = be_.cfg().kernels.vulkan.mrows_attn;
                 let batched_attn = rows >= 2
                     && hd <= 128
@@ -7275,7 +7278,8 @@ mod tests {
             ..Default::default()
         };
         // `kernels.vulkan.mmv_mw`, the tri-state: `None` = unset (the shipping default),
-        // `Some(true)` = `INFR_MMV_MW=1` (any non-"0" value), `Some(false)` = `INFR_MMV_MW=0`.
+        // `Some(true)` = `INFR_MMV_MW=1` (any ON spelling), `Some(false)` = `INFR_MMV_MW=0` (any OFF
+        // spelling); anything else is refused at startup.
         // A VALUE per sweep step — no process env, no guard, no serialization needed.
         let vkcfg = |mmv_mw: Option<bool>| infr_core::config::VulkanCfg {
             mmv_mw,

@@ -98,7 +98,8 @@ inline_decode = false
 coopmat_bda = false
 
 # Spill the KV cache to host RAM when VRAM runs out (VRAM-first). Note the
-# grammar of the env twin: INFR_KV_OVERFLOW="" and ="0" are OFF.
+# grammar of the env twin: INFR_KV_OVERFLOW=0/off/false/no is OFF, and any other
+# value — the empty one included — stops the run.
 overflow = false
 # VRAM ceiling for the KV cache, in MiB. Default: unset = the fit calculation.
 # overflow_vram_mb = 512

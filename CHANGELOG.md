@@ -6,6 +6,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Breaking
+
+- **An `INFR_*` boolean switch now reads its value.** All 43 on/off knobs —
+  `INFR_KV_INLINE`, `INFR_KV_Q8`, `INFR_IGNORE_EOS`, `INFR_CM_8X8`,
+  `INFR_PROF_OPS`, `INFR_NO_VRAM_GUARD`, every `INFR_DEBUG_*`, … — were read for
+  PRESENCE, so ANY value turned them ON: `INFR_KV_INLINE=0` measured the same
+  arm as `=1`, and a typo'd or empty value looked like an intentional one. Now
+  `1`/`true`/`on`/`yes` turn a switch on and `0`/`false`/`off`/`no` turn it off
+  (any ASCII case), unset leaves it at its default as before, and anything else —
+  the empty value included — stops the run with `INFR_X: expected a boolean …`
+  naming the accepted spellings. `INFR_DRAM_BYPASS` joins them: its manifest row
+  said `flag_from` (`0` off) while the code actually read presence (`0` on).
+  The other polarities were still presence-read and are covered by the entry
+  below; the marker and exact-literal keys keep their grammars on purpose. See
+  [docs/config.md](docs/config.md#environment-value-grammars).
+
+- **The same rule now covers the other polarity: 67 more keys, 110 switches in
+  all.** The 59 `INFR_NO_*` disable switches — `INFR_NO_MMV`, `INFR_NO_PUSH_DESC`,
+  the `INFR_METAL_NO_*` set — are a `BoolInv` value read now, and `INFR_CPU_NO_SPINPOOL`
+  joins them. `INFR_NO_MMV=1` disables what it always disabled, so a script that
+  switched a feature off keeps switching it off; `INFR_NO_MMV=0` now ENABLES the
+  feature instead of disabling it the same as `=1` did. That one flip is the
+  whole behavioural change for an existing script, and every site in the tree that
+  sets one of these keys was audited against it. `INFR_KV_OVERFLOW` and
+  `INFR_NC_FA_WIDE` read their value the same way: `0` was already OFF for both,
+  and what changes is the rest of the grammar — a typo used to mean ON for
+  `INFR_NC_FA_WIDE` and OFF for `INFR_KV_OVERFLOW`, and the empty value used to
+  mean ON for one and OFF for the other. Both are startup errors now. The
+  tri-state keys `INFR_LAYER_MAJOR` and `INFR_MMV_MW` keep unset as "decide from
+  the hardware" and now refuse a value that is neither an on nor an off spelling,
+  and so does the `INFR_MROWS_ATTN`/`INFR_NO_MROWS_ATTN` pair, where ANY value
+  used to force the half it forces, with the `NO_` key still winning when both
+  are set. `budget::flag_from` goes with them: `INFR_KV_OVERFLOW` was its only
+  caller. What stays presence-read is what is not a switch: the
+  `INFR_UBATCH` and `INFR_KV_TYPE_K`/`_V` markers, `INFR_NO_GEMV_REG`, and the
+  exact-literal `INFR_MTP`, `INFR_MTP_MEASURE` and `INFR_FLASH_BM`.
+
+### Fixed
+
 ## [0.2.0] - 2026-10-29
 
 ### Breaking
