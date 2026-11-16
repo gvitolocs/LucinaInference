@@ -1,11 +1,21 @@
 // Isolate the Vulkan planar Q8_0 KV write/read: store an f32 ramp → planar Q8 cache, dequant it back
 // to f16, and confirm the round-trip is within Q8 tolerance. Splits store_q8 / dequant_q8_f16 from
 // the full attention path so a layout bug is caught directly.
+//
+// EVERY test here opens a device, so every one of them is gated on the GPU lease first:
+// `INFR_PARITY_DISCRETE_LEASE` must name the lock the run holds, or the test prints one skip line
+// and returns before `VulkanBackend::new()` (the contract is `kv_inline_q4_parity`'s module header;
+// the reading of the variable is [`infr_testkit::lease_or_skip`]). A skipped test is not a pass —
+// it says so out loud, and it touches no card.
 use infr_core::backend::{Backend, BufferUsage};
+use infr_testkit::lease_or_skip;
 use infr_vulkan::VulkanBackend;
 
 #[test]
 fn planar_q8_store_dequant_roundtrip() {
+    if lease_or_skip("planar_q8_store_dequant_roundtrip").is_none() {
+        return;
+    }
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -54,6 +64,9 @@ fn planar_q8_store_dequant_roundtrip() {
 /// static store. Writes a row at pos=3 via store_q8_dyn, dequants the prefix, checks that row.
 #[test]
 fn planar_q8_store_dyn_roundtrip() {
+    if lease_or_skip("planar_q8_store_dyn_roundtrip").is_none() {
+        return;
+    }
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -117,6 +130,9 @@ fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
 /// logical KV within Q8 tolerance. Isolates the decode read from the full model path.
 #[test]
 fn planar_q8_attn_partial_matches_f16() {
+    if lease_or_skip("planar_q8_attn_partial_matches_f16").is_none() {
+        return;
+    }
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -239,6 +255,9 @@ fn planar_q8_attn_partial_matches_f16() {
 /// must match the all-f16 split within Q8 tolerance. Proves KQ8 and VQ8 are independent.
 #[test]
 fn planar_q8_attn_partial_mixed_kv() {
+    if lease_or_skip("planar_q8_attn_partial_mixed_kv").is_none() {
+        return;
+    }
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -334,6 +353,9 @@ fn planar_q8_attn_partial_mixed_kv() {
 /// The record-once self-chunking planar-Q8 decode (attn_partial_dynac_q8) must match the f16 dynac.
 #[test]
 fn planar_q8_dynac_matches_f16() {
+    if lease_or_skip("planar_q8_dynac_matches_f16").is_none() {
+        return;
+    }
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -457,6 +479,9 @@ fn planar_q8_dynac_matches_f16() {
 /// regression can't hide behind that story again.
 #[test]
 fn planar_q8_store_replay_tape_matches_static() {
+    if lease_or_skip("planar_q8_store_replay_tape_matches_static").is_none() {
+        return;
+    }
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
         return;
@@ -549,4 +574,122 @@ fn planar_q8_store_replay_tape_matches_static() {
     let p: &[u32] = bytemuck::cast_slice(&p);
     assert_eq!(p[0] as usize, rows - 1, "params[0] after {rows} replays");
     eprintln!("replayed Q8 store tape bit-matches static ({rows} rows)");
+}
+
+/// Seeding a shared prefix out of a PLANAR Q8_0 cache, on the layout the shader really writes.
+///
+/// `SeamKv::seed_from` (via `seed_kv_prefix`) copies the spans
+/// `infr_core::budget::kv_state_copy_spans` names: codes `[0, P)` and scales
+/// `[cap, cap + P/16)`. One contiguous prefix copy of the PACKED byte count — what llama.cpp does,
+/// because its cache is packed — lands the seeded codes plus `P/16` code bytes of the first
+/// UNSEEDED row, and never moves the seeded rows' scales, so the fork dequantizes its shared prefix
+/// as codes x scale 0. This test writes a whole cache, seeds `p` rows of it into a fresh one, and
+/// checks both halves: the seeded rows dequantize identically, and every byte past them is still
+/// the zero fill.
+///
+/// No device is opened without a GPU lease (`INFR_PARITY_DISCRETE_LEASE`, checked before
+/// `VulkanBackend::new()`), and a run that finds no device skips loudly rather than passing.
+#[test]
+fn planar_q8_seed_prefix_moves_codes_and_scales() {
+    let Some(lease) = lease_or_skip("planar_q8_seed_prefix_moves_codes_and_scales") else {
+        return;
+    };
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    // Which card ran matters here: the second span is a 10-byte `vkCmdCopyBuffer` at offset 512, and
+    // the log has to say which driver it was accepted on.
+    eprintln!("device: {} (under lease {lease})", be.capabilities().name);
+    let (row, rows, p) = (32usize, 16usize, 5usize); // 1 block per row, 16 rows, seed 5
+    let cap = rows * row; // 512 elements = 16 blocks
+    let cache_bytes = (cap / 32 * 34).next_multiple_of(4);
+    let seeded = p * row; // code bytes of the seeded prefix
+
+    // Every row of the SOURCE cache is written, so an over-eager prefix copy is visible in the
+    // destination's zero fill rather than hidden behind an unwritten source.
+    let src_ramp: Vec<f32> = (0..cap).map(|i| ((i as f32) - 24.0) * 0.05 + 1.0).collect();
+    let sbuf = be.alloc(cap * 4, BufferUsage::Activations).unwrap();
+    be.upload(sbuf.as_ref(), bytemuck::cast_slice(&src_ramp))
+        .unwrap();
+    let src = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+    let dst = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.store_q8(sbuf.as_ref(), src.as_ref(), cap, 0, cap, false, 0);
+    rec.finish().unwrap();
+
+    // The seam's own span list for rows [0, p) of a planar q8_0 side — with the LAYOUT question
+    // asked of the backend that owns it, so this test is red if `kv_cache_is_planar` ever answers
+    // false (the seam would then copy one packed span and never the scales).
+    assert!(
+        be.kv_cache_is_planar(infr_core::DType::Q8_0),
+        "the Vulkan Q8 cache is planar: store_q8.comp writes codes then scales at cap"
+    );
+    let spans = infr_core::budget::kv_state_copy_spans(
+        infr_core::DType::Q8_0,
+        row,
+        cap,
+        0,
+        p,
+        be.kv_cache_is_planar(infr_core::DType::Q8_0),
+    );
+    assert_eq!(
+        spans,
+        vec![(0, 0, seeded), (cap, cap, seeded / 32 * 2)],
+        "codes [0,{seeded}) then scales [cap, cap+{})",
+        seeded / 32 * 2
+    );
+    for (s, d, len) in &spans {
+        if *s == 0 && *d == 0 {
+            be.copy_buffer(src.as_ref(), dst.as_ref(), *len).unwrap();
+        } else {
+            be.copy_buffer_at(src.as_ref(), dst.as_ref(), *s, *d, *len)
+                .unwrap();
+        }
+    }
+
+    let mut got = vec![0u8; cache_bytes];
+    be.download(dst.as_ref(), &mut got).unwrap();
+    let mut full = vec![0u8; cache_bytes];
+    be.download(src.as_ref(), &mut full).unwrap();
+    let scales = cap + cap / 32 * 2;
+    assert_eq!(&got[..seeded], &full[..seeded], "seeded codes");
+    assert_eq!(
+        &got[cap..cap + seeded / 32 * 2],
+        &full[cap..cap + seeded / 32 * 2],
+        "seeded SCALES — the byte range a packed prefix copy never touches"
+    );
+    assert!(
+        got[seeded..cap].iter().all(|&b| b == 0),
+        "codes of rows [{p},{rows}) must stay at the zero fill"
+    );
+    assert!(
+        got[cap + seeded / 32 * 2..scales].iter().all(|&b| b == 0),
+        "scales of the unseeded blocks must stay at the zero fill"
+    );
+
+    // Semantically: the seeded prefix of the fork dequantizes to the source's own values.
+    let out = be.alloc(seeded * 2, BufferUsage::Activations).unwrap();
+    let rec = be.recorder().unwrap();
+    rec.dequant_q8_f16(dst.as_ref(), out.as_ref(), seeded, cap);
+    rec.finish().unwrap();
+    let mut raw = vec![0u8; seeded * 2];
+    be.download(out.as_ref(), &mut raw).unwrap();
+    let deq: Vec<f32> = bytemuck::cast_slice::<u8, u16>(&raw)
+        .iter()
+        .map(|&h| half::f16::from_bits(h).to_f32())
+        .collect();
+    let (mut worst, mut worst_i) = (0.0f32, 0usize);
+    for (i, (&g, &s)) in deq.iter().zip(src_ramp.iter()).enumerate() {
+        let err = (g - s).abs();
+        if err > worst {
+            worst = err;
+            worst_i = i;
+        }
+    }
+    assert!(
+        worst < 0.05,
+        "seeded row dequantized wrong at element {worst_i}: err {worst} (scale 0 would be ~1.0)"
+    );
+    eprintln!("planar Q8 prefix seed round-trips, max_err = {worst}");
 }

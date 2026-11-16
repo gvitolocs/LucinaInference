@@ -9,7 +9,10 @@
 //!   | grep -vE '_TEST_|^INFR_(TP|EP|CPU|METAL)$'
 //! ```
 //!
-//! which yields **177** keys at `2dd0c5a`: [`KEYS`]'s 174 plus [`NOT_MIGRATED`]'s 3. (A naive
+//! which yields **177** keys at `2dd0c5a`: [`KEYS`]'s 174 plus [`NOT_MIGRATED`]'s 3 — the sizes of
+//! THOSE tables at THAT commit, not today's: `config::tests::manifest_matches_the_tree` re-runs
+//! that scan, so every `INFR_*` literal added under `crates/*/src` has to join one of the two lists
+//! to pass. (A naive
 //! `grep 'env::var("INFR_'` found only 153 of them — 205 literal call sites — because ~27 reads
 //! went through a helper that took the key name as a `&str`: `budget::env_flag`/`env_mib`/
 //! `overflow_vram_reserve`, `pager::ring_bytes_policy`, `tier::EnvRows::get`, `fusion`'s
@@ -366,6 +369,14 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
         "CLI presentation only, NOT a Config field: it is `infr run --diffusion-visual`, \
          a plain clap flag whose `env =` fallback keeps the old spelling working. The literal that \
          remains in `cli/main.rs` is that clap attribute, not a `std::env::var` read.",
+    ),
+    (
+        "INFR_PARITY_DISCRETE_LEASE",
+        "test harness only: the id of the GPU lock/lease a device test run holds on the discrete \
+         card. Read by `infr-testkit`'s `LEASE_VAR` (`lease_or_skip` refuses to open a Vulkan \
+         device without it, `kv_inline_q4_parity`'s gate refuses that one card with it absent) and \
+         named nowhere else in the tree. The runtime has no read site — no process that owns a \
+         `Config` is deciding whether it may touch a card — so it must not become a Config field.",
     ),
 ];
 

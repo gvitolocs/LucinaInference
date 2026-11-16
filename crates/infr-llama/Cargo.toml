@@ -29,3 +29,5 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 infr-hub.workspace = true
+# The shared GPU lease gate (`lease_or_skip`), for the one lib test that would open a Vulkan device.
+infr-testkit.workspace = true

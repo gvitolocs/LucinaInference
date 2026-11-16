@@ -20,6 +20,13 @@
 //! block's scale fields are; `dequant_block` says what the bytes mean; the device kernels say what
 //! the GPU computes. The harness only makes the three meet.
 //!
+//! ## The GPU lease gate
+//!
+//! It is also the one place that knows the lease contract ([`LEASE_VAR`]): a test that would OPEN a
+//! device at all calls [`lease_or_skip`] before it constructs a backend, and a test that only has
+//! to keep off the DISCRETE card reads the same variable through [`discrete_lease`]. Unleased, both
+//! skip out loud — the card may be serving production traffic.
+//!
 //! ## Shape of a parity test
 //!
 //! ```ignore
@@ -475,10 +482,73 @@ pub fn sweep_linear_on(
     }
 }
 
+// ─── the GPU lease gate ──────────────────────────────────────────────────────────────────────
+
+/// The variable that names the GPU lock/lease a run holds on the discrete card, however that
+/// machine arbitrates it. Its VALUE is the proof of the lease, and it is printed in the log, so a
+/// run on the discrete card can never be mistaken for one on the integrated GPU.
+///
+/// The contract is `kv_inline_q4_parity`'s (its module header, and its `device_gate`): the card may
+/// be serving production traffic, and two users on it at once is how devices are lost.
+pub const LEASE_VAR: &str = "INFR_PARITY_DISCRETE_LEASE";
+
+/// The lease grammar over an explicit value: unset or empty ⇒ no lease. The one reading in the
+/// workspace, so "set to nothing" and "not set at all" cannot mean different things at two call
+/// sites — an ABSENT lease is the only thing that refuses.
+pub fn lease_from(raw: Option<String>) -> Option<String> {
+    let lease = raw.unwrap_or_default();
+    (!lease.is_empty()).then_some(lease)
+}
+
+/// The lease [`LEASE_VAR`] names, through [`lease_from`].
+pub fn discrete_lease() -> Option<String> {
+    lease_from(std::env::var(LEASE_VAR).ok())
+}
+
+/// The gate for a test that would OPEN a device: [`discrete_lease`] must be held, whatever card it
+/// ends up on. Returns the lease to print, after saying so; on `None` it has already printed one
+/// loud skip line naming [`LEASE_VAR`], and the caller returns without touching a driver — a
+/// `VulkanBackend::new()` that has not happened allocates nothing, which is the whole point: the
+/// skip cannot be a silent pass, and it cannot be a card the run was not supposed to touch.
+///
+/// A test that runs on the integrated GPU by design and only needs the DISCRETE card gated keeps
+/// its own device-name refusal instead (`kv_inline_q4_parity::device_gate`, which reads the lease
+/// through [`discrete_lease`] so the grammar stays one definition).
+pub fn lease_or_skip(test: &str) -> Option<String> {
+    let Some(lease) = discrete_lease() else {
+        // print-ok: harness output for the person running the test — a skipped device test must be
+        // loud, not a green line. Every caller of this is a `#[test]`.
+        eprintln!(
+            "SKIP {test}: refusing to open a Vulkan device without a GPU lease — name the lock \
+             this run holds in {LEASE_VAR} (`{LEASE_VAR}=<lease-id> cargo test …`). No device was \
+             touched, so this is NOT a pass."
+        );
+        return None;
+    };
+    // print-ok: harness output for the person running the test — it says which lease was granted
+    // before the test touches a card. Every caller of this is a `#[test]`.
+    println!("{test}: GPU lease {lease:?} taken from {LEASE_VAR}, device work permitted");
+    Some(lease)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use infr_core::decode_spec::block_layout;
+
+    /// The lease grammar, over explicit values so no test has to touch the process environment:
+    /// unset and empty are BOTH "no lease", and every other string IS the lease id — including
+    /// `"0"`, because the value names a lock rather than switching one on.
+    #[test]
+    fn only_a_non_empty_lease_value_grants_the_device() {
+        assert_eq!(lease_from(None), None);
+        assert_eq!(lease_from(Some(String::new())), None);
+        assert_eq!(
+            lease_from(Some("lease-42".into())).as_deref(),
+            Some("lease-42")
+        );
+        assert_eq!(lease_from(Some("0".into())).as_deref(), Some("0"));
+    }
 
     /// The spec-driven builder must produce EXACTLY the byte count the spec claims, for every
     /// weight quant. A wrong `block_bytes` shows up here first.

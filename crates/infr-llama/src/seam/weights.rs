@@ -1,10 +1,11 @@
 //! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
 //! Pure-move split of `seam.rs` — see `super` for the module overview.
+use super::common_prefix_len;
 use super::sc::{DenoiseCache, SelfCondWeights};
-use super::{common_prefix_len, kv_fmt_bytes};
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
+use infr_core::budget::kv_state_copy_spans;
 use infr_core::tensor::{DType, TensorId};
 
 /// FFN weight handles: a dense gated FFN, a qwen3moe routed-expert bank (router + stacked
@@ -775,25 +776,385 @@ impl SeamKv {
             // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
             // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            be.copy_buffer(
+            // The element capacity the kernels index this side by: the same rows x width the buffer
+            // was allocated with (see `fork`), and the base of a planar cache's scale region.
+            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
+            seed_kv_prefix(
+                be,
                 src.kbufs[l].as_ref(),
                 self.kbufs[l].as_ref(),
-                kv_fmt_bytes(self.k_fmt, p * k_row),
+                self.k_fmt,
+                k_row,
+                rows_l * k_row,
+                p,
             )
             .map_err(|e| anyhow!("{e}"))?;
             // `v_row == 0`: this arch caches no V (MLA) and `vbufs[l]` is the placeholder — there
             // is nothing to seed.
             if v_row > 0 {
-                be.copy_buffer(
+                seed_kv_prefix(
+                    be,
                     src.vbufs[l].as_ref(),
                     self.vbufs[l].as_ref(),
-                    kv_fmt_bytes(self.v_fmt, p * v_row),
+                    self.v_fmt,
+                    v_row,
+                    rows_l * v_row,
+                    p,
                 )
                 .map_err(|e| anyhow!("{e}"))?;
             }
         }
         self.cached = src.cached[..p].to_vec();
         Ok(())
+    }
+}
+
+/// Seed `dst`'s first `p` rows from `src`'s — ONE cache side of ONE layer — by copying the byte
+/// spans that actually carry those rows ([`kv_state_copy_spans`]). [`SeamKv::seed_from`] calls this
+/// per side per layer and nothing else does the arithmetic, so this is the whole seed-copy path.
+///
+/// Two separate facts decide the copy, and neither one is "the length of the buffer":
+///
+/// * A state RANGE is data, not an allocation stride: v1.0.0's whole-block arithmetic
+///   (`src/llama-context.cpp:3727-3728`, ported as
+///   [`infr_core::budget::kv_state_range_bytes`]) rather than two
+///   `kv_fmt_bytes` prefixes differenced. `kv_fmt_bytes` 4-aligns q8_0's 34-byte block so an
+///   allocation is never short of a `u32`-addressing kernel, and folding that pad into a LENGTH put
+///   the range 2 bytes mid-block — the same class `e56f006ed` removed upstream, where bytes were
+///   divided by `ggml_element_size` and the resulting block count was read as elements.
+/// * The LAYOUT decides whether that range is one contiguous run at all. llama.cpp's cache is
+///   packed, so upstream copies one region and that is the correct port of its arithmetic. Our
+///   Vulkan Q8_0 cache is PLANAR (`infr-vulkan/shaders/store_q8.comp:58-67`: code byte = element
+///   index in `[0, cap)`, block `b`'s f16 scale at `cap + b*2`), so the same rows live in two
+///   disjoint spans and one offset-0 prefix copy of the packed count moves the seeded codes plus 2
+///   code bytes of the row after them while leaving the seeded rows' scales at their zero fill —
+///   attention then multiplies the seeded prefix by scale 0. The CPU and Metal Q8_0 caches, the
+///   low-bit GGUF-block quants on every backend, Turbo, f16 and f32 are packed: one span, exactly
+///   what v1.0.0 does.
+///
+/// `cap_elems` is this side's element capacity, `rows * row_elems` — the same product the
+/// allocation used, because the planar scale base is the cache's own element count and nothing else.
+/// A `p` past those rows is a caller bug, and it is the backend's extent check that says so (an
+/// `Err`), never a silently short copy.
+pub(crate) fn seed_kv_prefix(
+    be: &dyn Backend,
+    src: &dyn Buffer,
+    dst: &dyn Buffer,
+    fmt: DType,
+    row_elems: usize,
+    cap_elems: usize,
+    p: usize,
+) -> infr_core::error::Result<()> {
+    let planar = be.kv_cache_is_planar(fmt);
+    for (src_off, dst_off, len) in kv_state_copy_spans(fmt, row_elems, cap_elems, 0, p, planar) {
+        // A window at offset 0 on both sides IS the prefix copy every backend already implements
+        // (device-side region on Vulkan, host bounce by default) — take that rather than the
+        // general form, so a packed seed is byte-for-byte the copy it was before planar support.
+        if src_off == 0 && dst_off == 0 {
+            be.copy_buffer(src, dst, len)?;
+        } else {
+            be.copy_buffer_at(src, dst, src_off, dst_off, len)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::seed_kv_prefix;
+    use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
+    use infr_core::budget::{kv_fmt_bytes, kv_state_copy_spans};
+    use infr_core::graph::Graph;
+    use infr_core::tensor::DType;
+
+    /// A cache side of `rows` rows x `row` elements of q8_0, filled with `fill` byte for byte.
+    fn q8_side(be: &dyn Backend, rows: usize, row: usize, fill: u8) -> Box<dyn Buffer> {
+        let alloc = kv_fmt_bytes(DType::Q8_0, rows * row);
+        let buf = be.alloc(alloc, BufferUsage::KvCache).unwrap();
+        be.upload(buf.as_ref(), &vec![fill; alloc]).unwrap();
+        buf
+    }
+
+    fn read(be: &dyn Backend, buf: &dyn Buffer) -> Vec<u8> {
+        let mut v = vec![0u8; buf.len_bytes()];
+        be.download(buf, &mut v).unwrap();
+        v
+    }
+
+    /// The PACKED seed — the copy `SeamKv::seed_from` runs per side per layer on the CPU and Metal
+    /// Q8_0 caches, and every other format everywhere — moves exactly the seeded rows' block-exact
+    /// bytes. 5 rows of three 34-byte q8_0 blocks is 510 bytes of DATA; the buffer's ALLOCATION is
+    /// 4-aligned, and copying that instead rewrote 2 bytes of the first unseeded row.
+    #[test]
+    fn seed_kv_prefix_packed_moves_the_block_exact_rows_and_nothing_else() {
+        let be = infr_cpu::CpuBackend::new();
+        let (rows, row, p) = (8usize, 96usize, 5usize);
+        let cap = rows * row;
+        let src = q8_side(&be, rows, row, 7);
+        let dst = q8_side(&be, rows, row, 0xAA);
+        let want = read(&be, src.as_ref());
+
+        seed_kv_prefix(&be, src.as_ref(), dst.as_ref(), DType::Q8_0, row, cap, p).unwrap();
+        let got = read(&be, dst.as_ref());
+
+        let seeded = p * row / 32 * 34;
+        assert_eq!(
+            seeded, 510,
+            "5 rows of 3 q8_0 blocks: data, not the 512-byte allocation"
+        );
+        assert_eq!(
+            &got[..seeded],
+            &want[..seeded],
+            "the seeded rows arrived byte for byte"
+        );
+        assert!(
+            got[seeded..].iter().all(|&b| b == 0xAA),
+            "row {p} onward is not seeded — the padded length rewrote bytes [{seeded}, {}) of it",
+            seeded + 2
+        );
+        // `p == 0` seeds nothing at all; `p == rows` seeds the whole cache.
+        let none = q8_side(&be, rows, row, 0xAA);
+        seed_kv_prefix(&be, src.as_ref(), none.as_ref(), DType::Q8_0, row, cap, 0).unwrap();
+        assert!(
+            read(&be, none.as_ref()).iter().all(|&b| b == 0xAA),
+            "a 0-row seed is not even a copy"
+        );
+        let all = q8_side(&be, rows, row, 0xAA);
+        seed_kv_prefix(&be, src.as_ref(), all.as_ref(), DType::Q8_0, row, cap, rows).unwrap();
+        assert_eq!(read(&be, all.as_ref()), want);
+    }
+
+    /// A backend that stores q8_0 PLANAR and otherwise IS the CPU backend — i.e. the Vulkan Q8_0
+    /// cache's *span list* on top of the trait's default windowed copy. `seed_kv_prefix` asks the
+    /// backend which layout it is; nothing here guesses from the format.
+    struct PlanarQ8 {
+        inner: infr_cpu::CpuBackend,
+    }
+    impl Backend for PlanarQ8 {
+        fn name(&self) -> &str {
+            "planar-q8-mock"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn Buffer>> {
+            self.inner.alloc(bytes, usage)
+        }
+        fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> infr_core::error::Result<()> {
+            self.inner.upload(dst, src)
+        }
+        fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> infr_core::error::Result<()> {
+            self.inner.download(src, dst)
+        }
+        // `copy_buffer` AND `copy_buffer_at` stay the trait defaults on purpose — exactly what the
+        // CPU and Metal backends run — so this test covers the span list and the default bounce.
+        fn kv_cache_is_planar(&self, dt: DType) -> bool {
+            matches!(dt, DType::Q8_0)
+        }
+        fn compile(&self, _graph: &Graph) -> infr_core::error::Result<Box<dyn Plan>> {
+            unimplemented!("a state copy never compiles a graph")
+        }
+        fn execute(&self, _plan: &dyn Plan, _b: &Bindings) -> infr_core::error::Result<()> {
+            unimplemented!("a state copy never executes")
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The PLANAR seed on the layout `infr-vulkan/shaders/store_q8.comp:58-67` actually writes —
+    /// code of element `e` at byte `e`, scale of block `b` at byte `cap + b*2` — built by hand so
+    /// the two-span rule is testable without a device. One prefix copy of the packed length leaves
+    /// the seeded rows' SCALES at their fill (attention then multiplies the seeded codes by scale 0)
+    /// and rewrites the first 2 code bytes of the row after the prefix. Both are asserted here.
+    #[test]
+    fn seed_kv_prefix_planar_moves_codes_and_scales_to_their_own_regions() {
+        let be = PlanarQ8 {
+            inner: infr_cpu::CpuBackend::new(),
+        };
+        let (rows, row, p) = (128usize, 32usize, 3usize);
+        let cap = rows * row; // 4096 elements: codes [0, 4096), scales [4096, 4096 + 256)
+        let alloc = kv_fmt_bytes(DType::Q8_0, cap);
+        assert_eq!(
+            alloc, 4352,
+            "4096 code bytes + 128 scales x 2, already 4-aligned"
+        );
+
+        let src = be.alloc(alloc, BufferUsage::KvCache).unwrap();
+        let mut fill = vec![0u8; alloc];
+        for e in 0..cap {
+            fill[e] = (e % 251) as u8 + 1;
+        }
+        for b in 0..cap / 32 {
+            fill[cap + b * 2] = (b % 253) as u8 + 1;
+            fill[cap + b * 2 + 1] = 200;
+        }
+        be.upload(src.as_ref(), &fill).unwrap();
+        let dst = be.alloc(alloc, BufferUsage::KvCache).unwrap();
+        be.upload(dst.as_ref(), &vec![0xAAu8; alloc]).unwrap();
+
+        seed_kv_prefix(&be, src.as_ref(), dst.as_ref(), DType::Q8_0, row, cap, p).unwrap();
+        let got = read(&be, dst.as_ref());
+
+        let codes = p * row; // 96 code bytes
+        let scales = codes / 32 * 2; // 3 blocks -> 6 scale bytes
+        assert_eq!(codes + scales, 102, "the two spans sum to the packed range");
+        assert_eq!(&got[..codes], &fill[..codes], "the seeded rows' codes");
+        assert_eq!(
+            &got[cap..cap + scales],
+            &fill[cap..cap + scales],
+            "and their scales, which live at byte `cap` — the bug was never copying these"
+        );
+        assert!(
+            got[codes..cap].iter().all(|&b| b == 0xAA),
+            "codes of the UNSEEDED rows are not the seed's to write; a single packed prefix of {} \
+             bytes wrote {} code bytes of row {p}",
+            codes + scales,
+            scales
+        );
+        assert!(
+            got[cap + scales..].iter().all(|&b| b == 0xAA),
+            "scales of the unseeded blocks are not the seed's to write"
+        );
+
+        // A range that does not start at row 0 needs a SOURCE offset as well; the span list names
+        // it and the windowed copy is the only primitive that can express it.
+        let dst2 = be.alloc(alloc, BufferUsage::KvCache).unwrap();
+        be.upload(dst2.as_ref(), &vec![0xAAu8; alloc]).unwrap();
+        let spans = kv_state_copy_spans(DType::Q8_0, row, cap, 5, 8, true);
+        assert_eq!(
+            spans,
+            vec![(160, 160, 96), (cap + 10, cap + 10, 6)],
+            "rows [5,8): elements 160..256, scales of blocks 5..8"
+        );
+        for (s, d, len) in &spans {
+            assert_ne!(*s, 0, "rows past 0 do not start at byte 0 of either region");
+            be.copy_buffer_at(src.as_ref(), dst2.as_ref(), *s, *d, *len)
+                .unwrap();
+        }
+        let got2 = read(&be, dst2.as_ref());
+        assert_eq!(&got2[160..256], &fill[160..256], "codes of rows [5,8)");
+        assert_eq!(
+            &got2[cap + 10..cap + 16],
+            &fill[cap + 10..cap + 16],
+            "their scales"
+        );
+        assert!(got2[..160].iter().all(|&b| b == 0xAA));
+        assert!(got2[256..cap].iter().all(|&b| b == 0xAA));
+        assert!(got2[cap + 16..].iter().all(|&b| b == 0xAA));
+    }
+
+    /// The PLANAR seed end to end on the real thing: an `infr_vulkan::VulkanBackend` whose Q8_0
+    /// cache was filled by `store_q8` itself, seeded by [`seed_kv_prefix`] — so the layout answer,
+    /// the span list and both copies are the production ones, where the mock above only pins the
+    /// span list on top of the trait's default host-bounce copies. The device's own
+    /// `copy_buffer_at` is what the 10-byte scale span of an odd block count lands on.
+    ///
+    /// `p` runs 5 and 4: an ODD and an EVEN block count below the prefix, so the scale span is 10
+    /// bytes at offset 512 in one pass and 8 in the other.
+    ///
+    /// It does not open a driver without a GPU lease: `INFR_PARITY_DISCRETE_LEASE` must name the
+    /// lock the run holds, checked BEFORE `VulkanBackend::new()` (see [`infr_testkit::lease_or_skip`]
+    /// and `crates/infr-vulkan/tests/kv_inline_q4_parity.rs`, which owns the contract). Without it
+    /// the test prints one skip line naming the variable and returns; with it, the lease goes in the
+    /// log and the run either finds a device or skips loudly.
+    #[test]
+    fn seed_kv_prefix_planar_on_the_vulkan_device_cache() {
+        let Some(lease) =
+            infr_testkit::lease_or_skip("seed_kv_prefix_planar_on_the_vulkan_device_cache")
+        else {
+            return;
+        };
+        let Ok(be) = infr_vulkan::VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        eprintln!("device: {} (under lease {lease})", be.capabilities().name);
+        // One 32-element block per row, 16 rows = 512 elements; the side is 512 code bytes then
+        // 32 scale bytes, already 4-aligned.
+        let (row, rows) = (32usize, 16usize);
+        let cap = rows * row;
+        let alloc = kv_fmt_bytes(DType::Q8_0, cap);
+        // A ramp with varied magnitudes, so every one of the 16 blocks has a non-zero scale.
+        let ramp: Vec<f32> = (0..cap).map(|i| ((i as f32) - 24.0) * 0.05 + 1.0).collect();
+
+        let sbuf = be.alloc(cap * 4, BufferUsage::Activations).unwrap();
+        be.upload(sbuf.as_ref(), bytemuck::cast_slice(&ramp))
+            .unwrap();
+        let src = be.alloc(alloc, BufferUsage::KvCache).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.store_q8(sbuf.as_ref(), src.as_ref(), cap, 0, cap, false, 0);
+        rec.finish().unwrap();
+        let want = read(&be, src.as_ref());
+        assert_eq!(
+            want.len(),
+            alloc,
+            "the side is {alloc} bytes: codes then scales"
+        );
+        assert!(
+            want.iter().any(|&b| b != 0),
+            "skip guard: store_q8 wrote nothing, and every byte of this would pass on zeros"
+        );
+
+        for p in [5usize, 4] {
+            let (codes, scales) = (p * row, p * row / 32 * 2);
+            let dst = be.alloc(alloc, BufferUsage::KvCache).unwrap();
+            // `Backend::alloc`'s calloc contract is what "everything else is untouched" means —
+            // check the fill before the copy rather than assume it.
+            assert!(
+                read(&be, dst.as_ref()).iter().all(|&b| b == 0),
+                "{p} rows: a fresh cache does not start at the zero fill"
+            );
+
+            seed_kv_prefix(&be, src.as_ref(), dst.as_ref(), DType::Q8_0, row, cap, p).unwrap();
+            let got = read(&be, dst.as_ref());
+
+            assert_eq!(&got[..codes], &want[..codes], "{p} rows: seeded codes");
+            assert_eq!(
+                &got[cap..cap + scales],
+                &want[cap..cap + scales],
+                "{p} rows: seeded SCALES [{cap}, {}) — the bytes a packed prefix copy leaves at 0",
+                cap + scales
+            );
+            assert!(
+                got[codes..cap].iter().all(|&b| b == 0),
+                "{p} rows: codes of rows [{p},{rows}) must stay at the zero fill"
+            );
+            assert!(
+                got[cap + scales..].iter().all(|&b| b == 0),
+                "{p} rows: the scales of the unseeded blocks must stay at the zero fill"
+            );
+        }
+        eprintln!("planar Q8 seed moved codes and scales on the device (p=5 and p=4)");
+    }
+
+    /// A prefix longer than the cache is refused by the buffer bounds check — an `Err` on the way
+    /// out of the seed, not a GPU fault, a host panic, or a silently short copy.
+    #[test]
+    fn seed_kv_prefix_refuses_a_prefix_longer_than_the_cache() {
+        let be = infr_cpu::CpuBackend::new();
+        let (rows, row) = (4usize, 64usize);
+        let src = q8_side(&be, rows, row, 3);
+        let dst = q8_side(&be, rows, row, 0xAA);
+        let cap = rows * row;
+        seed_kv_prefix(&be, src.as_ref(), dst.as_ref(), DType::Q8_0, row, cap, rows).unwrap();
+        assert!(
+            seed_kv_prefix(
+                &be,
+                src.as_ref(),
+                dst.as_ref(),
+                DType::Q8_0,
+                row,
+                cap,
+                rows + 1
+            )
+            .is_err(),
+            "5 rows of a 4-row cache is out of bounds for both buffers"
+        );
     }
 }
 

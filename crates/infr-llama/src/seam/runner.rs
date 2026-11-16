@@ -591,9 +591,12 @@ pub(crate) fn generate_dense_backend(
     let kv_align_ok = crate::seam::kv_row_align_ok(c);
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
-    // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
+    // head_dim % 128 (a WHT group is a 128-elem head_dim slice) AND the cached row % 128 — the
+    // range arithmetic (`kv_state_range_bytes`) and the kernels index the ROW, which for MLA is not
+    // a head_dim slice at all. See `crate::seam::kv_turbo_row_align_ok`.
     let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
-        && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
+        && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128))
+        && crate::seam::kv_turbo_row_align_ok(c);
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
     let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
     // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its

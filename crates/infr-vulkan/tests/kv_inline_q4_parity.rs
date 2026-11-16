@@ -1285,20 +1285,23 @@ fn gpu_serial() -> std::sync::MutexGuard<'static, ()> {
 /// the proof of the lease and what shows up in the log, so a run on that card cannot be mistaken for
 /// one on the integrated GPU. It is also the only card whose driver assembles the coopmat pipeline
 /// the prefill test's `nonfa` leg needs (see [`coopmat_assembles`]).
+///
+/// The variable and its non-empty grammar are [`infr_testkit`]'s ([`infr_testkit::discrete_lease`]),
+/// shared with the tests that refuse to open ANY device unleased ([`infr_testkit::lease_or_skip`]);
+/// what is this file's own is WHICH device a run may land on.
 fn device_gate(name: &str) -> Option<String> {
     let discrete = name.contains("7900") || name.contains("NAVI31");
-    let lease = std::env::var("INFR_PARITY_DISCRETE_LEASE").unwrap_or_default();
-    if discrete && lease.is_empty() {
+    let lease = infr_testkit::discrete_lease();
+    if discrete && lease.is_none() {
         eprintln!(
             "skip: refusing discrete GPU ({name}) — run it under a lease and name the lease in \
              INFR_PARITY_DISCRETE_LEASE (see the module header)"
         );
         return None;
     }
-    Some(if discrete {
-        format!("{name} (discrete, under lease {lease})")
-    } else {
-        name.to_string()
+    Some(match lease {
+        Some(lease) if discrete => format!("{name} (discrete, under lease {lease})"),
+        _ => name.to_string(),
     })
 }
 

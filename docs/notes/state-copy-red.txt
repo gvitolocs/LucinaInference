@@ -1,0 +1,86 @@
+# state_copy tests against the pre-fix arithmetic
+
+Headline, before the numbers: the run reports "3 failed", and only TWO of those three are
+the source defect (both name Q8_0 — a 1-row segment of 36 instead of 34 bytes, and the live
+seed prefix (0, 512) instead of (0, 510)). The third failure, on `F16 ... left: 20 right: 18`,
+was a bug in this test's own expectation (`state_copy_subrange_selects_the_bytes_llama_v1_selects`)
+and was fixed in the test; it is not evidence about infr. "What the run showed" below says which
+is which. Do not read "3 failed" as three source failures.
+
+Recorded 2026-11-15 on branch `li/v1-state-copy` at commit `7c5c59c0`, whose
+`crates/infr-llama/tests/state_copy.rs` builds every infr state range as a difference of
+`infr_core::budget::kv_fmt_bytes` — the arithmetic `SeamKv::seed_from` used before the fix.
+Worktree clean (`git status --short` empty) apart from this note.
+
+Command and its real exit code:
+
+```
+$ cargo test -p infr-llama --test state_copy
+RED_EXIT=101
+```
+
+Verbatim output (build lines omitted; the test binary compiled without warnings):
+
+```
+running 6 tests
+test state_copy_block_formats_are_what_makes_bytes_and_elements_differ ... ok
+test state_copy_f32_recurrent_state_ranges_are_the_whole_buffer ... ok
+test state_copy_ranges_tile_a_state_buffer_with_no_gap_or_overlap ... FAILED
+test state_copy_q4_0_the_pin_selects_a_32x_shorter_range_than_v1 ... ok
+test state_copy_subrange_selects_the_bytes_llama_v1_selects ... FAILED
+test state_copy_seed_prefix_copies_exactly_the_seeded_rows ... FAILED
+
+---- state_copy_ranges_tile_a_state_buffer_with_no_gap_or_overlap stdout ----
+thread 'state_copy_ranges_tile_a_state_buffer_with_no_gap_or_overlap' (1196800) panicked at crates/infr-llama/tests/state_copy.rs:245:17:
+assertion `left == right` failed: Q8_0: 1-row segment is 36 bytes
+  left: 36
+ right: 34
+
+---- state_copy_subrange_selects_the_bytes_llama_v1_selects stdout ----
+thread 'state_copy_subrange_selects_the_bytes_llama_v1_selects' (1196806) panicked at crates/infr-llama/tests/state_copy.rs:187:13:
+assertion `left == right` failed: F16: the range does not end on row 6
+  left: 20
+ right: 18
+
+---- state_copy_seed_prefix_copies_exactly_the_seeded_rows stdout ----
+thread 'state_copy_seed_prefix_copies_exactly_the_seeded_rows' (1196805) panicked at crates/infr-llama/tests/state_copy.rs:208:9:
+assertion `left == right` failed: Q8_0 prefix of 5 rows
+  left: (0, 512)
+ right: (0, 510)
+
+failures:
+    state_copy_ranges_tile_a_state_buffer_with_no_gap_or_overlap
+    state_copy_seed_prefix_copies_exactly_the_seeded_rows
+    state_copy_subrange_selects_the_bytes_llama_v1_selects
+
+test result: FAILED. 3 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p infr-llama --test state_copy`
+```
+
+## What the run showed
+
+Two of the three failures are the source defect this slice is about, and both name `Q8_0`:
+
+* `state_copy_ranges_tile_a_state_buffer_with_no_gap_or_overlap` — a 1-row q8_0 segment of a
+  one-block row is 34 data bytes; differenced prefixes call it 36, because `kv_fmt_bytes`
+  rounds a q8_0 buffer up to a `u32` multiple. The segments therefore do not tile: each one
+  overlaps the next by up to 2 bytes, or leaves a 2-byte hole.
+* `state_copy_seed_prefix_copies_exactly_the_seeded_rows` — a 5-row q8_0 prefix is 510 bytes,
+  the sizer difference says 512. This is the live `SeamKv::seed_from` number, passed straight
+  to `Backend::copy_buffer`, so the seeded window runs 2 bytes into the first row that was not
+  seeded.
+
+The third failure was a bug in the test itself, not in infr: `state_copy_subrange_selects_the_bytes_llama_v1_selects`
+asserted that the block found at `off + len - block_bytes` is `first_block_of_row(r1 - 1)`. That
+holds only at one block per row; at 3 blocks per row (`F16`, the first format in the roster) the
+range's last block is the row's THIRD block, so the check compared 20 against 18 and aborted the
+test. It is corrected to the last block of row `r1 - 1` — `(r1 * row_elems / block_elems) - 1` —
+which also lets the format loop reach `Q8_0` and report the pad there instead of stopping at the
+test's own arithmetic.
+
+The three passing tests are the evidence that the pin's bug class is absent, not present:
+`state_copy_q4_0_the_pin_selects_a_32x_shorter_range_than_v1` reproduces llama.cpp's
+`3612199ed` arithmetic (2304 bytes of a q4_0 sub-range re-sized as 128 elements covers 72 bytes)
+and `state_copy_f32_recurrent_state_ranges_are_the_whole_buffer` shows the f32 DeltaNet state the
+MTP checkpoint copies is exact because `ggml_blck_size(f32) == 1`.

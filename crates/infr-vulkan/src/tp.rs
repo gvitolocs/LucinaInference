@@ -759,9 +759,13 @@ impl Backend for TensorParallelBackend {
 
     /// `bytes` is a LOGICAL length (see [`Buffer::len_bytes`]) — the caller names the full-width
     /// tensor, whether it read the count off a buffer (`SeamKv::mtp_snapshot_delta`) or computed it
-    /// from the model config (`SeamKv::seed_from`, `p * n_kv * head_dim` — full, unsharded
-    /// geometry). Only the config-derived case forces the issue: there is no buffer to ask, so the
-    /// sharding MUST happen here. It did not, and every rank was handed a full-width length for a
+    /// from the model config (`SeamKv::seed_from`, whose per-side byte length(s) come from
+    /// `infr_core::budget::kv_state_range_bytes` and, on a planar cache, its
+    /// `kv_state_copy_spans` —
+    /// `p` rows of `row_elems` elements at this format's BYTES PER BLOCK, not
+    /// `p * n_kv * head_dim` elements and not the padded allocation stride).
+    /// Only the config-derived case forces the issue: there is no buffer to ask, so the sharding
+    /// MUST happen here. It did not, and every rank was handed a full-width length for a
     /// `full/W`-sized buffer — a `W`-fold overrun, today an error from `check_extent` rather than
     /// silent corruption of whatever VRAM followed the cache.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
@@ -801,6 +805,61 @@ impl Backend for TensorParallelBackend {
             b.copy_buffer(s.on(i)?, d.on(i)?, per_rank)?;
         }
         Ok(())
+    }
+
+    /// The windowed form of [`copy_buffer`] — every rank copies the SAME window of its own shard.
+    ///
+    /// A window's OFFSETS divide by the world exactly like its length does: byte `N` of the logical
+    /// cache is byte `N/W` of this rank's copy, because the head split takes 1/W of every row and
+    /// `prepare` lowers the KV decl's `numel` to `numel/W` so the per-rank planar scale base really
+    /// is `cap/W` (see [`shard_kv_bytes`]). That is what lets the seam name spans in LOGICAL bytes —
+    /// a planar Q8_0 seed's scale span starts at the logical `cap` — and have them land on each
+    /// rank's own regions. A span that does not divide is an error, never a truncation, for the same
+    /// reason a non-divisible length is.
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_off: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_tp(src)?, as_tp(dst)?);
+        if s.bufs.len() != d.bufs.len() {
+            return Err(be("tp: copy_buffer_at between mismatched TpBuffers"));
+        }
+        if s.kind != d.kind {
+            return Err(be(format!(
+                "tp: copy_buffer_at between TpBuffers of different kinds ({:?} → {:?}) — a copy \
+                 across shard layouts is not a per-rank copy",
+                s.kind, d.kind
+            )));
+        }
+        let (s_off, d_off, per_rank) = match s.kind {
+            TpKind::Replica => (src_off, dst_off, bytes),
+            TpKind::Kv => (
+                self.shard_bytes(src_off)?,
+                self.shard_bytes(dst_off)?,
+                self.shard_bytes(bytes)?,
+            ),
+            TpKind::Weight(role) => {
+                return Err(be(format!(
+                    "tp: copy_buffer_at of a {role:?}-parallel weight shard is not supported — the \
+                     per-rank byte range of a window depends on the weight's device role, so there \
+                     is no single correct divisor; weights are filled by the binder"
+                )))
+            }
+        };
+        for (i, b) in self.ranks.iter().enumerate() {
+            b.copy_buffer_at(s.on(i)?, d.on(i)?, s_off, d_off, per_rank)?;
+        }
+        Ok(())
+    }
+
+    /// Planarity is a property of the DEVICE cache, not of this wrapper: the ranks underneath are
+    /// Vulkan, so a Q8_0 cache reached through TP is still planar and its seed still needs spans.
+    fn kv_cache_is_planar(&self, dt: infr_core::DType) -> bool {
+        self.ranks[0].kv_cache_is_planar(dt)
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {

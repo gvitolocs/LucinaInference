@@ -1130,10 +1130,32 @@ pub(crate) fn kv_side_bytes(fmt: DType, elems: usize) -> usize {
 /// blocks. Pure geometry: it says the format *fits* the rows, not that this model may use it (see
 /// [`kv_q8_layout_ok`], which adds the MLA exclusion).
 pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
+    kv_row_align_ok_blocks(cfg, 32)
+}
+
+/// Every layer's cached KV row is a whole number of `blk`-element blocks, on BOTH sides.
+fn kv_row_align_ok_blocks(cfg: &Config, blk: usize) -> bool {
     (0..cfg.n_layer).all(|l| {
         let (k, v) = kv_row_elems(cfg, l);
-        k.is_multiple_of(32) && v.is_multiple_of(32)
+        k.is_multiple_of(blk) && v.is_multiple_of(blk)
     })
+}
+
+/// The TurboQuant (turbo2/3/4) version of [`kv_row_align_ok`]: a Turbo block is 128 elements, so a
+/// Turbo cache needs the CACHED ROW — not just `head_dim` — to be whole 128-elem blocks on both
+/// sides.
+///
+/// The two are the same number only where a row holds exactly one head's slice. They are not for
+/// MLA, whose K row is `kv_lora_rank + qk_rope_dim` = 576 on V2-Lite (`config.rs:288`): 18 whole
+/// 32-element blocks, `576 % 128 == 64`. Admitting that config through the gate only moves the
+/// failure somewhere else, because a row that splits a block cannot be range-copied at all —
+/// `infr_core::budget::kv_state_range_bytes` asserts on it the way upstream's `GGML_ASSERT` does —
+/// and the CPU MLA arm does not force f16 the way the GPU arms do ([`mla_kv_fmt`]), so a
+/// `turbo*` request on CPU deepseek2 used to reach [`SeamKv::seed_from`] and panic there.
+///
+/// [`SeamKv::seed_from`]: crate::seam::weights::SeamKv::seed_from
+pub(crate) fn kv_turbo_row_align_ok(cfg: &Config) -> bool {
+    kv_row_align_ok_blocks(cfg, 128)
 }
 
 /// Whether a Q8_0 KV cache may be CHOSEN for this model: the rows are 32-block aligned
@@ -4859,5 +4881,56 @@ mod seam_helper_tests {
                 "B must NOT inherit A's chunk"
             );
         }
+    }
+
+    /// The TurboQuant row gate is on the CACHED ROW, not on `head_dim`, and for MLA they are not the
+    /// same number: V2-Lite caches one compressed row of `kv_lora_rank + qk_rope_dim` = 576, which
+    /// is 18 whole 32-element blocks (`kv_row_align_ok` admits q8) and NOT a whole number of the
+    /// 128-element Turbo blocks. `kv_state_range_bytes` asserts on a row that splits a block — as
+    /// upstream's `GGML_ASSERT` does — and the CPU MLA arm does not force f16 (`mla_kv_fmt` returns
+    /// early on `backend == "cpu"`), so a `turbo*` request on CPU deepseek2 used to pass the gate
+    /// and panic inside `seed_from`.
+    #[test]
+    fn turbo_row_gate_refuses_a_cache_row_that_splits_a_128_block() {
+        let turbo_block = 128;
+        // An ordinary GQA row: 4 kv heads x 128 = 512 elements = 4 whole Turbo blocks.
+        let gqa = crate::Config {
+            n_layer: 2,
+            n_kv: 4,
+            head_dim: 128,
+            ..Default::default()
+        };
+        assert_eq!(super::kv_row_elems(&gqa, 0), (512, 512));
+        assert!(super::kv_row_align_ok(&gqa), "512 is 16 whole 32-blocks");
+        assert!(
+            super::kv_turbo_row_align_ok(&gqa),
+            "and 4 whole Turbo blocks"
+        );
+
+        // MLA: the K row is the compressed KV, the V side is the placeholder (`kv_row_elems` says 0).
+        let mla = crate::Config {
+            n_layer: 4,
+            deepseek2: true,
+            kv_lora_rank: 512,
+            qk_rope_dim: 64,
+            ..Default::default()
+        };
+        assert_eq!(super::kv_row_elems(&mla, 0), (576, 0), "576 on V2-Lite");
+        assert!(super::kv_row_align_ok(&mla), "q8 fits 576 exactly");
+        assert!(
+            !super::kv_turbo_row_align_ok(&mla),
+            "576 % {turbo_block} == 64: a Turbo cache would split every block, so the gate must \
+             refuse it instead of letting the seed assert"
+        );
+
+        // A row that is not even 32-aligned fails both gates, so no format is chosen for it.
+        let odd = crate::Config {
+            n_layer: 1,
+            n_kv: 1,
+            head_dim: 80,
+            ..Default::default()
+        };
+        assert_eq!(super::kv_row_elems(&odd, 0), (80, 80), "80 % 32 == 16");
+        assert!(!super::kv_row_align_ok(&odd) && !super::kv_turbo_row_align_ok(&odd));
     }
 }

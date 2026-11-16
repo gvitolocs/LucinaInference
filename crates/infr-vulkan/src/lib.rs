@@ -4359,6 +4359,46 @@ impl Backend for VulkanBackend {
         })
     }
 
+    /// The region form of [`copy_buffer`]: one `vkCmdCopyBuffer` region at each side's caller-named
+    /// byte offset, plus that side's `sub_offset` exactly as `copy_buffer` folds it in. This is what
+    /// makes seeding a PLANAR Q8_0 cache possible — see
+    /// [`infr_core::backend::Backend::copy_buffer_at`] for why a prefix copy cannot do it, and
+    /// [`infr_core::budget::kv_state_copy_spans`] for where the two spans come from.
+    /// Bounds-checked with the same shared helper the host-bounce default uses, so the two
+    /// implementations cannot disagree about what "in bounds" means.
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_off: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+        infr_core::backend::check_copy_range(src_off, dst_off, bytes, s.size, d.size)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (sb, db) = (s.buffer, d.buffer);
+        let (so, do_) = (s.sub_offset + src_off, d.sub_offset + dst_off);
+        self.one_shot(move |cmd| unsafe {
+            let region = vk::BufferCopy {
+                src_offset: so as u64,
+                dst_offset: do_ as u64,
+                size: bytes as u64,
+            };
+            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
+        })
+    }
+
+    /// The Vulkan Q8_0 KV cache is PLANAR: `shaders/store_q8.comp:58-67` writes element `e`'s code
+    /// at byte `e` of a `[0, cap)` region and block `b`'s f16 scale at byte `cap + b*2`. No other
+    /// format here is — the low-bit quants (`quant_kv.comp`) and Turbo (`quant_turbo.comp:39`)
+    /// write one self-describing block per block of elements, and f16/f32 have no second region.
+    fn kv_cache_is_planar(&self, dt: infr_core::DType) -> bool {
+        matches!(dt, infr_core::DType::Q8_0)
+    }
+
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {

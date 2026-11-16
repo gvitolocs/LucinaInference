@@ -592,6 +592,43 @@ impl Backend for PipelineBackend {
         }
     }
 
+    /// The windowed form of [`copy_buffer`], same device-sharing rules: the window is a plain
+    /// `vkCmdCopyBuffer` region pair on the one device that owns both buffers, or the identical
+    /// window on every device of a replicated set.
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_off: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_pipe(src)?, as_pipe(dst)?);
+        match (s.single_device(), d.single_device()) {
+            (Some(sd), Some(dd)) if sd == dd => self.backends[sd].copy_buffer_at(
+                s.bufs[0].as_ref(),
+                d.bufs[0].as_ref(),
+                src_off,
+                dst_off,
+                bytes,
+            ),
+            (None, None) => {
+                for (i, b) in self.backends.iter().enumerate() {
+                    b.copy_buffer_at(s.on(i)?, d.on(i)?, src_off, dst_off, bytes)?;
+                }
+                Ok(())
+            }
+            _ => Err(be(
+                "pipeline: copy_buffer_at across devices is not supported (cross-device KV copy)",
+            )),
+        }
+    }
+
+    /// Planarity belongs to the device cache underneath, not to this wrapper (see the TP twin).
+    fn kv_cache_is_planar(&self, dt: infr_core::DType) -> bool {
+        self.backends[0].kv_cache_is_planar(dt)
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         Ok(Box::new(PipelinePlan {
             graph: graph.clone(),

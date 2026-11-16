@@ -443,6 +443,32 @@ impl Backend for ExpertParallelBackend {
         Ok(())
     }
 
+    /// The windowed form of [`copy_buffer`]: every rank holds a REPLICATED KV cache under EP (only
+    /// the experts are split), so every rank is given the identical window — no divisor, exactly as
+    /// the length-less-of-`W` prefix copy above.
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_off: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_ep(src)?, as_ep(dst)?);
+        if s.bufs.len() != d.bufs.len() {
+            return Err(be("ep: copy_buffer_at between mismatched EpBuffers"));
+        }
+        for (i, b) in self.ranks.iter().enumerate() {
+            b.copy_buffer_at(s.on(i)?, d.on(i)?, src_off, dst_off, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Planarity belongs to the device cache underneath, not to this wrapper (see the TP twin).
+    fn kv_cache_is_planar(&self, dt: infr_core::DType) -> bool {
+        self.ranks[0].kv_cache_is_planar(dt)
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         Ok(Box::new(EpPlan {
             graph: graph.clone(),

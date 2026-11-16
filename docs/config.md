@@ -323,7 +323,7 @@ and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`
 
 ## The `INFR_*` keys that are deliberately NOT config
 
-Four keys keep reading the environment directly, for reasons a runtime `Config`
+Five keys keep reading the environment directly, for reasons a runtime `Config`
 cannot fix:
 
 | Key                        | Why                                                                                                                                         |
@@ -332,6 +332,7 @@ cannot fix:
 | `INFR_TEST_GGUF`           | Test fixture: points `infr-gguf`'s tests at a `.gguf` on disk.                                                                              |
 | `INFR_TEST_MODEL`          | Test fixture: overrides the HF-cache lookup for the model-backed tests.                                                                     |
 | `INFR_LLAMA_DIFFUSION_CLI` | Dev fixture: points `infr compare` at a `llama-diffusion-cli` binary on disk.                                                               |
+| `INFR_PARITY_DISCRETE_LEASE` | Test harness: the id of the GPU lock/lease a device-test run holds on the discrete card. Read only by `infr-testkit` (`LEASE_VAR`) and the Vulkan parity test's device gate. |
 
 Two related notes. `INFR_DIFFUSION_VISUAL` is also not a `Config` field — since
 it only steers CLI presentation it became the plain flag

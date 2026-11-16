@@ -29,6 +29,37 @@ pub fn check_copy_bytes(bytes: usize, src_len: usize) -> Result<()> {
     Ok(())
 }
 
+/// Bounds-check a [`Backend::copy_buffer_at`] window: `src[src_off .. src_off + bytes)` must fit in
+/// the source and `dst[dst_off .. dst_off + bytes)` must fit in the destination. Same discipline as
+/// [`check_copy_bytes`] — a `Backend` error, never a downstream slice panic — with the overflow in
+/// `off + bytes` caught rather than wrapped. Pure and public so the check is unit-testable without
+/// a backend.
+pub fn check_copy_range(
+    src_off: usize,
+    dst_off: usize,
+    bytes: usize,
+    src_len: usize,
+    dst_len: usize,
+) -> Result<()> {
+    for (what, off, len, end) in [
+        ("source", src_off, src_len, src_off.checked_add(bytes)),
+        ("destination", dst_off, dst_len, dst_off.checked_add(bytes)),
+    ] {
+        let Some(end) = end else {
+            return Err(Error::backend(format!(
+                "copy_buffer_at: {what} window at offset {off} of {bytes} bytes overflows the \
+                 address space ({what} buffer is {len} bytes)"
+            )));
+        };
+        if end > len {
+            return Err(Error::backend(format!(
+                "copy_buffer_at: {what} window [{off}, {end}) exceeds {what} buffer of {len} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The 16x16x16 (M,N,K) cooperative-matrix tile every production coopmat shader is built for
 /// (RADV/RDNA3+, NVIDIA — every `coopmat<...,16,16,...>` declaration across
 /// gemm_warp/native_gemm*/attn_*/deltanet_prep).
@@ -556,6 +587,50 @@ pub trait Backend: Send + Sync {
         self.download(src, &mut tmp)?;
         self.upload(dst, &tmp)
     }
+    /// Copy `bytes` from `src[src_off..]` into `dst[dst_off..]`. [`copy_buffer`] is the
+    /// `src_off == dst_off == 0` case.
+    ///
+    /// A state cache whose layout is PLANAR — codes in one region, scales in another (the Vulkan
+    /// Q8_0 KV cache; see [`crate::budget::kv_state_copy_spans`]) — does not keep a row range in one
+    /// contiguous span, so seeding a shared prefix from a single offset-0 copy leaves the seeded
+    /// rows' scales untouched. That is not a length problem to be clever about at the caller: it
+    /// needs a copy that can NAME an offset in each buffer.
+    ///
+    /// Default is a host bounce, built from the prefix-only `download`/`upload` every backend has:
+    /// read the source window, read the destination up to the END of the window so the bytes before
+    /// and around it are preserved, splice, write the destination prefix back. Correct everywhere;
+    /// note it touches `dst_off + bytes` bytes of `dst`, so an offset near the end of a large cache
+    /// is a large bounce — backends with a real region copy override it.
+    /// Errors (rather than panics) when the window leaves either buffer.
+    fn copy_buffer_at(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        src_off: usize,
+        dst_off: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        check_copy_range(src_off, dst_off, bytes, src.len_bytes(), dst.len_bytes())?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let (s_end, d_end) = (src_off + bytes, dst_off + bytes);
+        let mut s = vec![0u8; s_end];
+        self.download(src, &mut s)?;
+        let mut d = vec![0u8; d_end];
+        self.download(dst, &mut d)?;
+        d[dst_off..d_end].copy_from_slice(&s[src_off..s_end]);
+        self.upload(dst, &d)
+    }
+    /// Whether this backend stores a KV/state cache of `dt` with a row's data split over disjoint
+    /// regions (planar) instead of one self-describing block per block of elements (packed). The
+    /// answer selects how many spans a state copy has to move — see
+    /// [`crate::budget::kv_state_copy_spans`]. `false` is correct for every backend except the
+    /// Vulkan Q8_0 cache, and every wrapper backend MUST forward this to the backend that really
+    /// owns the buffer (a Vulkan cache reached through tensor-parallel is still planar).
+    fn kv_cache_is_planar(&self, _dt: crate::tensor::DType) -> bool {
+        false
+    }
 
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;
@@ -855,6 +930,76 @@ mod tests {
         let out = dst.0.lock().unwrap();
         assert_eq!(&out[..8], &[0, 1, 2, 3, 4, 5, 6, 7]); // prefix copied
         assert!(out[8..].iter().all(|&b| b == 0xAA)); // tail untouched
+    }
+
+    /// The default `copy_buffer_at` is the primitive a PLANAR cache seed needs: it must move only
+    /// the window, and leave every byte of `dst` outside the window exactly as it found them.
+    #[test]
+    fn copy_buffer_at_default_moves_only_the_named_window() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new((0u8..64).collect()));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 64]));
+
+        // src[40..48) -> dst[10..18): a planar scale span looks exactly like this.
+        be.copy_buffer_at(&src, &dst, 40, 10, 8).unwrap();
+        let out = dst.0.lock().unwrap();
+        assert!(
+            out[..10].iter().all(|&b| b == 0xAA),
+            "bytes before the window are not the window"
+        );
+        assert_eq!(&out[10..18], &[40, 41, 42, 43, 44, 45, 46, 47]);
+        assert!(
+            out[18..].iter().all(|&b| b == 0xAA),
+            "bytes after the window survived the bounce"
+        );
+        // Both-offsets-zero is `copy_buffer`: the window and the prefix agree byte for byte.
+        let dst2 = MockBuffer(std::sync::Mutex::new(vec![0xAAu8; 64]));
+        be.copy_buffer_at(&src, &dst2, 0, 0, 8).unwrap();
+        assert_eq!(&dst2.0.lock().unwrap()[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn copy_buffer_at_default_errors_when_the_window_leaves_a_buffer() {
+        let be = MockBackend {
+            last_download_len: std::sync::Mutex::new(0),
+        };
+        let src = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        let dst = MockBuffer(std::sync::Mutex::new(vec![0u8; 16]));
+        // Fits the source, overruns the destination: the DESTINATION bound is the one that must fire.
+        assert!(be.copy_buffer_at(&src, &dst, 0, 12, 8).is_err());
+        assert_eq!(
+            *be.last_download_len.lock().unwrap(),
+            0,
+            "nothing crossed the bus"
+        );
+        assert!(be.copy_buffer_at(&src, &dst, 12, 0, 8).is_err());
+        assert!(be.copy_buffer_at(&src, &dst, 0, 0, usize::MAX).is_err());
+        // A zero-length window at the very end is in bounds and copies nothing.
+        assert!(be.copy_buffer_at(&src, &dst, 16, 16, 0).is_ok());
+    }
+
+    /// The pure window check: each side is policed separately, and `off + bytes` overflow is an
+    /// error rather than a wrapped small window.
+    #[test]
+    fn check_copy_range_polices_both_sides() {
+        assert!(check_copy_range(0, 0, 8, 16, 16).is_ok());
+        assert!(check_copy_range(8, 8, 8, 16, 16).is_ok()); // exactly to the end on both
+        assert!(
+            check_copy_range(9, 0, 8, 16, 16).is_err(),
+            "source window past the end"
+        );
+        assert!(
+            check_copy_range(0, 9, 8, 16, 16).is_err(),
+            "destination window past the end"
+        );
+        assert!(check_copy_range(0, 0, 17, 16, 64).is_err());
+        assert!(
+            check_copy_range(usize::MAX, 0, 1, 16, 16).is_err(),
+            "offset overflow"
+        );
+        assert!(check_copy_range(0, 0, 0, 0, 0).is_ok());
     }
 
     #[test]
