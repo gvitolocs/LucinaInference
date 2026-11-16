@@ -355,6 +355,72 @@ pub(super) struct DecodeHandles {
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
+/// v1.0.0 port (`61ad80bf9`, #30580, `tools/server/server-context.cpp:4219`) of the SWA reuse
+/// threshold — the per-window-layer half of the rewind guard in `generate_dense_backend`'s `start`
+/// computation, kept separate so the bound is testable without a backend.
+///
+/// llama.cpp decided a saved state was reusable with `pos_min < pos_min_thold`,
+/// `pos_min_thold = max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1))`, which asked for two cells
+/// more than the window needs: the first evaluated token attends positions `> pos_eval - n_swa`,
+/// i.e. down to `pos_eval - (n_swa - 1)` inclusive, so a state whose lowest live position sits
+/// EXACTLY there already holds the whole window. Upstream now uses
+/// `pos_min_thold = max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval)`. In our units the same
+/// bound reads `live_from <= start - (window - 1)`: `start` is `pos_eval` (the first position the
+/// rewind re-evaluates), `live_from = cached_len - rows_l` is `pos_min` (what a ring layer still
+/// holds), and the `max(0, …)` clamp plus llama.cpp's `|| pos_min == 0` escape are what
+/// `saturating_sub` gives when the cache never wrapped. We were one position stricter than the fixed
+/// bound — `window` instead of `window - 1` — so a rewind landing exactly on the ring's retained
+/// tail lost its reuse and paid a full re-prefill: upstream's symptom, one cell shorter.
+/// `window - 1` is also the number `kv_rows`'s own sizing argument uses for the oldest position a
+/// forward reaches (`seam::kv_rows`: "the oldest position any query's window reaches is
+/// `p0 + 1 - window`") and the one the denoise mask uses for its `lo` (`AttnMask::Canvas`).
+///
+/// `window == 0` is v1.0.0's OTHER arm, not a zero-width window: `n_swa == 0` sets
+/// `pos_min_thold = pos_eval` itself — "a state without SWA must end before pos_eval"
+/// (`server-context.cpp:4214-4219`) — so the comparison is STRICT where the windowed arm is
+/// inclusive. This call site cannot reach it (`Config::is_swa_layer` requires `swa_window > 0`, so
+/// no layer of a zero-window model is even visited), and mirroring both arms is what keeps the
+/// helper honest if another caller ever asks.
+fn swa_reuse_thold_ok(cached_len: usize, rows_l: usize, window: usize, start: usize) -> bool {
+    let live_from = cached_len.saturating_sub(rows_l);
+    if window == 0 {
+        return live_from == 0 || live_from < start;
+    }
+    start.saturating_sub(window - 1) >= live_from
+}
+
+/// The whole SWA ring rewind guard of `generate_dense_backend`'s `start` computation — the decision
+/// itself, so the tests run the code that makes it rather than only the bound inside it
+/// ([`swa_reuse_thold_ok`]).
+///
+/// A ring layer RETAINS only its last `rows_l` positions, so a rewind to `start` is usable only if
+/// EVERY window layer still holds what its first evaluated token attends. `start` unchanged when it
+/// is (or when the guard does not apply: no ring, no rewind at all, an extending turn); `0` — a full
+/// re-prefill — when any of them does not.
+fn swa_rewind_start(
+    c: &Config,
+    ec: &EngineConfig,
+    kv_ring: bool,
+    cached_len: usize,
+    max_ctx: usize,
+    start: usize,
+) -> usize {
+    let guard = kv_ring && start > 0 && start < cached_len;
+    if !guard {
+        return start;
+    }
+    let safe = (0..c.n_layer)
+        .filter(|&l| c.is_swa_layer(l))
+        .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
+        .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
+        .all(|rows_l| swa_reuse_thold_ok(cached_len, rows_l, c.swa_window, start));
+    if safe {
+        start
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_backend(
@@ -1270,7 +1336,7 @@ pub(crate) fn generate_dense_backend(
         sc_ping,
         sc_ping_write,
         sc_temp_inv_buf,
-        mtp_delta_ckpt: _,
+        mtp_delta_ckpt,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
@@ -1322,6 +1388,16 @@ pub(crate) fn generate_dense_backend(
         cached.len()
     } else if c.qwen35 {
         let pfx = common_prefix_len(cached, prompt);
+        // v1.0.0 `ab3768cdc` (#31368) `src/llama-memory-recurrent.cpp:676` port: the pass that moves
+        // the recurrent state is the one that records what the retained MTP snapshot guarantees, so
+        // `mtp_restore_delta` can refuse a rewind past it (see `MtpDeltaCkpt::rs_max`). `pfx` is how
+        // much of the live token prefix this forward preserves — the whole of it when the prompt only
+        // extends the cache, only `pfx` of it when the state is zeroed and re-prefilled — and
+        // `prompt.len()` is the length the pass leaves `cached` at (the MTP trunk calls are all
+        // `max_new == 0`; a generating call under-records, which costs a refusal, never a stale read).
+        if let Some(ck) = mtp_delta_ckpt.as_mut() {
+            ck.note_forward(prompt.len(), pfx);
+        }
         if pfx == cached.len() && pfx < prompt.len() {
             pfx
         } else {
@@ -1358,28 +1434,13 @@ pub(crate) fn generate_dense_backend(
     };
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
     // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
-    // from `start` attends positions `[start - window, start)` on window layers, so a rewind
-    // deeper than the ring's retained tail would read recycled rows; fall back to a full
-    // re-prefill (start = 0 — correctness over reuse; the full cache never hits this). Extending
-    // turns (start == cached.len()) and the ≤1-token `.min(prompt.len()-1)` rewind stay safe:
-    // rows_l - window >= ubatch >= 1.
-    let start = if kv_ring && start > 0 && start < cached.len() {
-        let safe = (0..c.n_layer)
-            .filter(|&l| c.is_swa_layer(l))
-            .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
-            .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
-            .all(|rows_l| {
-                let live_from = cached.len().saturating_sub(rows_l);
-                start.saturating_sub(c.swa_window) >= live_from
-            });
-        if safe {
-            start
-        } else {
-            0
-        }
-    } else {
-        start
-    };
+    // from `start` attends down to `start - (window - 1)` on window layers, so a rewind deeper than
+    // the ring's retained tail would read recycled rows; fall back to a full re-prefill (start = 0
+    // — correctness over reuse; the full cache never hits this). Extending turns
+    // (start == cached.len()) and the ≤1-token `.min(prompt.len()-1)` rewind stay safe:
+    // rows_l - window >= ubatch >= 1. The decision and its v1.0.0 `61ad80bf9` bound live in
+    // [`swa_rewind_start`] / [`swa_reuse_thold_ok`].
+    let start = swa_rewind_start(c, ec, kv_ring, cached.len(), max_ctx, start);
     cached.truncate(start);
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
@@ -6049,7 +6110,8 @@ pub(crate) fn generate_dense_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::{resident_after_gen, validate_token_ids};
+    use super::{resident_after_gen, swa_reuse_thold_ok, swa_rewind_start, validate_token_ids};
+    use crate::{Config, EngineConfig};
 
     // ── resident_after_gen: which tokens' KV rows are recorded as materialized ────────────────
     //
@@ -6133,5 +6195,196 @@ mod tests {
     #[test]
     fn validate_token_ids_rejects_far_out_of_vocab() {
         assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+    }
+
+    // ── swa_reuse_thold_ok: the v1.0.0 `61ad80bf9` (#30580) reuse threshold ────────────────────
+    //
+    // Geometry for the whole group: an SWA window of 64 on a ring layer of 128 rows with 1000
+    // tokens materialized — the layer still holds positions 872..=999 (`live_from`), and a rewind
+    // to `start` re-evaluates a first token that attends down to `start - (window - 1)` = `start
+    // - 63`. The bound is EXACTLY satisfied at start = 935 (872 is still live); that is the value
+    // the pre-port `start - window` form refused, and the one upstream's off-by-two fix accepts.
+
+    const WIN: usize = 64;
+    const ROWS: usize = 128;
+    const LEN: usize = 1000;
+    /// The retained tail of the geometry above: `LEN - ROWS`.
+    const LIVE_FROM: usize = LEN - ROWS;
+
+    /// The group's fixed geometry at one rewind depth.
+    fn thold(start: usize) -> bool {
+        swa_reuse_thold_ok(LEN, ROWS, WIN, start)
+    }
+
+    /// llama.cpp v1.0.0's own test, transcribed: accept a saved state iff
+    /// `cur.pos_min < pos_min_thold || cur.pos_min == 0` with
+    /// `pos_min_thold = max(0, n_swa > 0 ? pos_eval - n_swa + 2 : pos_eval)`
+    /// (`tools/server/server-context.cpp:4219` and the restore predicate at `:4276-4285`). The
+    /// `pos_min == 0` escape is the case our saturating form covers by construction: a cache that
+    /// never wrapped really does hold position 0.
+    fn upstream_reuse_ok(pos_eval: i64, n_swa: i64, pos_min: i64) -> bool {
+        let thold = (if n_swa > 0 {
+            pos_eval - n_swa + 2
+        } else {
+            pos_eval
+        })
+        .max(0);
+        pos_min == 0 || pos_min < thold
+    }
+
+    #[test]
+    fn reuse_thold_swa_accepts_rewind_at_the_retained_tail() {
+        // 935 - 63 = 872 = LIVE_FROM: the deepest rewind the retained ring still backs.
+        assert!(thold(935));
+        // Shallow rewinds keep the whole window with room to spare.
+        assert!(thold(936));
+        assert!(thold(999));
+    }
+
+    #[test]
+    fn reuse_thold_swa_refuses_one_position_past_the_tail() {
+        // 934 - 63 = 871, and row 871 was recycled by position 999 — a full re-prefill instead.
+        assert!(!thold(934));
+        assert!(!thold(800));
+    }
+
+    #[test]
+    fn reuse_thold_swa_matches_upstreams_fixed_threshold() {
+        // Pin the port against the original over every rewind depth around the boundary, and pin
+        // the fix itself: the pre-port bound (`window` instead of `window - 1`) was stricter than
+        // upstream by exactly one position, at 935 for this geometry.
+        let mut fixed_by_port = 0;
+        for start in 850..1000i64 {
+            let ours = thold(start as usize);
+            let theirs = upstream_reuse_ok(start, WIN as i64, LIVE_FROM as i64);
+            assert_eq!(ours, theirs, "v1.0.0 disagrees at start {start}");
+            if ours != (start - WIN as i64 >= LIVE_FROM as i64) {
+                fixed_by_port += 1;
+            }
+        }
+        assert_eq!(fixed_by_port, 1, "the port must newly accept exactly 935");
+    }
+
+    #[test]
+    fn reuse_thold_swa_window_of_one_is_position_exact() {
+        // A window of 1 attends only its own position, so the retained tail is never in scope:
+        // any start at or above LIVE_FROM is live, anything below it was recycled.
+        assert!(swa_reuse_thold_ok(LEN, ROWS, 1, LIVE_FROM));
+        assert!(swa_reuse_thold_ok(LEN, ROWS, 1, 999));
+        assert!(!swa_reuse_thold_ok(LEN, ROWS, 1, LIVE_FROM - 1));
+    }
+
+    #[test]
+    fn reuse_thold_swa_never_wrapping_layer_always_accepts() {
+        // rows_l >= cached_len: nothing was recycled, live_from saturates to 0 and llama.cpp's
+        // `pos_min == 0` case holds.
+        assert!(swa_reuse_thold_ok(LEN, LEN, WIN, 0));
+        assert!(swa_reuse_thold_ok(LEN, 4096, WIN, 17));
+    }
+
+    #[test]
+    fn reuse_thold_zero_window_is_upstreams_other_arm() {
+        // v1.0.0 `61ad80bf9` keeps `n_swa == 0` as a SEPARATE branch of the threshold expression
+        // (`server-context.cpp:4219`): without a window to cover, the state must simply END before
+        // the first evaluated token — STRICTLY, where the windowed arm is inclusive one cell deeper.
+        // Treating zero as just another `window - 1` subtraction accepted `live_from == start`
+        // (a state that retains nothing below the rewind point), which upstream never does.
+        for start in 850..1000i64 {
+            assert_eq!(
+                swa_reuse_thold_ok(LEN, ROWS, 0, start as usize),
+                upstream_reuse_ok(start, 0, LIVE_FROM as i64),
+                "v1.0.0's `n_swa == 0` arm disagrees at start {start}"
+            );
+        }
+        assert!(!swa_reuse_thold_ok(LEN, ROWS, 0, LIVE_FROM)); // strict: ends BELOW pos_eval
+        assert!(swa_reuse_thold_ok(LEN, ROWS, 0, LIVE_FROM + 1));
+    }
+
+    // ── swa_rewind_start: the decision the runner's `start` actually passes through ─────────────
+    //
+    // The bound above is only half the fix: the pre-port expression lived INLINE in
+    // `generate_dense_backend`, so a call-site that kept calling the helper with the old arithmetic
+    // (or dropped the `window - 1` again) passed every predicate test. These run the guard the way
+    // the runner runs it — over a real `Config`, a real `kv_rows` ring size, and the real
+    // layer/filter chain — on the same geometry: 4 layers, SWA on the odd ones (`swa_pattern = 2`),
+    // a 64-token window, a 64-row prefill chunk ⇒ a ring of `round64(64 + 64) = 128` rows on a
+    // 1024-token context, so `live_from = 1000 - 128 = 872` exactly as above.
+
+    const MAX_CTX: usize = 1024;
+
+    fn ring_cfg() -> Config {
+        Config {
+            n_layer: 4,
+            swa_window: WIN,
+            swa_pattern: 2,
+            ..Default::default()
+        }
+    }
+
+    /// The prefill chunk height PINNED, so the ring size — and with it the boundary these tests
+    /// assert — never depends on the ambient default or on `INFR_UBATCH`.
+    fn ring_ec() -> EngineConfig {
+        EngineConfig {
+            device: infr_core::config::DeviceCfg {
+                ubatch: Some(64),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The runner's `start` decision at one rewind depth, ring sizing on.
+    fn ring_start(start: usize) -> usize {
+        swa_rewind_start(&ring_cfg(), &ring_ec(), true, LEN, MAX_CTX, start)
+    }
+
+    #[test]
+    fn reuse_ring_start_keeps_the_rewind_at_the_retained_tail() {
+        // 935 is the deepest rewind the ring still backs (935 - 63 = 872). The pre-port call site
+        // (`start.saturating_sub(c.swa_window) >= live_from`) answered 0 here and paid a full
+        // re-prefill: this assertion IS the off-by-two regression test.
+        assert_eq!(ring_start(935), 935);
+        // Shallower rewinds reuse with room to spare.
+        assert_eq!(ring_start(936), 936);
+        assert_eq!(ring_start(999), 999);
+    }
+
+    #[test]
+    fn reuse_ring_start_falls_back_to_a_full_reprefill_past_the_tail() {
+        // 934 - 63 = 871, a row position 999 already recycled → no reuse at all.
+        assert_eq!(ring_start(934), 0);
+        assert_eq!(ring_start(500), 0);
+    }
+
+    #[test]
+    fn reuse_ring_start_guards_only_a_real_rewind_on_a_real_ring() {
+        // The three shapes the call site excludes, each returning `start` untouched: no ring (a
+        // full-context cache never loses a position)…
+        assert_eq!(
+            swa_rewind_start(&ring_cfg(), &ring_ec(), false, LEN, MAX_CTX, 500),
+            500
+        );
+        // …an extending turn (`start == cached_len`, nothing is rewound)…
+        assert_eq!(ring_start(LEN), LEN);
+        // …and a call that already starts at 0.
+        assert_eq!(ring_start(0), 0);
+        // A ring so wide the layer never wraps (`rows_l == max_ctx` is filtered out as a layer that
+        // cannot lose positions): with every layer filtered, the guard has nothing to refuse.
+        assert_eq!(
+            swa_rewind_start(&ring_cfg(), &ring_ec(), true, LEN, ROWS, 500),
+            500
+        );
+        // And a model with NO sliding window at all: `is_swa_layer` is false for every layer
+        // (`Config::is_swa_layer` requires `swa_window > 0`), which is why the zero-window arm above
+        // is a faithful mirror rather than a reachable call-site branch.
+        let no_swa = Config {
+            n_layer: 4,
+            swa_pattern: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            swa_rewind_start(&no_swa, &ring_ec(), true, LEN, MAX_CTX, 500),
+            500
+        );
     }
 }

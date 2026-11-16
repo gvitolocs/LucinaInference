@@ -26,7 +26,7 @@ mod weights;
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
-pub(crate) use weights::SeamKv;
+pub(crate) use weights::{MtpRollback, SeamKv};
 
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.

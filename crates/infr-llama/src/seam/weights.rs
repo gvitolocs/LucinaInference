@@ -365,6 +365,81 @@ pub(super) struct MtpDeltaCkpt {
     /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
     layers: Vec<usize>,
     cached_len: usize,
+    /// The deepest rollback (in tokens, measured back from the live `cached` length) that this
+    /// retained snapshot GUARANTEES — infr's form of llama.cpp's
+    /// `llama_memory_recurrent::cell::rs_max`, ported from v1.0.0 `ab3768cdc` (#31368).
+    ///
+    /// llama.cpp keeps the bound in the memory and writes it from the pass that moves the state
+    /// (`find_slot`, `src/llama-memory-recurrent.cpp:676`: `rs_max = n_seq_tokens - 1` for a ubatch
+    /// of `n <= n_rs_seq + 1` tokens, 0 for a longer one, which only guarantees the final state) and
+    /// clears it to 0 when the state is wiped (`clear`, `:151`); `seq_rm` (`:212`) then refuses any
+    /// rollback past it. infr keeps ONE full state copy per boundary instead of per-token snapshots,
+    /// so the guarantee is the distance from the live state back to that copy, and it is written by
+    /// the same kind of site llama.cpp uses — the pass that moves the state
+    /// ([`MtpDeltaCkpt::note_forward`], which drops the guarantee to 0 by itself when that pass
+    /// re-prefilled a different sequence through the snapshot's prefix) — plus
+    /// [`MtpDeltaCkpt::note_reset`] (0) when the materialized tokens are dropped with no replacement
+    /// prompt (`SeamKv::reset`/`reset_tokens`). A snapshot nobody re-extended guarantees nothing.
+    rs_max: usize,
+}
+
+impl MtpDeltaCkpt {
+    /// v1.0.0 `ab3768cdc` (#31368) `src/llama-memory-recurrent.cpp:676` port — the pass that moved
+    /// the recurrent state records how deep a rollback the retained snapshot now backs.
+    ///
+    /// `live_len` is the cached length the pass leaves behind, `kept` how many of the tokens it
+    /// started from the new prompt agreed with (the longest common prefix). The DeltaNet state after
+    /// `n` tokens is a pure function of those `n` tokens, so the copy stays a true state at
+    /// `cached_len` exactly while nothing below that index was rewritten: `kept < cached_len` means
+    /// the pass re-prefilled a DIFFERENT sequence through the snapshot's prefix and the guarantee
+    /// drops to 0 — the copy must not be restored until a fresh snapshot replaces it. Recording
+    /// `live_len` as the pass STARTED it (before any generated rows) only ever under-estimates the
+    /// depth, and an under-estimate is a refused rollback (a re-prefill), never a stale read.
+    pub(crate) fn note_forward(&mut self, live_len: usize, kept: usize) {
+        self.rs_max = if kept >= self.cached_len {
+            live_len.saturating_sub(self.cached_len)
+        } else {
+            0
+        };
+    }
+
+    /// v1.0.0 `ab3768cdc` (#31368) `src/llama-memory-recurrent.cpp:151` port (`cells[i].rs_max = 0`
+    /// in `clear`) — the materialized tokens were dropped, so nothing live backs the retained copy
+    /// any more and every rollback of it must be refused until a new snapshot is taken.
+    pub(crate) fn note_reset(&mut self) {
+        self.rs_max = 0;
+    }
+}
+
+/// v1.0.0 `ab3768cdc` (#31368) `src/llama-memory-recurrent.cpp:212` port — the rollback decision
+/// `llama_memory_recurrent::seq_rm` applies to a partial recurrent-state rewind: it computes the
+/// depth the caller wants (`rollback = cell.pos - (p0 - 1)`) and accepts it ONLY when it is a real
+/// rewind (`rollback >= 1`) that the snapshots written by the last ubatch actually back
+/// (`rollback <= cell.rs_max`); otherwise the request falls through to the full-reset path instead
+/// of rewinding onto a state that was never written. Kept separate from [`SeamKv::mtp_restore_delta`]
+/// so the bound is testable without a backend.
+pub(crate) fn rs_rollback_ok(rollback: usize, rs_max: usize) -> bool {
+    rollback >= 1 && rollback <= rs_max
+}
+
+/// What a [`SeamKv::mtp_restore_delta`] request resolved to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MtpRollback {
+    /// [`rs_rollback_ok`] accepted the depth: the retained snapshot is back in the live buffers and
+    /// `cached` is truncated to the length it covers.
+    Applied,
+    /// This model has no recurrent mixer at all (no snapshot was ever taken), so there is no state
+    /// to go stale — a per-position KV cache rewinds through the prefix diff on its own.
+    NotRecurrent,
+    /// The requested rewind is not one the retained snapshot backs — deeper than its guarantee, or a
+    /// guarantee of 0 because nothing re-extended the state since the snapshot was taken or dropped.
+    /// NOTHING was touched: the live state still carries the rejected drafts. The caller must not
+    /// treat the boundary as clean — v1.0.0's answer to a refused `seq_rm` is to re-evaluate the
+    /// prefix from zero, which is what the next verify's forward does here: a partially-accepted
+    /// cycle leaves the following feed diverging from `cached` at the rejection point, so the
+    /// append-only rule in `generate_dense_backend` takes its zero-reset full re-prefill instead of
+    /// a rewind onto a state that was never written.
+    Refused,
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -403,6 +478,7 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        self.mtp_invalidate_ckpt();
     }
 
     /// Number of token ids materialized in this slot's KV cache.
@@ -414,6 +490,18 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        self.mtp_invalidate_ckpt();
+    }
+
+    /// v1.0.0 `ab3768cdc` (#31368) `src/llama-memory-recurrent.cpp:151` port — the paired half of
+    /// `clear()`'s `cells[i].rs_max = 0`: the materialized tokens are gone, so the retained DeltaNet
+    /// snapshot describes a prefix that no longer exists and every rollback of it must be refused.
+    /// Without this, a `reset()` (bench reps, `reset_cache`, the Metal session) leaves a live-looking
+    /// snapshot whose state buffers nothing in `cached` backs, and the MTP loop would rewind onto it.
+    pub(crate) fn mtp_invalidate_ckpt(&mut self) {
+        if let Some(ck) = self.mtp_delta_ckpt.as_mut() {
+            ck.note_reset();
+        }
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
@@ -448,6 +536,7 @@ impl SeamKv {
                 vbufs,
                 layers,
                 cached_len: 0,
+                rs_max: 0,
             });
         }
         let cached_len = self.cached.len();
@@ -466,21 +555,41 @@ impl SeamKv {
             )
             .map_err(|e| anyhow!("{e}"))?;
         }
-        self.mtp_delta_ckpt
-            .as_mut()
-            .expect("just ensured Some")
-            .cached_len = cached_len;
+        let ck = self.mtp_delta_ckpt.as_mut().expect("just ensured Some");
+        ck.cached_len = cached_len;
+        // The snapshot was just taken AT the live state, so there is nothing to roll back yet: the
+        // guarantee only grows when a later forward extends the state past it (`note_forward`),
+        // exactly like llama.cpp, where `rs_max` is a property of the ubatch that wrote the state
+        // (`src/llama-memory-recurrent.cpp:676`) and not of the checkpoint copy.
+        ck.rs_max = 0;
         Ok(())
     }
 
-    /// Restore the DeltaNet state captured by the last [`mtp_snapshot_delta`] and truncate `cached`
-    /// back to the snapshot's token length — the MTP loop's rollback after a partial-accept cycle
-    /// (drops the rejected drafts the verify forward absorbed into the recurrent state). A no-op
-    /// when no snapshot has been taken yet.
-    pub(crate) fn mtp_restore_delta(&mut self, be: &dyn Backend) -> AResult<()> {
+    /// Rewind the DeltaNet state to the [`mtp_snapshot_delta`] copy and truncate `cached` to that
+    /// snapshot's token length — the MTP loop's rollback after a partial-accept cycle (drops the
+    /// rejected drafts the verify forward absorbed into the recurrent state).
+    ///
+    /// `target` is the committed length the caller wants to roll back to. v1.0.0 `ab3768cdc`
+    /// (#31368) makes the MEMORY own that bound: `seq_rm` computes the depth and refuses anything
+    /// past what its retained snapshots guarantee (`src/llama-memory-recurrent.cpp:212`) rather than
+    /// rewinding onto a state that was never written. The same gate lives here — a `target` shallower
+    /// than the snapshot, or a snapshot that no forward has re-extended, resolves to
+    /// [`MtpRollback::Refused`]; a model with no recurrent snapshot at all resolves to
+    /// [`MtpRollback::NotRecurrent`] (nothing exists that could go stale). Both leave every buffer
+    /// untouched, so a stale state can never be consumed silently. On success the guarantee is spent:
+    /// the state is back at `cached_len`, so `rs_max` returns to 0 until the next `note_forward`.
+    pub(crate) fn mtp_restore_delta(
+        &mut self,
+        be: &dyn Backend,
+        target: usize,
+    ) -> AResult<MtpRollback> {
         let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
-            return Ok(());
+            return Ok(MtpRollback::NotRecurrent);
         };
+        let rollback = self.cached.len().saturating_sub(target);
+        if !rs_rollback_ok(rollback, ck.rs_max) {
+            return Ok(MtpRollback::Refused);
+        }
         for (i, &l) in ck.layers.iter().enumerate() {
             be.copy_buffer(
                 ck.kbufs[i].as_ref(),
@@ -496,7 +605,18 @@ impl SeamKv {
             .map_err(|e| anyhow!("{e}"))?;
         }
         self.cached.truncate(ck.cached_len);
-        Ok(())
+        self.mtp_delta_ckpt
+            .as_mut()
+            .expect("checked Some above")
+            .note_reset();
+        Ok(MtpRollback::Applied)
+    }
+
+    /// The committed length the retained DeltaNet snapshot covers — the rollback bound in the
+    /// memory's own units, which is what the MTP loop reads instead of keeping its own guess
+    /// (`None` when this model has no recurrent snapshot).
+    pub(crate) fn mtp_ckpt_boundary(&self) -> Option<usize> {
+        self.mtp_delta_ckpt.as_ref().map(|ck| ck.cached_len)
     }
 
     pub(crate) fn fork(
@@ -674,5 +794,391 @@ impl SeamKv {
         }
         self.cached = src.cached[..p].to_vec();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rs_rollback_ok, MtpDeltaCkpt, MtpRollback, SeamKv, SeamWeights, SessionStable};
+    use crate::Config;
+    use infr_core::backend::{Backend, BufferUsage};
+    use infr_core::tensor::DType;
+
+    /// A recurrent-state snapshot at `cached_len` with no device buffers behind it: the rollback
+    /// decision is pure arithmetic, so the v1.0.0 `ab3768cdc` (#31368) gate is testable without a
+    /// backend. `rs_max` starts at 0 — a snapshot that no forward has re-extended yet.
+    fn ckpt(cached_len: usize) -> MtpDeltaCkpt {
+        MtpDeltaCkpt {
+            kbufs: Vec::new(),
+            vbufs: Vec::new(),
+            layers: Vec::new(),
+            cached_len,
+            rs_max: 0,
+        }
+    }
+
+    /// The rollback depth `seq_rm` computes for a request (`cell.pos - (p0 - 1)`), in our units:
+    /// how many tokens the live cache is ahead of the boundary the caller wants back.
+    fn rollback(live_len: usize, target: usize) -> usize {
+        live_len.saturating_sub(target)
+    }
+
+    // ── the gate itself, at llama.cpp's three cases ────────────────────────────────────────────
+
+    #[test]
+    fn rollback_within_rs_max_is_accepted() {
+        // A snapshot at 100, the last verify wrote through 112: rs_max = 12.
+        let mut ck = ckpt(100);
+        ck.note_forward(112, 100);
+        assert_eq!(ck.rs_max, 12);
+        assert!(rs_rollback_ok(rollback(112, 105), ck.rs_max));
+        assert!(rs_rollback_ok(rollback(112, 101), ck.rs_max));
+    }
+
+    #[test]
+    fn rollback_at_the_rs_max_boundary_is_accepted() {
+        // llama.cpp uses `rollback <= (llama_pos) cell.rs_max`, so the DEEPEST backed rewind —
+        // landing exactly on the retained snapshot — is accepted, not merely a shallower one.
+        let mut ck = ckpt(100);
+        ck.note_forward(112, 100);
+        assert!(rs_rollback_ok(rollback(112, 100), ck.rs_max));
+        assert_eq!(rollback(112, 100), ck.rs_max);
+    }
+
+    #[test]
+    fn rollback_past_rs_max_is_refused() {
+        // One token deeper than any retained snapshot backs (target 99 < cached_len 100) is
+        // refused: `seq_rm` falls through instead of rewinding onto a state it never wrote.
+        let mut ck = ckpt(100);
+        ck.note_forward(112, 100);
+        assert!(!rs_rollback_ok(rollback(112, 99), ck.rs_max));
+        assert!(!rs_rollback_ok(rollback(112, 0), ck.rs_max));
+        // A zero-depth request is refused too, exactly as llama.cpp's `rollback >= 1` half does.
+        assert!(!rs_rollback_ok(rollback(112, 112), ck.rs_max));
+    }
+
+    #[test]
+    fn rollback_of_a_cleared_state_is_refused() {
+        // v1.0.0 `clear()` writes `cells[i].rs_max = 0`; after that nothing is guaranteed, even
+        // though the snapshot copy is still sitting in its buffers.
+        let mut ck = ckpt(100);
+        ck.note_forward(112, 100);
+        assert!(rs_rollback_ok(rollback(112, 100), ck.rs_max));
+        ck.note_reset();
+        assert_eq!(ck.rs_max, 0);
+        assert!(!rs_rollback_ok(rollback(112, 100), ck.rs_max));
+        assert!(!rs_rollback_ok(1, ck.rs_max));
+    }
+
+    // ── who is allowed to (re-)establish the guarantee ─────────────────────────────────────────
+
+    #[test]
+    fn rollback_bound_grows_only_with_the_tokens_the_last_pass_wrote() {
+        let mut ck = ckpt(100);
+        // Fresh snapshot: the live state IS the snapshot, so there is nothing to roll back yet.
+        ck.rs_max = 0;
+        assert!(!rs_rollback_ok(1, ck.rs_max));
+        // A prompt that extends the cache writes the rows past it → those rollbacks are backed.
+        ck.note_forward(106, 100);
+        assert_eq!(ck.rs_max, 6);
+        ck.note_forward(200, 194);
+        assert_eq!(ck.rs_max, 100, "a longer extension deepens the guarantee");
+    }
+
+    #[test]
+    fn rollback_bound_dies_when_a_pass_rewrites_the_snapshotted_prefix() {
+        // A zero-reset re-prefill of a DIFFERENT sequence (common prefix 90 < cached_len 100)
+        // recomputed the state through the snapshot's own prefix: the copy is no longer a state any
+        // live token stream has, so it must not be restorable until a fresh snapshot replaces it.
+        let mut ck = ckpt(100);
+        ck.note_forward(112, 100);
+        assert!(rs_rollback_ok(rollback(112, 100), ck.rs_max));
+        ck.note_forward(300, 90);
+        assert_eq!(ck.rs_max, 0);
+        assert!(!rs_rollback_ok(rollback(300, 100), ck.rs_max));
+        // The same pass over an AGREEING prefix (kept >= cached_len) keeps the guarantee: within one
+        // generation the tokens below the snapshot never change, so the copy stays a true state.
+        ck.note_forward(320, 100);
+        assert_eq!(ck.rs_max, 220);
+    }
+
+    #[test]
+    fn rollback_bound_never_overstates_a_generating_pass() {
+        // Recording the length the pass STARTED at under-states the depth once decode appends rows;
+        // that direction is the safe one (a refusal costs a re-prefill, never a stale read).
+        let mut ck = ckpt(100);
+        ck.note_forward(104, 100);
+        assert_eq!(ck.rs_max, 4);
+        assert!(rs_rollback_ok(rollback(104, 100), ck.rs_max));
+        // The pass really left 109 tokens cached (5 generated rows beyond the prompt), so a rewind
+        // to the snapshot is genuinely safe from there too — but the recorded bound, taken from the
+        // prompt length, refuses depth 9. Under-stating is what this errs towards.
+        assert!(!rs_rollback_ok(rollback(109, 100), ck.rs_max));
+        // A `live_len` below `cached_len` (the cache was dropped under the snapshot) saturates to 0.
+        ck.note_forward(80, 80);
+        assert_eq!(ck.rs_max, 0);
+    }
+
+    // ── the same three boundaries through the WIRED call site ──────────────────────────────────
+    //
+    // The predicate tests above cannot see `SeamKv::mtp_restore_delta` at all: deleting its
+    // `rs_rollback_ok` gate (i.e. the pre-port always-restore), or truncating `cached` to the
+    // caller's `target` instead of the snapshot's length, or dropping the `note_reset` that spends
+    // the guarantee, leaves every one of them green. These run the production function on the real
+    // CPU backend, over real state buffers and a real `cached` token list.
+
+    /// Bytes per DeltaNet state buffer in these tests — enough to tell one pattern from another.
+    const STATE_BYTES: usize = 16;
+    /// The committed length the snapshot is taken at.
+    const SNAP: usize = 100;
+    /// The cached length the verify leaves behind (`SNAP` + 12 trunk tokens).
+    const LIVE: usize = 112;
+    /// Pattern in the state buffers when the snapshot is taken (the clean committed boundary).
+    const CLEAN: u8 = 0xA1;
+    /// Pattern after the verify: the rejected drafts, absorbed into the live recurrent state.
+    const POLLUTED: u8 = 0xB2;
+
+    /// qwen35 geometry in which EVERY layer is a gated-DeltaNet mixer (`full_attn_interval` defaults
+    /// to 0, so `is_qwen35_attn_layer` is false everywhere) — what `mtp_snapshot_delta` keys on.
+    fn delta_cfg() -> Config {
+        Config {
+            qwen35: true,
+            n_layer: 2,
+            ..Default::default()
+        }
+    }
+
+    /// A real slot with per-layer recurrent-state buffers and `SNAP` materialized tokens, no
+    /// checkpoint yet. Only the KV/state buffers and `cached` matter to these tests; everything
+    /// else is the empty session the MTP trunk caller never touches.
+    fn delta_kv(be: &dyn Backend) -> SeamKv {
+        let state = || be.alloc(STATE_BYTES, BufferUsage::KvCache).unwrap();
+        let scratch = || be.alloc(4, BufferUsage::Activations).unwrap();
+        SeamKv {
+            weights: std::sync::Arc::new(SeamWeights {
+                wbufs: Vec::new(),
+                wspecs: Vec::new(),
+                rf_buf: None,
+                yff_buf: None,
+                layer_has_epb: Vec::new(),
+            }),
+            stable: std::sync::Arc::new(SessionStable {
+                has_wv: Vec::new(),
+                out_scale: Vec::new(),
+                dec_out_scale: Vec::new(),
+                rope_freqs: None,
+                yarn_ff: None,
+                fuse_gu: false,
+                fuse_qkv: false,
+                moe_batched_ok: false,
+            }),
+            kbufs: vec![state(), state()],
+            vbufs: vec![state(), state()],
+            k_fmt: DType::F32,
+            v_fmt: DType::F32,
+            hidden_buf: scratch(),
+            pos_buf: scratch(),
+            ipl_buf: None,
+            logits_buf: scratch(),
+            max_ctx: 4096,
+            kv_ring: false,
+            cached: (0..SNAP as u32).collect(),
+            denoise_cache: None,
+            self_cond_w: None,
+            sc_embt: None,
+            sc_ping: None,
+            sc_ping_write: 0,
+            sc_temp_inv_buf: None,
+            mtp_delta_ckpt: None,
+        }
+    }
+
+    /// Write `byte` into every live state buffer — a forward that moved the recurrent state.
+    fn write_states(be: &dyn Backend, st: &mut SeamKv, byte: u8) {
+        for b in st.kbufs.iter_mut().chain(st.vbufs.iter_mut()) {
+            be.upload(b.as_ref(), &[byte; STATE_BYTES]).unwrap();
+        }
+    }
+
+    /// What every live state buffer holds now, so a test can say whether a restore copied anything.
+    fn read_states(be: &dyn Backend, st: &SeamKv) -> Vec<Vec<u8>> {
+        st.kbufs
+            .iter()
+            .chain(st.vbufs.iter())
+            .map(|b| {
+                let mut v = vec![0u8; STATE_BYTES];
+                be.download(b.as_ref(), &mut v).unwrap();
+                v
+            })
+            .collect()
+    }
+
+    /// The state of the trunk between two MTP cycles: a snapshot at `SNAP` whose tokens the verify
+    /// then extended to `LIVE`, with the rejected drafts still in the state. The extension is the
+    /// runner's own pairing — append the tokens to `cached` and let the pass that moved the state
+    /// record the bound (`generate_dense_backend`'s `ck.note_forward(prompt.len(), pfx)`).
+    fn after_verify(be: &dyn Backend, cfg: &Config) -> SeamKv {
+        let mut st = delta_kv(be);
+        write_states(be, &mut st, CLEAN);
+        st.mtp_snapshot_delta(be, cfg).unwrap();
+        assert_eq!(st.mtp_ckpt_boundary(), Some(SNAP));
+        st.cached.extend((SNAP as u32)..(LIVE as u32));
+        st.mtp_delta_ckpt.as_mut().unwrap().note_forward(LIVE, SNAP);
+        write_states(be, &mut st, POLLUTED);
+        st
+    }
+
+    #[test]
+    fn rollback_at_rs_max_is_applied_by_the_real_restore() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = delta_cfg();
+        let mut st = after_verify(&be, &cfg);
+        assert_eq!(st.cached.len(), LIVE);
+        // Depth LIVE - SNAP == rs_max: the DEEPEST backed rewind, accepted inclusively.
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP).unwrap(),
+            MtpRollback::Applied
+        );
+        // The snapshot's bytes are back in the live buffers (not zeros, not the polluted state)…
+        assert!(
+            read_states(&be, &st)
+                .iter()
+                .all(|s| s.as_slice() == vec![CLEAN; STATE_BYTES]),
+            "an accepted restore must copy the retained snapshot into the live state"
+        );
+        // …and `cached` is back at the length the snapshot covers.
+        assert_eq!(st.cached.len(), SNAP);
+        // The guarantee is SPENT: the state now sits at the snapshot, so a second rewind — even one
+        // the caller re-extends the token list to pretend is backed — must be refused until a new
+        // forward re-records it.
+        write_states(&be, &mut st, POLLUTED);
+        st.cached.extend((SNAP as u32)..(LIVE as u32));
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP).unwrap(),
+            MtpRollback::Refused,
+            "a restore must not be reusable without a new forward"
+        );
+        assert!(
+            read_states(&be, &st)
+                .iter()
+                .all(|s| s.as_slice() == vec![POLLUTED; STATE_BYTES]),
+            "a refused restore must not touch the state buffers"
+        );
+        assert_eq!(st.cached.len(), LIVE, "a refused restore must not truncate");
+    }
+
+    #[test]
+    fn rollback_one_past_rs_max_leaves_buffers_and_cached_untouched() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = delta_cfg();
+        let mut st = after_verify(&be, &cfg);
+        let before = read_states(&be, &st);
+        // One token shallower than the snapshot: nothing was ever written at that depth, so v1.0.0's
+        // `seq_rm` falls through instead of rewinding. Same here, and NOTHING moves.
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP - 1).unwrap(),
+            MtpRollback::Refused
+        );
+        assert_eq!(read_states(&be, &st), before);
+        assert_eq!(st.cached.len(), LIVE);
+    }
+
+    #[test]
+    fn rollback_of_zero_depth_is_refused_and_untouched() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = delta_cfg();
+        let mut st = after_verify(&be, &cfg);
+        let before = read_states(&be, &st);
+        // `rollback >= 1`: a request that rewinds nothing is not a rollback (llama.cpp's full-erase
+        // fall-through, which the MTP loop never asks for — a full accept snapshots instead).
+        assert_eq!(
+            st.mtp_restore_delta(&be, LIVE).unwrap(),
+            MtpRollback::Refused
+        );
+        // A target AHEAD of the live cache saturates to depth 0 — refused the same way.
+        assert_eq!(
+            st.mtp_restore_delta(&be, LIVE + 40).unwrap(),
+            MtpRollback::Refused
+        );
+        assert_eq!(read_states(&be, &st), before);
+        assert_eq!(st.cached.len(), LIVE);
+    }
+
+    #[test]
+    fn rollback_lands_on_the_snapshot_not_on_the_requested_target() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = delta_cfg();
+        let mut st = after_verify(&be, &cfg);
+        // A shallower depth that the bound also backs (7 < rs_max 12): accepted — and it lands on
+        // the snapshot, because that copy is the state AT `SNAP`. Truncating to `target` instead
+        // would leave the state of 100 tokens describing 105.
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP + 5).unwrap(),
+            MtpRollback::Applied
+        );
+        assert_eq!(st.cached.len(), SNAP);
+        assert!(read_states(&be, &st)
+            .iter()
+            .all(|s| s.as_slice() == vec![CLEAN; STATE_BYTES]));
+    }
+
+    #[test]
+    fn rollback_of_a_snapshot_no_forward_reextended_is_refused() {
+        let be = infr_cpu::CpuBackend::new();
+        let cfg = delta_cfg();
+        // Snapshot taken AT the live state: rs_max 0, so even the token the runner appends afterwards
+        // without a `note_forward` cannot buy back a rewind.
+        let mut st = delta_kv(&be);
+        write_states(&be, &mut st, CLEAN);
+        st.mtp_snapshot_delta(&be, &cfg).unwrap();
+        let before = read_states(&be, &st);
+        st.cached.push(LIVE as u32);
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP).unwrap(),
+            MtpRollback::Refused
+        );
+        assert_eq!(read_states(&be, &st), before);
+        assert_eq!(st.cached.len(), SNAP + 1);
+        // The paired half: dropping the materialized tokens writes the bound to 0, exactly as
+        // v1.0.0's `clear()` does (`cells[i].rs_max = 0`, `src/llama-memory-recurrent.cpp:151`), so
+        // the retained copy — still sitting in its buffers, still 12 tokens deep — is not restorable.
+        let mut st = after_verify(&be, &cfg);
+        assert_eq!(st.mtp_delta_ckpt.as_ref().unwrap().rs_max, LIVE - SNAP);
+        st.reset();
+        assert_eq!(
+            st.mtp_delta_ckpt.as_ref().unwrap().rs_max,
+            0,
+            "`reset` must clear the guarantee, not only the tokens"
+        );
+        let before = read_states(&be, &st);
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP).unwrap(),
+            MtpRollback::Refused,
+            "a reset cache must not leave a restorable snapshot behind"
+        );
+        assert_eq!(read_states(&be, &st), before);
+    }
+
+    #[test]
+    fn rollback_without_any_snapshot_reports_not_recurrent() {
+        let be = infr_cpu::CpuBackend::new();
+        // A non-qwen35 model: `mtp_snapshot_delta` builds no checkpoint, so there is no recurrent
+        // state that could go stale (`NotRecurrent`, NOT `Refused` — the loop keeps its old bookkeeping).
+        let cfg = Config {
+            n_layer: 2,
+            ..Default::default()
+        };
+        let mut st = delta_kv(&be);
+        write_states(&be, &mut st, POLLUTED);
+        st.mtp_snapshot_delta(&be, &cfg).unwrap();
+        assert!(st.mtp_delta_ckpt.is_none());
+        assert_eq!(st.mtp_ckpt_boundary(), None);
+        let before = read_states(&be, &st);
+        assert_eq!(
+            st.mtp_restore_delta(&be, SNAP).unwrap(),
+            MtpRollback::NotRecurrent
+        );
+        assert_eq!(read_states(&be, &st), before);
+        assert_eq!(st.cached.len(), SNAP);
     }
 }

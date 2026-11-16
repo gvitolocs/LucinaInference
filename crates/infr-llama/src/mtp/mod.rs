@@ -2396,7 +2396,13 @@ fn generate_mtp_spec_core(
     // can't rewind by cache truncation — see `SeamKv::mtp_snapshot_delta` and the `c.qwen35` branch
     // in `generate_dense_backend`'s `start` computation). Token-identical either way (a pure decode
     // speedup): restoring an exact state snapshot + re-prefilling the same committed tokens yields
-    // the same recurrence as prefilling them from zero.
+    // the same recurrence as prefilling them from zero. Restoring one is a ROLLBACK, and v1.0.0
+    // `ab3768cdc` (#31368) is explicit about its bound: the memory records the deepest rollback its
+    // retained snapshots guarantee (`rs_max`) and `seq_rm` refuses anything past it
+    // (`src/llama-memory-recurrent.cpp:212,676,151`) instead of rewinding onto a state that was
+    // never written. That invariant lives in `SeamKv::mtp_restore_delta` here — see
+    // `crate::seam::MtpRollback` — and `boundary` is read back from the snapshot rather than
+    // assumed, so a rewind the snapshot does not back is refused and re-primed, never used stale.
     let mtp_ckpt = ec.spec.mtp_ckpt;
     // Bounded rollback window (INFR_NO_MTP_REPRIME=1 A/B escape): the snapshot above only advances
     // on FULL-accept cycles, so at low accept rates (alpha≈0.5 on repetitive/dummy prompts —
@@ -2485,7 +2491,13 @@ fn generate_mtp_spec_core(
     }
     // Committed-token length of the last snapshot — the rollback window `committed.len() -
     // boundary` is what the next verify re-prefills after a partial accept (`mtp_reprime`'s doc).
-    let mut boundary = p;
+    // Read from the snapshot itself, not assumed from `prompt_tokens`: v1.0.0 `ab3768cdc` (#31368)
+    // keeps the rollback bound inside the memory (`src/llama-memory-recurrent.cpp:676`), and a
+    // caller-side guess is how a stale state gets used silently.
+    let mut boundary = trunk_state
+        .as_ref()
+        .and_then(|st| st.mtp_ckpt_boundary())
+        .unwrap_or(p);
 
     let mut committed = prompt_tokens.clone();
     let mut id_last = prompt_tokens[p - 1];
@@ -2652,18 +2664,38 @@ fn generate_mtp_spec_core(
         // LucinaInference: this cycle's bookkeeping must match the Verus-proved model (lucina_rules::spec_rules::cycle).
         let committed_before = committed.len();
         let mut restored = false;
+        // v1.0.0 `ab3768cdc` (#31368) port: the rollback bound belongs to the MEMORY, not to this
+        // loop. llama.cpp's `seq_rm` refuses a partial recurrent rewind past the snapshots the last
+        // ubatch guarantees (`src/llama-memory-recurrent.cpp:212`) instead of rewinding onto a state
+        // that was never written; here that gate is `SeamKv::mtp_restore_delta`'s `rs_max` check, and
+        // `boundary` is read back from the snapshot (`mtp_ckpt_boundary`) rather than inferred from
+        // `feed`. A REFUSED rewind leaves every buffer untouched — the loop must not mark the
+        // boundary clean, and the next verify's divergent feed then takes the runner's zero-reset
+        // full re-prefill, which is v1.0.0's "refuse, then re-evaluate from 0".
+        let mut refused = false;
         if mtp_ckpt {
             if let Some(st) = trunk_state.as_mut() {
                 if accepted == cand.len() {
                     st.mtp_snapshot_delta(be, cfg)?;
                     // The state covers `feed` = committed ++ cand (next_tok never went through
-                    // the trunk this cycle) — that's the snapshot's committed length.
-                    boundary = feed.len();
+                    // the trunk this cycle) — the snapshot records that length and the loop reads it
+                    // back, so the two can never disagree about what is rewound-to.
+                    boundary = st.mtp_ckpt_boundary().unwrap_or(feed.len());
                 } else {
-                    st.mtp_restore_delta(be)?;
-                    // A clean boundary may need re-establishing at the END of this cycle (after
-                    // the accepted tokens + next_tok are committed) — see `mtp_reprime`'s doc.
-                    restored = true;
+                    match st.mtp_restore_delta(be, boundary)? {
+                        crate::seam::MtpRollback::Applied
+                        | crate::seam::MtpRollback::NotRecurrent => {
+                            // `NotRecurrent` = no DeltaNet mixer at all (a per-position KV cache
+                            // rewinds through the prefix diff), so — exactly as before this port —
+                            // there is no stale state to guard and the reprime bookkeeping stands.
+                            boundary = st.mtp_ckpt_boundary().unwrap_or(boundary);
+                            // A clean boundary may need re-establishing at the END of this cycle
+                            // (after the accepted tokens + next_tok are committed) — see
+                            // `mtp_reprime`'s doc.
+                            restored = true;
+                        }
+                        crate::seam::MtpRollback::Refused => refused = true,
+                    }
                 }
             }
         }
@@ -2769,6 +2801,15 @@ fn generate_mtp_spec_core(
             .map(|c| c.committed),
             "MTP cycle committed count diverged from lucina_rules::spec_rules::cycle"
         );
+        // A refused rewind (the `rs_max` gate above) restored nothing, so there is no clean boundary
+        // to claim: the next verify's feed diverges from `cached` at this cycle's rejection point,
+        // which makes the runner's append-only rule take its zero-reset re-prefill from position 0 —
+        // v1.0.0's answer to a refused `seq_rm`. Nothing is rewound onto a state the retained
+        // snapshot does not back, and `boundary` snaps to the memory's own record on the next
+        // accepted rollback anyway.
+        if refused {
+            boundary = committed.len();
+        }
         debug_assert!(
             !mtp_ckpt || boundary <= committed.len(),
             "MTP rollback boundary {boundary} past the committed tokens {}",
@@ -2822,7 +2863,10 @@ fn generate_mtp_spec_core(
             if let Some(st) = trunk_state.as_mut() {
                 st.mtp_snapshot_delta(be, cfg)?;
             }
-            boundary = committed.len();
+            boundary = trunk_state
+                .as_ref()
+                .and_then(|st| st.mtp_ckpt_boundary())
+                .unwrap_or(committed.len());
             sum_catchup_secs += t_reprime.elapsed().as_secs_f64();
         }
     }
