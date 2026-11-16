@@ -1,0 +1,372 @@
+#version 460
+// Coopmat-1 flash-attention PREFILL at head_dim 256: fused QK -> online softmax -> PV with the S, P
+// and O tiles in shared memory and the O accumulator in per-thread registers. No materialized
+// scores matrix and, in the -DDEQ_Q4_0 build, no f16 KV prepass: the q4_0 GGUF block cache is
+// decoded IN the K/V staging loads.
+//
+// Translated from llama.cpp ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_cm1.comp at v1.0.0
+// (b1b770d), MIT licence, Copyright (c) 2023-2026 The ggml authors. Tile geometry is that file's
+// host pick for FA_COOPMAT1 (ggml-vulkan.cpp:1290-1318 at b1b770d): Br=16 query rows, Bc=64 kv
+// columns, row_split=4 subgroups, so one workgroup = 4 subgroups of 32 (the recorder pins sg32 and
+// full subgroups). Shared arrays keep that file's names and strides (:42-63): Qf, Psh, sfsh with
+// the unpadded `sfshstride = Br/4` it uses for HSK > 128 (:50-52), kvsh, pvsh. shmem_staging is 0
+// here: ggml-vulkan.cpp:1316 turns it on only for NVIDIA with hsk < 256 AND hsv < 256, so no device
+// gets it at this head dim — K/V go through the Bc x 16 kvsh sub-tile, or straight from global
+// memory for an f16 cache when the block is in bounds (flash_attn_cm1.comp:277-316, :456-510). The
+// q4_0 decode is flash_attn_dequant.glsl's FA_DEQUANT4_Q4_0 (b1b770d), read through 32-bit words
+// instead of `block_q4_0_packed16`.
+//
+// Adapted to infr: Q is f16 [mpad, nh, hd] and is NOT pre-scaled (the 1/sqrt(hd) scale is applied
+// to the f32 scores instead); masking is causal by absolute position (no mask tensor, no ALiBi, no
+// softcap, no sinks); S and O both accumulate in f32, WIDER than upstream on purpose — upstream's
+// non-bf16 shader keeps O in f16 in both accumulator builds (flash_attn_base.glsl:101,
+// `#define O_TYPE FLOAT_TYPE`) and makes only S f32, via the f32acc build's ACC_TYPE. Here both are
+// float, so pvsh is vec4 not f16vec4 and the tile is 4 KiB larger (2 KiB each on sfsh and pvsh);
+// the kernel is opt-in and measured against an exact f64 oracle, so the extra shared memory is
+// priced. The split-K output is infr's [n_splits, mpad, nh, hd] partial + m + l for
+// attn_flash_combine, and n_splits == 1 writes the normalized [mpad, nh*hd] f32 output directly.
+// Rows at or past `n_rows` (the Br-tile padding) are stored, but only ever with the neutral result:
+// upstream can skip such a store (its output has no pad rows), infr cannot leave mpad - n_rows of
+// its buffer undefined.
+// Shared bytes: src/flash_cm1.rs `shmem_bytes` (27904 B at hd 256), keep in sync.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+const uint Br = 16u;        // query rows per workgroup
+const uint Bc = 64u;        // kv columns per block
+const uint HD = 256u;       // head dim (HSK == HSV)
+const uint ROW_SPLIT = 4u;  // subgroups per workgroup
+const uint SG = 32u;
+const uint WG = ROW_SPLIT * SG;
+const uint MatBr = 16u;
+const uint MatBc = 16u;
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+const uint rows_per_thread = Br / ROW_SPLIT;          // 4
+const uint cols_per_iter = WG / ROW_SPLIT;            // 32
+const uint cols_per_thread = Bc / cols_per_iter;      // 2
+const uint threads_per_rowgroup = WG / ROW_SPLIT;     // 32 == one subgroup
+const uint d_per_thread = (HD / 4u + threads_per_rowgroup - 1u) / threads_per_rowgroup; // 2
+
+layout(push_constant) uniform PC {
+    uint q_len;      // mpad (64-row padded rows of q / attn / partials)
+    uint kv_len;
+    uint nh;
+    uint nkv;
+    uint hd;         // == 256
+    uint pos_offset; // absolute position of query row 0 (causal)
+    uint n_splits;
+    uint ksplit;     // kv columns per split (multiple of Bc)
+    uint n_rows;     // real query rows; every row at or past it stores the neutral result
+} pc;
+
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };      // [mpad, nh, hd]
+#if defined(DEQ_Q4_0)
+layout(binding = 1) readonly buffer KB { uint kw[]; };         // q4_0 blocks, [kv, nkv, hd]
+layout(binding = 2) readonly buffer VB { uint vw[]; };
+#else
+layout(binding = 1) readonly buffer KB { f16vec4 k4[]; };      // f16 [kv, nkv, hd]
+layout(binding = 2) readonly buffer VB { f16vec4 v4[]; };
+#endif
+layout(binding = 3) writeonly buffer POB { vec4 po[]; };       // [n_splits, mpad, nh, hd] un-normalized
+layout(binding = 4) writeonly buffer PMB { float pm[]; };      // [n_splits, mpad, nh]
+layout(binding = 5) writeonly buffer PLB { float pl[]; };      // [n_splits, mpad, nh]
+layout(binding = 6) writeonly buffer OB { vec4 o4[]; };        // [mpad, nh*hd] (n_splits == 1)
+
+const uint qstride = HD / 4u + 2u;
+shared f16vec4 Qf[Br * qstride];
+
+const uint psh_stride = Br / 4u + 2u;
+shared f16vec4 Psh[Bc * psh_stride];
+
+// flash_attn_cm1.comp:50-52 — no padding for HSK > 128.
+const uint sfshstride = Br / 4u;
+shared vec4 sfsh[Bc * sfshstride];
+
+const uint kvsh_stride = MatBr / 4u + 2u;
+const uint v_cols = MatBc / 4u * ROW_SPLIT;
+const uint vsh_stride = v_cols;
+shared f16vec4 kvsh[(kvsh_stride >= vsh_stride) ? (Bc * kvsh_stride) : (Bc * vsh_stride)];
+
+const uint osh_stride = ROW_SPLIT * MatBr / 4u;
+shared vec4 pvsh[MatBc * osh_stride];
+
+#if defined(DEQ_Q4_0)
+// q4_0 block: [f16 d][u8 qs[16]] = 18 bytes, 32 elements, y = d * (nibble - 8); element j < 16 is
+// the low nibble of qs[j], j >= 16 the high nibble of qs[j - 16]. Four consecutive elements e..e+3
+// (e % 4 == 0) share one block and four consecutive qs bytes at (e % 16). The byte offsets are only
+// 2-aligned (18-byte blocks), so the d half-word and the qs word are funnelled out of 32-bit words.
+#define FA_DEQUANT4_Q4_0(W)                                                                 \
+    uint ib = e >> 5u;                                                                      \
+    uint iqs = e & 31u;                                                                     \
+    uint bd = ib * 18u;                                                                     \
+    uint dw = W[bd >> 2u];                                                                  \
+    float d = unpackHalf2x16((bd & 2u) != 0u ? (dw >> 16u) : dw).x;                         \
+    uint bo = bd + 2u + (iqs & 15u);                                                        \
+    uint w0 = W[bo >> 2u];                                                                  \
+    uint sh = (bo & 3u) << 3u;                                                              \
+    uint qv = (sh == 0u) ? w0 : ((w0 >> sh) | (W[(bo >> 2u) + 1u] << (32u - sh)));          \
+    qv >>= (iqs & 16u) >> 2u;                                                               \
+    vec4 nib = vec4(float(qv & 0xFu), float((qv >> 8u) & 0xFu),                             \
+                    float((qv >> 16u) & 0xFu), float((qv >> 24u) & 0xFu));                  \
+    return f16vec4(d * (nib - 8.0));
+f16vec4 loadK4(uint e) { FA_DEQUANT4_Q4_0(kw) }
+f16vec4 loadV4(uint e) { FA_DEQUANT4_Q4_0(vw) }
+const bool USE_DECODE = true;
+#else
+f16vec4 loadK4(uint e) { return k4[e >> 2u]; }
+f16vec4 loadV4(uint e) { return v4[e >> 2u]; }
+const bool USE_DECODE = false;
+#endif
+
+void main() {
+    const uint qt = gl_WorkGroupID.x / pc.nh;
+    const uint h = gl_WorkGroupID.x % pc.nh;
+    const uint split = gl_WorkGroupID.y;
+    const uint qr0 = qt * Br;
+    const uint kvh = h / (pc.nh / pc.nkv);
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint row_tid = tid / threads_per_rowgroup;   // == sg
+    const uint col_tid = tid % threads_per_rowgroup;   // == lane
+    const uint nhhd4 = pc.nh * HD / 4u;
+    const uint kvrow = pc.nkv * HD;                    // elements per cache row
+    const float scale = 1.0 / sqrt(float(HD));
+    // flash_attn_cm1.comp:114-115 — -FLT_MAX/2 rather than -inf.
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFFu);
+    // flash_attn_base.glsl FATTN_KQ_MAX_OFFSET (b1b770d): the running max carries a +3*ln2 offset,
+    // so P <= 1/8. Common to every split, so the combine's exp(m_s - m) is unaffected.
+    const float FATTN_KQ_MAX_OFFSET = 3.0 * 0.6931;
+
+#define tile_row(r) (row_tid * rows_per_thread + (r))
+
+    // Fully-padded tile (rows >= n_rows rounded up to Br): nothing to attend; write the neutral
+    // result and leave — the whole-tile fast path of the per-row rule at the stores below.
+    // Workgroup-uniform, so no barrier is skipped by part of the group.
+    if (qr0 >= pc.n_rows) {
+        [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+            const uint row = qr0 + tile_row(r);
+            [[unroll]] for (uint dl = 0u; dl < d_per_thread; ++dl) {
+                const uint d = dl * threads_per_rowgroup + col_tid;
+                if (pc.n_splits > 1u) {
+                    po[(split * pc.q_len + row) * nhhd4 + h * (HD / 4u) + d] = vec4(0.0);
+                } else {
+                    o4[row * nhhd4 + h * (HD / 4u) + d] = vec4(0.0);
+                }
+            }
+            if (pc.n_splits > 1u && col_tid == 0u) {
+                const uint idx = (split * pc.q_len + row) * pc.nh + h;
+                pm[idx] = NEG_FLT_MAX_OVER_2;
+                pl[idx] = 0.0;
+            }
+        }
+        return;
+    }
+
+    // Q tile -> Qf (unscaled f16).
+    [[unroll]] for (uint idx = 0u; idx < Br * HD / 4u; idx += WG) {
+        const uint d = (idx + tid) % (HD / 4u);
+        const uint r = (idx + tid) / (HD / 4u);
+        Qf[r * qstride + d] = q4[(qr0 + r) * nhhd4 + h * (HD / 4u) + d];
+    }
+    barrier();
+
+    vec4 Of[rows_per_thread][d_per_thread];
+    float Lf[rows_per_thread];
+    float Mf[rows_per_thread];
+    [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+        [[unroll]] for (uint d = 0u; d < d_per_thread; ++d) {
+            Of[r][d] = vec4(0.0);
+        }
+        Lf[r] = 0.0;
+        Mf[r] = NEG_FLT_MAX_OVER_2;
+    }
+
+    const uint kvstart = split * pc.ksplit;
+    const uint kvend = min(min(pc.kv_len, pc.pos_offset + qr0 + Br), kvstart + pc.ksplit);
+    const uint kbase = kvh * HD;
+
+    [[dont_unroll]]
+    for (uint kv0 = kvstart; kv0 < kvend; kv0 += Bc) {
+        // A block reaching past kv_len is staged (zero-filled past the end) rather than read
+        // straight from global memory — flash_attn_cm1.comp's KV_bounds_check staging. A quant
+        // cache is always staged, for the decode.
+        const bool stage = USE_DECODE || (kv0 + Bc > pc.kv_len);
+
+        // ---- K * Q^T -> S^T: Bc x HD * HD x Br, one 16-column slab per subgroup (:265-329) ----
+        coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> SfMat =
+            coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float16_t, gl_ScopeSubgroup, MatBc, 16, gl_MatrixUseA> KMat;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, MatBr, gl_MatrixUseB> QMat;
+
+        [[unroll]] for (uint d = 0u; d < HD / 16u; ++d) {
+            if (stage) {
+                barrier();
+                [[unroll]] for (uint idx = 0u; idx < Bc * MatBr / 4u; idx += WG) {
+                    const uint col_vec = (idx + tid) % (MatBr / 4u);
+                    const uint row = (idx + tid) / (MatBr / 4u);
+                    f16vec4 K_Tf = f16vec4(0.0);
+                    if (kv0 + row < pc.kv_len) {
+                        K_Tf = loadK4((kv0 + row) * kvrow + kbase + d * 16u + col_vec * 4u);
+                    }
+                    kvsh[row * kvsh_stride + col_vec] = K_Tf;
+                }
+                barrier();
+                coopMatLoad(KMat, kvsh, (sg * MatBc) * kvsh_stride, kvsh_stride,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            } else {
+#if !defined(DEQ_Q4_0)
+                coopMatLoad(KMat, k4, ((kv0 + sg * MatBc) * kvrow + kbase + d * 16u) / 4u,
+                            kvrow / 4u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            }
+            coopMatLoad(QMat, Qf, d * 16u / 4u, qstride, gl_CooperativeMatrixLayoutColumnMajor);
+            SfMat = coopMatMulAdd(KMat, QMat, SfMat);
+        }
+        coopMatStore(SfMat, sfsh, sg * MatBc * sfshstride, sfshstride,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+
+        // ---- online softmax over this block (:358-409) ----
+        float eMf[rows_per_thread];
+        [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+            const uint r_vec = tile_row(r) / 4u;
+            const uint r_comp = tile_row(r) % 4u;
+            const uint qpos = pc.pos_offset + qr0 + tile_row(r);
+            float rowmaxf = NEG_FLT_MAX_OVER_2;
+            [[unroll]] for (uint c = 0u; c < cols_per_thread; ++c) {
+                const uint col = c * cols_per_iter + col_tid;
+                const uint kpos = kv0 + col;
+                if (kpos > qpos || kpos >= pc.kv_len) {
+                    continue;
+                }
+                rowmaxf = max(rowmaxf, sfsh[r_vec + col * sfshstride][r_comp] * scale);
+            }
+            rowmaxf += FATTN_KQ_MAX_OFFSET;
+            const float Moldf = Mf[r];
+            rowmaxf = subgroupMax(rowmaxf);
+            Mf[r] = max(rowmaxf, Moldf);
+            eMf[r] = exp(Moldf - Mf[r]);
+            Lf[r] = eMf[r] * Lf[r];
+        }
+        [[unroll]] for (uint d = 0u; d < d_per_thread; ++d) {
+            [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+                Of[r][d] *= eMf[r];
+            }
+        }
+        [[unroll]] for (uint c = 0u; c < cols_per_thread; ++c) {
+            const uint col = c * cols_per_iter + col_tid;
+            const uint kpos = kv0 + col;
+            [[unroll]] for (uint r = 0u; r < rows_per_thread; r += 4u) {
+                const uint row = tile_row(r);
+                const vec4 s = sfsh[row / 4u + col * sfshstride] * scale;
+                vec4 p;
+                [[unroll]] for (uint vi = 0u; vi < 4u; ++vi) {
+                    const uint qpos = pc.pos_offset + qr0 + row + vi;
+                    p[vi] = (kpos > qpos || kpos >= pc.kv_len) ? 0.0 : exp(s[vi] - Mf[r + vi]);
+                }
+                const f16vec4 Pf = f16vec4(p);
+                // L sums the same f16-rounded P the PV product uses (:403-405).
+                [[unroll]] for (uint vi = 0u; vi < 4u; ++vi) {
+                    Lf[r + vi] += float(Pf[vi]);
+                }
+                Psh[col * psh_stride + row / 4u] = Pf;
+            }
+        }
+        barrier();
+
+        // ---- P * V: Br x Bc * Bc x HD in 64-wide tiles, 16 dims per subgroup (:439-541) ----
+        [[unroll]] for (uint hsv_tile = 0u; hsv_tile < HD / (MatBc * ROW_SPLIT); ++hsv_tile) {
+            const uint hsv_offset = (hsv_tile * ROW_SPLIT + sg) * 16u;
+            coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator> PVMat =
+                coopmat<float, gl_ScopeSubgroup, MatBc, MatBr, gl_MatrixUseAccumulator>(0.0);
+            if (stage) {
+                [[unroll]] for (uint i = 0u; i < Bc * v_cols / WG; ++i) {
+                    const uint idx = i * WG + tid;
+                    const uint row = idx / v_cols;
+                    const uint col = idx % v_cols;
+                    const uint v_col = hsv_tile * MatBc * ROW_SPLIT + col * 4u;
+                    f16vec4 V_Tf = f16vec4(0.0);
+                    if (kv0 + row < pc.kv_len) {
+                        V_Tf = loadV4((kv0 + row) * kvrow + kbase + v_col);
+                    }
+                    kvsh[row * vsh_stride + col] = V_Tf;
+                }
+            }
+            barrier();
+            [[unroll]] for (uint bc_chunk = 0u; bc_chunk < Bc / MatBc; ++bc_chunk) {
+                coopMatLoad(KMat, Psh, bc_chunk * MatBc * psh_stride, psh_stride,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                if (stage) {
+                    coopMatLoad(QMat, kvsh, bc_chunk * MatBr * v_cols + sg * (MatBc / 4u),
+                                vsh_stride, gl_CooperativeMatrixLayoutRowMajor);
+                } else {
+#if !defined(DEQ_Q4_0)
+                    coopMatLoad(QMat, v4, ((kv0 + bc_chunk * MatBc) * kvrow + kbase + hsv_offset) / 4u,
+                                kvrow / 4u, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+                }
+                PVMat = coopMatMulAdd(KMat, QMat, PVMat);
+            }
+            coopMatStore(PVMat, pvsh, sg * MatBr / 4u, osh_stride,
+                         gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            const uint hsv_base = hsv_tile * ROW_SPLIT * MatBc;
+            [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+                const uint row = tile_row(r);
+                [[unroll]] for (uint dl = 0u; dl < d_per_thread; ++dl) {
+                    const uint hsv_col = 4u * (dl * threads_per_rowgroup + col_tid);
+                    if (hsv_col >= hsv_base && hsv_col < hsv_base + ROW_SPLIT * MatBc) {
+                        Of[r][dl] += pvsh[row * osh_stride + (hsv_col - hsv_base) / 4u];
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+        Lf[r] = subgroupAdd(Lf[r]);
+    }
+
+    if (pc.n_splits > 1u) {
+        // Un-normalized partial for attn_flash_combine. A tile that straddles n_rows (rows=24: the
+        // second Br tile holds rows 16..31) computes REAL softmax output in its pad rows, so each
+        // pad row stores the same neutral value the whole-tile early-out writes. Upstream skips the
+        // store instead (flash_attn_cm1.comp b1b770d:580 `if (global_row < N)`, :590 for m/l)
+        // because its output has no pad rows; here the buffer is mpad rows and attn_flash_combine
+        // reads all of them. The VALUE is selected rather than the store skipped, so every lane
+        // stores every row and the loop stays workgroup-uniform (nothing after it reads shared
+        // memory, so a guarded store would have been safe too).
+        [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+            const uint row = qr0 + tile_row(r);
+            const bool real = row < pc.n_rows;
+            const uint base = (split * pc.q_len + row) * nhhd4 + h * (HD / 4u);
+            [[unroll]] for (uint dl = 0u; dl < d_per_thread; ++dl) {
+                po[base + dl * threads_per_rowgroup + col_tid] = real ? Of[r][dl] : vec4(0.0);
+            }
+            if (col_tid == 0u) {
+                const uint idx = (split * pc.q_len + row) * pc.nh + h;
+                pm[idx] = real ? Mf[r] : NEG_FLT_MAX_OVER_2;
+                pl[idx] = real ? Lf[r] : 0.0;
+            }
+        }
+        return;
+    }
+
+    [[unroll]] for (uint r = 0u; r < rows_per_thread; ++r) {
+        const float Lfrcp = (Lf[r] == 0.0) ? 0.0 : (1.0 / Lf[r]);
+        const uint row = qr0 + tile_row(r);
+        // Same rule as above: upstream guards this store with `row < N` (:653).
+        [[unroll]] for (uint dl = 0u; dl < d_per_thread; ++dl) {
+            o4[row * nhhd4 + h * (HD / 4u) + dl * threads_per_rowgroup + col_tid] =
+                (row < pc.n_rows) ? Of[r][dl] * Lfrcp : vec4(0.0);
+        }
+    }
+}

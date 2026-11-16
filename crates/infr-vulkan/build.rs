@@ -418,6 +418,15 @@ fn main() {
         // FMT_Q8_0 `dqblk` (which this shared substrate uses) would misread it. A Q8 dequant-in-flash
         // needs a bespoke planar decoder + a `cap` push constant; out of scope for the GGUF-block
         // substrate. iq4_nl (codebook gather) is likewise left on the prepass.
+        // Coopmat-1 flash prefill at head_dim 256 (port of llama.cpp v1.0.0 flash_attn_cm1.comp):
+        // S/P/O tiles in shared memory, f16 KV, or a q4_0 GGUF block cache decoded in the K/V
+        // staging loads (`-DDEQ_Q4_0`, no dequant_kv_f16 prepass). See src/flash_cm1.rs.
+        ("attn_flash_cm1", "attn_flash_cm1_hd256", &[]),
+        (
+            "attn_flash_cm1",
+            "attn_flash_cm1_hd256_q4_0",
+            &["-DDEQ_Q4_0"],
+        ),
         ("attn_flash_warp", "attn_flash_warp", &[]),
         // BM=32 tile: 29056 B shared (vs 58112 B), fits NVIDIA (48 KB) / MoltenVK (32 KB) devices
         // whose maxComputeSharedMemorySize is under the 64 KB the default BM=64 tile needs.

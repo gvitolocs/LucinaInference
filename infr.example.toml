@@ -148,6 +148,11 @@ moe_small_m = 8 # clamped to 0..=64 by the accessor
 # Attention.
 flash_warp = true
 flash_min_rows = 24
+# The hd-256 coopmat-1 flash prefill (`INFR_FLASH_CM1=1` opts in). OFF: it allocates
+# no scores matrix (~0.86 GB less at 32k depth) and is the closer leg to exact
+# attention, but measures slower prefill than the non-FA coopmat route it replaces
+# at both depths.
+flash_cm1 = false
 # flash_splits = 2   # default: unset = the engine's split heuristic
 # pv_splits = 2      # default: unset
 

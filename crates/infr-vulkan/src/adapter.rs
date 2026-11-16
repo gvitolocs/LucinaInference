@@ -926,6 +926,13 @@ pub(crate) enum PrefillTier {
 /// it fast at hd 256 is the next optimisation, and the reference for what that means is the
 /// `flash_attn_cm1.comp` shape cited above.
 ///
+/// hd 256 now has a coopmat flash kernel of its own (`attn_flash_cm1.comp`, the port of that
+/// `flash_attn_cm1.comp` shape): when it fits the device AND `kernels.vulkan.flash_cm1` is on, the
+/// caller's `flash_ok` is true and `Flash` wins before either branch below. So the hd-256 order is
+/// cm1 flash → nc_fa (only with `nc_fa_wide`) → nonfa. BOTH switches default off, and for the same
+/// reason — the fused tile is the closer leg against the exact oracle but the SLOWER prefill, so the
+/// shipped hd-256 route is `NonFa` (see `flash_cm1`'s knob doc for that measurement).
+///
 /// The reroute is confined to shapes nonfa WOULD have served (`nc_fa_wide_ok` requires
 /// `nonfa_base`), so everything that previously fell through to split-K — `cap_short`, ring-past,
 /// rows<64, hd not a multiple of 64 — still falls there, and hd<=128 routing is untouched.
@@ -969,6 +976,15 @@ pub(crate) fn prefill_attn_tier(i: &PrefillTierIn) -> PrefillTier {
     } else {
         PrefillTier::Split
     }
+}
+
+/// The head-dim term of the prefill call site's `flash_geom`: hd 128 has always taken coopmat
+/// flash, hd 256 only through [`crate::flash_cm1::admitted`] — the `kernels.vulkan.flash_cm1` knob
+/// AND the tile fitting this device's shared memory. Every other hd is refused. A function so the
+/// wiring is testable with no device (see `cm1_admission_wiring_routes_hd256`); the other
+/// `flash_geom` terms (rows, capacity, mask, scale, coopmat, tensor kinds) are the caller's own.
+fn flash_hd_admitted(hd: usize, cm1_enabled: bool, max_shared: u32) -> bool {
+    hd == 128 || crate::flash_cm1::admitted(hd, cm1_enabled, max_shared)
 }
 
 /// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
@@ -3034,8 +3050,31 @@ fn lower_op(
                 // Read ONCE and share: `flash_geom` (below) and `nc_fa_ok` (further down) both floor
                 // on this row count and MUST agree — two reads risked a divergence trap.
                 let flash_min_rows: usize = be_.cfg().kernels.vulkan.flash_min_rows;
+                // Head dim 256 has its own coopmat flash kernel, a port of llama.cpp v1.0.0
+                // `flash_attn_cm1.comp` (b1b770d; FA_COOPMAT1 is RADV's path,
+                // ggml-vulkan.cpp:1349-1390, gated on the shared-memory fit at :1368-1373): S/P/O
+                // tiles in shared memory, no scores matrix, q4_0 KV decoded in-shader. Same geometry
+                // gate as hd 128 below, plus that fit against this device's limit — a device that
+                // cannot hold the tile keeps the non-FA route (`nonfa_ok`). Both hd gates are the
+                // pure [`flash_hd_admitted`], so that wiring is testable without a device.
+                //
+                // `kernels.vulkan.flash_cm1` is OFF by default — `INFR_FLASH_CM1=1` opts in —
+                // because the kernel loses on prefill, the thing this path is judged on. Measured on
+                // the 7900 XTX (median of 3): 512 @d4k 881.8 t/s vs 913.3 without it (-3.5%), @d32k
+                // 508.7 vs 558.7 (-9%). What it wins is why the route stays in the tree: no scores
+                // matrix (~0.86 GB saved at 32k) and the closer leg against the exact f64 oracle
+                // (1.57e-4 / 1.14e-4 vs nonfa's 1.92e-4 / 2.69e-4). The bar for defaulting it on is
+                // the old path's prefill at both depths, where llama.cpp v1.0.0 measures 540 t/s.
+                let flash_hd_ok = flash_hd_admitted(
+                    hd,
+                    be_.cfg().kernels.vulkan.flash_cm1,
+                    be_.max_shared_memory_bytes(),
+                );
+                // cm1 specifically (hd 256 admitted): the dequant-format and dispatch arms below
+                // branch on the kernel, not on coopmat flash in general.
+                let flash_cm1_hd = flash_hd_ok && hd == crate::flash_cm1::HD as usize;
                 let flash_geom = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
-                    && hd == 128
+                    && flash_hd_ok
                     // The flash kernels read K/V in BN=64 column tiles, so the last tile over-reads up
                     // to kv_len.div_ceil(64)*64 rows (masked in softmax, but a real global read the
                     // direct coopMatLoad arm can't guard). Require the PADDED read width to fit the
@@ -3052,18 +3091,26 @@ fn lower_op(
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
                 let flash_deq_fmt = if flash_geom
                     && kdt == vdt
-                    // GGUF-block low-bit set only (native_decode dqblk substrate). Q8_0 (planar
-                    // cache) and iq4_nl (codebook) stay on the dequant_kv_f16 prepass — see
-                    // attn_flash_partial.comp / build.rs.
-                    && matches!(
-                        kdt,
-                        infr_core::DType::Q4_0
-                            | infr_core::DType::Q4_1
-                            | infr_core::DType::Q5_0
-                            | infr_core::DType::Q5_1
-                    )
-                    && be_.cfg().kernels.vulkan.flash_dequant
-                {
+                    && if flash_cm1_hd {
+                        // The hd-256 kernel decodes q4_0 in-shader unconditionally, as v1.0.0 does:
+                        // its dequant→f16-transpose prepass exists only for Q8_0 — the sole
+                        // `pipeline_dequant_transpose` it creates (ggml-vulkan.cpp:3300 at pin).
+                        // `use_dequant_kv` then needs that pipeline on both sides (:8496-8508), so
+                        // a q4_0 cache reaches coopmat-1 still quantized. Its other KV dtypes take
+                        // the prepass and the f16 build.
+                        kdt == infr_core::DType::Q4_0
+                    } else {
+                        // GGUF-block low-bit set only (native_decode dqblk substrate). Q8_0 (planar
+                        // cache) and iq4_nl (codebook) stay on the dequant_kv_f16 prepass — see
+                        // attn_flash_partial.comp / build.rs.
+                        matches!(
+                            kdt,
+                            infr_core::DType::Q4_0
+                                | infr_core::DType::Q4_1
+                                | infr_core::DType::Q5_0
+                                | infr_core::DType::Q5_1
+                        ) && be_.cfg().kernels.vulkan.flash_dequant
+                    } {
                     Some(kdt)
                 } else {
                     None
@@ -3146,7 +3193,7 @@ fn lower_op(
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
                 let flash_stage = if let Some(dt) = flash_deq_fmt {
                     crate::recorder::FlashStage::Dequant(dt)
-                } else if flash_geom && be_.cfg().kernels.vulkan.flash_stage {
+                } else if flash_geom && !flash_cm1_hd && be_.cfg().kernels.vulkan.flash_stage {
                     crate::recorder::FlashStage::Stage
                 } else {
                     crate::recorder::FlashStage::Off
@@ -3318,7 +3365,58 @@ fn lower_op(
                     && hd % 4 == 0
                     && hd <= 512
                     && (rows == 1 || !(k_q8_eff || v_q8_eff));
-                if flash_ok {
+                if flash_ok && flash_cm1_hd {
+                    let mpad = rows.div_ceil(64) * 64;
+                    // v1.0.0 split_k rule (ggml-vulkan.cpp:8698-8742): one pass for a full prefill
+                    // chunk, partials only when the tiles under-fill the shader cores — so the
+                    // partial scratch is sized from the plan and is 0 at one split.
+                    let plan = crate::flash_cm1::split_plan(
+                        rows,
+                        kv_len,
+                        nh,
+                        be_.caps().compute_units,
+                        be_.cfg()
+                            .kernels
+                            .vulkan
+                            .flash_splits
+                            .and_then(|v| u32::try_from(v).ok()),
+                    );
+                    let (po_b, pm_b, pl_b) = plan.partial_bytes(mpad, nh, hd);
+                    let parts = if plan.n_splits > 1 {
+                        Some((
+                            pooled(pool, be_, "flash_po", po_b)?,
+                            pooled(pool, be_, "flash_pm", pm_b)?,
+                            pooled(pool, be_, "flash_pl", pl_b)?,
+                        ))
+                    } else {
+                        None
+                    };
+                    let kcb = match &kc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*k_cache)?,
+                    };
+                    let vcb = match &vc_key {
+                        Some(k) => pool[k].as_ref(),
+                        None => r(*v_cache)?,
+                    };
+                    rec.attention_prefill_flash_cm1(
+                        r(*q)?,
+                        kcb,
+                        vcb,
+                        r(*dst)?,
+                        parts.as_ref().map(|(a, b, c)| {
+                            (pool[a].as_ref(), pool[b].as_ref(), pool[c].as_ref())
+                        }),
+                        rows,
+                        kv_len,
+                        nh,
+                        nkv,
+                        hd,
+                        pos,
+                        flash_deq_fmt,
+                        plan,
+                    );
+                } else if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
                     // set serves every layer instead of n_layer live copies (~1GB each at 8B p8k).
@@ -6458,10 +6556,11 @@ mod tests {
     }
 
     /// The prefill ladder at a Qwen3.8-27B-shaped point: coopmat device, Internal (row-padded)
-    /// q/dst, causal, f16 KV (already dequanted), no Canvas, and BOTH nc_fa knobs at their shipped
-    /// defaults — `nc_fa` on, `nc_fa_wide` OFF, i.e. the old route. [`route_wide`] turns the reroute
-    /// switch on. `flash_ok` is an INPUT, so every case below states the geometry verdict the caller
-    /// reached.
+    /// q/dst, causal, f16 KV (already dequanted), no Canvas, and the attention switches at their
+    /// shipped defaults — `nc_fa` on, `nc_fa_wide` OFF and hd 256 NOT admitted to coopmat flash
+    /// (`flash_cm1` OFF), i.e. the old route. [`route_wide`] turns the reroute switch on,
+    /// [`cm1_granted`] the hd-256 cm1 kernel. `flash_ok` is an INPUT, so every case below states the
+    /// geometry verdict the caller reached.
     fn route(rows: usize, kv_len: usize, hd: usize, att_cap_rows: usize) -> PrefillTierIn {
         PrefillTierIn {
             rows,
@@ -6486,6 +6585,16 @@ mod tests {
         let mut i = route(rows, kv_len, hd, att_cap_rows);
         i.nc_fa_wide = true;
         i
+    }
+
+    /// Grant the hd-256 coopmat flash kernel — `kernels.vulkan.flash_cm1=true`
+    /// (`INFR_FLASH_CM1=1`) on a device whose `maxComputeSharedMemorySize` holds the tile, which is
+    /// exactly what makes the caller's `flash_ok` true at hd 256. Shipped default is the opposite
+    /// ([`route`]).
+    fn cm1_granted(i: &PrefillTierIn) -> PrefillTierIn {
+        let mut g = *i;
+        g.flash_ok = true;
+        g
     }
 
     /// hd <= 128 routing must be byte-for-byte what it was before the `nc_fa_wide` reroute, WITH
@@ -6523,10 +6632,102 @@ mod tests {
         }
     }
 
-    /// The reroute itself, switch ON: hd 256 with the coopmat flash geometry refused takes
-    /// `attn_nc_fa` — zero pool scratch — instead of `attention_prefill_nonfa`'s `[nh, mpad,
-    /// kv_pad]` f16 scores matrix (1,410 MiB for this shape at 120k). `INFR_NO_NC_FA=1` restores the
-    /// old route even with the switch on; `INFR_NC_FA_WIDE=0` (the shipped default) does too.
+    /// hd 256 in both cm1 states, and in both `nc_fa_wide` states. GRANTED (`cm1_granted`:
+    /// `kernels.vulkan.flash_cm1` on and the tile fits the device) takes `Flash` whatever
+    /// `nc_fa_wide` says. REFUSED — which is the SHIPPED DEFAULT, so the `wide=false` arm below is
+    /// what a 27B prefill actually runs — hd 256 falls to `attn_nc_fa` (zero pool scratch,
+    /// `INFR_NC_FA_WIDE=1`) only with the reroute switch on, and otherwise to
+    /// `attention_prefill_nonfa`'s `[nh, mpad, kv_pad]` f16 scores matrix (1,410 MiB for this shape
+    /// at 120k). `INFR_NO_NC_FA=1` restores nonfa even with the switch on.
+    #[test]
+    fn route_head_dim_256_prefers_cm1_flash() {
+        for wide in [false, true] {
+            let base = if wide {
+                route_wide(256, 32_768, 256, 122_880)
+            } else {
+                route(256, 32_768, 256, 122_880)
+            };
+            assert_eq!(
+                prefill_attn_tier(&cm1_granted(&base)),
+                PrefillTier::Flash,
+                "wide={wide}"
+            );
+            let want = if wide {
+                PrefillTier::NcFa
+            } else {
+                PrefillTier::NonFa
+            };
+            assert_eq!(
+                prefill_attn_tier(&base),
+                want,
+                "wide={wide}: cm1 refused by default"
+            );
+        }
+    }
+
+    /// The WIRING around that ladder: [`flash_hd_admitted`] is the hd term the prefill call site
+    /// ANDs into `flash_geom`, so these take the two inputs it reads — the config knob and
+    /// `maxComputeSharedMemorySize` — and return the tier a real 256-row / 32k prefill lands on. At
+    /// hd 256 the knob alone does not admit the kernel: 27 903 B is one byte short of the tile and
+    /// keeps the old route, exactly as the knob being off does. At hd 128 neither input is
+    /// consulted, in either direction — that shape has had coopmat flash all along, which is what
+    /// "the default flip touches nothing else" means at the tier level.
+    #[test]
+    fn cm1_admission_wiring_routes_hd256() {
+        let tier = |hd: usize, enabled: bool, max_shared: u32, wide: bool| {
+            let mut i = if wide {
+                route_wide(256, 32_768, hd, 122_880)
+            } else {
+                route(256, 32_768, hd, 122_880)
+            };
+            // Every other `flash_geom` term holds at this shape; the hd term IS the wiring.
+            i.flash_ok = flash_hd_admitted(hd, enabled, max_shared);
+            prefill_attn_tier(&i)
+        };
+        let old = |wide: bool| {
+            if wide {
+                PrefillTier::NcFa
+            } else {
+                PrefillTier::NonFa
+            }
+        };
+        for wide in [false, true] {
+            // Knob OFF (the shipped default): the device's shared memory is irrelevant.
+            assert_eq!(tier(256, false, 65_536, wide), old(wide), "wide={wide}");
+            assert_eq!(tier(256, false, 27_904, wide), old(wide), "wide={wide}");
+            // Knob on, tile does not fit — the device the gate refuses, at the boundary and below.
+            assert_eq!(tier(256, true, 27_903, wide), old(wide), "wide={wide}");
+            assert_eq!(tier(256, true, 16_384, wide), old(wide), "wide={wide}");
+            // Knob on, tile fits: cm1, whatever `nc_fa_wide` says.
+            assert_eq!(
+                tier(256, true, 27_904, wide),
+                PrefillTier::Flash,
+                "wide={wide}: exactly the tile size fits"
+            );
+            assert_eq!(
+                tier(256, true, 65_536, wide),
+                PrefillTier::Flash,
+                "wide={wide}"
+            );
+            // A head dim the port has no shader for is never admitted, even on a device that would
+            // hold it, and falls back to the same old route as a refusal.
+            assert_eq!(tier(192, true, 65_536, wide), old(wide), "wide={wide}");
+            // hd 128: unaffected by both inputs.
+            for (enabled, shared) in [
+                (false, 27_903u32),
+                (false, 65_536),
+                (true, 27_903),
+                (true, 65_536),
+            ] {
+                assert_eq!(
+                    tier(128, enabled, shared, wide),
+                    PrefillTier::Flash,
+                    "wide={wide} hd=128 enabled={enabled} shared={shared}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn route_wide_head_dim_prefers_nc_fa() {
         let i = route_wide(256, 120_256, 256, 122_880);

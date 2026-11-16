@@ -1870,6 +1870,26 @@ static ATTN_PV_WARP_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static ATTN_PV_REDUCE_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 static RMSNORM_SPV: OnceLock<Vec<u32>> = OnceLock::new();
 
+/// The coopmat-1 flash prefill build at head_dim 256 (`attn_flash_cm1.comp`): `None` = f16 KV,
+/// `Some(Q4_0)` = the q4_0 block cache decoded in-shader. Any other KV dtype has no build (the
+/// adapter dequants it to the f16 scratch first and asks for the f16 build).
+pub(crate) fn attn_flash_cm1_spv(
+    kv: Option<infr_core::DType>,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    match kv {
+        None => Some(spv!("attn_flash_cm1_hd256")),
+        Some(infr_core::DType::Q4_0) => Some(spv!("attn_flash_cm1_hd256_q4_0")),
+        Some(_) => None,
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn gemm_tiled_spv() -> &'static [u32] {
     GEMM_TILED_SPV.get_or_init(|| spv_words(GEMM_TILED_SPV_BYTES))

@@ -5403,6 +5403,103 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Coopmat-1 flash-attention prefill at head_dim 256 (`attn_flash_cm1.comp`, a port of llama.cpp
+    /// v1.0.0 `flash_attn_cm1.comp`): fused QK → online softmax → PV with S/P/O in shared memory, no
+    /// scores matrix. `q` = \[mpad, nh, 256\] f16 (mpad = rows rounded up to 64), `attn` =
+    /// \[mpad, nh*256\] f32 out, `pos_offset` = absolute position of row 0 (causal). `kv = None`
+    /// reads `kc`/`vc` as f16 \[kv_len, nkv, 256\]; `Some(Q4_0)` reads them as the q4_0 GGUF block
+    /// cache and decodes in-shader (no prepass). `plan` comes from [`crate::flash_cm1::split_plan`];
+    /// at `n_splits > 1` the caller passes `partials` = (`po`, `pm`, `pl`) sized by
+    /// [`crate::flash_cm1::SplitPlan::partial_bytes`] and `attn_flash_combine` merges them, at one
+    /// split `partials` is `None` and the kernel writes `attn` directly. The caller has checked
+    /// [`crate::flash_cm1::shmem_support`] against this device.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_flash_cm1(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        attn: &dyn Buffer,
+        partials: Option<(&dyn Buffer, &dyn Buffer, &dyn Buffer)>,
+        n: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        kv: Option<infr_core::DType>,
+        plan: crate::flash_cm1::SplitPlan,
+    ) {
+        assert_eq!(
+            hd,
+            crate::flash_cm1::HD as usize,
+            "attention_prefill_flash_cm1: built for head_dim 256 only"
+        );
+        assert_eq!(
+            partials.is_some(),
+            plan.n_splits > 1,
+            "attention_prefill_flash_cm1: partial scratch iff the plan splits"
+        );
+        let (name, spv) = crate::gemm::attn_flash_cm1_spv(kv)
+            .expect("attention_prefill_flash_cm1: no build for this KV dtype");
+        let mpad = (n.div_ceil(64) * 64) as u32;
+        // One workgroup per (16-row tile, head) over the whole padded height: every row past `n`
+        // writes the neutral result, whether its tile is fully past the last row (the shader's
+        // whole-tile early exit) or the tile straddles it (per-row store guard).
+        let tiles = mpad / crate::flash_cm1::BR;
+        let k = self.be.kernel_sg(name, spv, 7, 36, 32);
+        let mut p = [0u8; 36];
+        p[0..4].copy_from_slice(&mpad.to_ne_bytes());
+        p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        p[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        p[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        p[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        p[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        p[24..28].copy_from_slice(&plan.n_splits.to_ne_bytes());
+        p[28..32].copy_from_slice(&plan.ksplit.to_ne_bytes());
+        p[32..36].copy_from_slice(&(n as u32).to_ne_bytes());
+        // At one split the partial bindings are never written; `attn` stands in for them.
+        let (po, pm, pl) = partials.unwrap_or((attn, attn, attn));
+        self.dispatch3(
+            k,
+            &[
+                Self::vkb(q),
+                Self::vkb(kc),
+                Self::vkb(vc),
+                Self::vkb(po),
+                Self::vkb(pm),
+                Self::vkb(pl),
+                Self::vkb(attn),
+            ],
+            4,
+            &p,
+            tiles * nh as u32,
+            plan.n_splits,
+            1,
+        );
+        if plan.n_splits > 1 {
+            let kc2 = self.be.kernel_sg(
+                "attn_flash_combine",
+                crate::gemm::attn_flash_combine_spv(),
+                4,
+                16,
+                32,
+            );
+            let mut pc2 = [0u8; 16];
+            pc2[0..4].copy_from_slice(&mpad.to_ne_bytes());
+            pc2[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
+            pc2[8..12].copy_from_slice(&(hd as u32).to_ne_bytes());
+            pc2[12..16].copy_from_slice(&plan.n_splits.to_ne_bytes());
+            self.dispatch(
+                kc2,
+                &[Self::vkb(po), Self::vkb(pm), Self::vkb(pl), Self::vkb(attn)],
+                1,
+                &pc2,
+                mpad * nh as u32,
+            );
+        }
+    }
+
     /// Non-coopmat shared-memory fma flash-attention prefill (`attn_nc_fa.comp`, adapter.rs
     /// `nc_fa_ok` — the Intel Arc tier): fused tile QK^T → online softmax → PV, one workgroup per
     /// (BM-row query tile, head), no subgroup ops, no pinned subgroup size, no scratch buffers.

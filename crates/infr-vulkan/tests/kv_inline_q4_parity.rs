@@ -34,6 +34,21 @@
 //! accuracy trade. Because nonfa stores scores in f16, the prefill cases use
 //! `q4_0_side_bytes_bounded` — see its doc.
 //!
+//! `kv_prefill_q4_0_head_dim_256_flash_cm1_matches_exact` extends the same oracle to PREFILL
+//! (rows=256, kv_len in {4096, 32768}, plus rows 24 and 100 at kv_len 8200) for the coopmat-1 flash
+//! kernel `attention_prefill_flash_cm1` (port of llama.cpp v1.0.0 `flash_attn_cm1.comp`: S/P/O in
+//! shared memory, no scores matrix, q4_0 decoded in-shader), against `attention_prefill_nonfa` —
+//! the tier hd 256 takes by default, which materializes an `[nh, mpad, kv_pad]` f16 scores matrix.
+//! `kernels.vulkan.flash_cm1` DEFAULTS OFF (slower prefill at both depths — see the knob's doc),
+//! but this test records the cm1 kernel directly, so its coverage of that route does not depend on
+//! the switch and the kernel cannot rot with it off. The short-row shapes pin the tile padding too:
+//! the rows past the end must come back exactly zero, in both of the kernel's output paths (see
+//! `run_cm1_prefill_case`). The exact reference is attention over the `dequant_kv_f16` prepass
+//! output; the in-shader decode rounds to f16 the same way, so all legs read the same K/V values
+//! and the assertion is about the attention kernels. nonfa keeps its scores in f16 (a 2^-10 ·
+//! max|s| · max|v| term the test derives and allows for); cm1 keeps them in f32. Because nonfa
+//! stores scores in f16, the prefill cases use `q4_0_side_bytes_bounded` — see its doc.
+//!
 //! SAFETY: the discrete card (RX 7900 XTX / NAVI31) may be serving production traffic. The default
 //! for both tests is the integrated GPU (1002:164e) via `MESA_VK_DEVICE_SELECT=1002:164e
 //! MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1`; a "7900"/"NAVI31" device is refused before any
@@ -923,6 +938,337 @@ fn run_prefill_case(
     failures
 }
 
+/// One side of the bounded q4_0 cache, on the device twice: as the raw q4_0 blocks the
+/// `attn_flash_cm1` q4_0 build decodes in-shader, and through `dequant_kv_f16` as the concrete f16
+/// cache the f16 legs read — plus that f16 cache widened exactly to f32 for the oracle.
+///
+/// One side at a time, host bytes released as soon as they are on the device (the 32k case holds
+/// ~400 MiB of host copies otherwise). The f16 cache is a fresh `KvCache` buffer rather than the
+/// prepass's own output buffer: downloading and re-uploading severs the cross-recorder scratch
+/// hazard (see the decode legs), and every f16 leg then reads the very same bytes.
+fn prefill_sides(
+    be: &VulkanBackend,
+    elems: usize,
+    seed: usize,
+) -> (
+    Box<dyn infr_core::backend::Buffer>,
+    Box<dyn infr_core::backend::Buffer>,
+    Vec<f32>,
+) {
+    let bytes = q4_0_side_bytes_bounded(elems, seed);
+    let q4 = be.alloc(bytes.len(), BufferUsage::KvCache).unwrap();
+    be.upload(q4.as_ref(), &bytes).unwrap();
+    drop(bytes);
+    let f16 = be.alloc(elems * 2, BufferUsage::Activations).unwrap();
+    {
+        let rec = be.recorder().unwrap();
+        rec.dequant_kv_f16(infr_core::DType::Q4_0, q4.as_ref(), f16.as_ref(), elems);
+        rec.finish().unwrap();
+    }
+    let mut h = vec![0u8; elems * 2];
+    be.download(f16.as_ref(), &mut h).unwrap();
+    drop(f16);
+    let exact = widen_f16_to_f32(&h);
+    let concrete = be.alloc(elems * 2, BufferUsage::KvCache).unwrap();
+    be.upload(concrete.as_ref(), &h).unwrap();
+    drop(h);
+    (q4, concrete, exact)
+}
+
+/// Runs one hd-256 PREFILL case (`rows` query rows, causal, q4_0 KV) through the coopmat-1 flash
+/// kernel `attention_prefill_flash_cm1` (a port of llama.cpp v1.0.0 `flash_attn_cm1.comp`: S/P/O
+/// tiles in shared memory, no scores matrix) and through `attention_prefill_nonfa`, the tier the
+/// adapter gave hd 256 before it (materialized `[nh, mpad, kv_pad]` f16 scores). Legs:
+///
+/// - `nonfa`: f16 KV from the `dequant_kv_f16` prepass;
+/// - `cm1 f16`: the cm1 f16 build over the same prepass cache;
+/// - `cm1 q4_0`: the cm1 `-DDEQ_Q4_0` build reading the raw q4_0 blocks, decoding in-shader — the
+///   route `kernels.vulkan.flash_cm1` opts into (default off): no prepass, no scores scratch;
+/// - `cm1 q4_0 split4`: the same build forced to four kv splits, which covers the partial +
+///   `attn_flash_combine` path at hd 256 (a full 256-row chunk on a 96-CU card never splits);
+/// - `cm1 q4_0 split1`: only when the natural plan DOES split, the same build forced to one pass —
+///   the other output path of the kernel (write the normalized f32 output, no combine).
+///
+/// Both paths end at an `mpad = ceil(rows/64)*64`-row buffer, so `rows` that is not a 16-row tile
+/// multiple leaves the kernel real softmax in its last tile's pad rows. Every cm1 leg asserts those
+/// rows are EXACTLY 0.0 bits: the shader's store rule (upstream skips the row instead,
+/// `flash_attn_cm1.comp` b1b770d:580/:653 — infr writes the neutral value, because
+/// `attn_flash_combine` reads the whole padded height) is a correctness claim, not a tolerance, and
+/// a nonzero pad row is a tile-boundary bug rather than noise. `nonfa` is not checked: it owns a
+/// different padding rule.
+///
+/// The oracle is exact f64 attention over the prepass's f16 cache on sampled `(row, head)` pairs:
+/// the in-shader decode computes the same `d * (nibble - 8)` and rounds it to f16 like the prepass,
+/// so all four legs read the same K/V values and the distances measure the attention kernels. The
+/// `cm1 f16` ↔ `cm1 q4_0` bit-identity is REPORTED (equal decode → equal coopmat inputs, same
+/// accumulation order), not asserted, like every bit-identity in this file.
+///
+/// Tolerance, this file's rule: each cm1 leg may be no further from exact than twice the nonfa
+/// leg's distance (beyond the 2^-11 f16 floor), nonfa no further than twice the cm1 leg's beyond
+/// the floor plus its own f16-scores term, and each cm1 leg at most 4x the floor outright (its
+/// scores are f32; its P is f16, as in upstream).
+#[allow(clippy::too_many_arguments)]
+fn run_cm1_prefill_case(
+    be: &VulkanBackend,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    kv_len: usize,
+    rows: usize,
+    rows_sample: &[usize],
+    heads_sample: &[usize],
+) -> Vec<Result<(), String>> {
+    use infr_vulkan::flash_cm1::{split_plan, SplitPlan};
+    assert!(
+        rows_sample.iter().all(|&r| r < rows),
+        "the oracle samples real rows only ({rows})"
+    );
+    let pos = kv_len - rows;
+    let mpad = rows.div_ceil(64) * 64;
+    let kv_pad = kv_len.div_ceil(256) * 256;
+    let elems = kv_len * nkv * hd;
+    let o_bytes = mpad * nh * hd * 4;
+    let mib = |b: usize| b as f64 / (1 << 20) as f64;
+    let name = format!("q4_0 cm1 prefill rows={rows} kv={kv_len} nh={nh} nkv={nkv} hd={hd}");
+    let clock = std::time::Instant::now;
+
+    let q = synth_f16(mpad * nh * hd, 101);
+    let q_buf = be.alloc(q.len(), BufferUsage::Activations).unwrap();
+    be.upload(q_buf.as_ref(), &q).unwrap();
+
+    let lap = clock();
+    let (kq4, kf16, kd32) = prefill_sides(be, elems, 11);
+    let (vq4, vf16, vd32) = prefill_sides(be, elems, 23);
+    let t_prepass = lap.elapsed();
+
+    let cus = be.capabilities().compute_units;
+    let plan = split_plan(rows, kv_len, nh, cus, None);
+    let forced = split_plan(rows, kv_len, nh, cus, Some(4));
+    let (s_bytes, pv_bytes) = (nh * mpad * kv_pad * 2, 8 * mpad * nh * hd * 4);
+    let (po_b, pm_b, pl_b) = plan.partial_bytes(mpad, nh, hd);
+    println!(
+        "{name}: nonfa scratch = {:.1} MiB scores + {:.1} MiB PV partials; cm1 plan {plan:?} \
+         (compute units {cus}) scratch = {:.1} MiB partials, 0 MiB scores, no f16 KV prepass",
+        mib(s_bytes),
+        mib(pv_bytes),
+        mib(po_b + pm_b + pl_b),
+    );
+
+    // ── Leg: nonfa over the prepass f16 cache. ───────────────────────────────────────────────
+    let lap = clock();
+    let nonfa_bits = {
+        let s = be.alloc(s_bytes, BufferUsage::Activations).unwrap();
+        let pv = be.alloc(pv_bytes, BufferUsage::Activations).unwrap();
+        let o = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill_nonfa(
+            q_buf.as_ref(),
+            kf16.as_ref(),
+            vf16.as_ref(),
+            o.as_ref(),
+            s.as_ref(),
+            pv.as_ref(),
+            rows,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos,
+            0,
+            0.0,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; o_bytes];
+        be.download(o.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+    let t_nonfa = lap.elapsed();
+
+    // ── The cm1 legs. ─────────────────────────────────────────────────────────────────────────
+    let cm1_leg = |kc: &dyn infr_core::backend::Buffer,
+                   vc: &dyn infr_core::backend::Buffer,
+                   kv: Option<infr_core::DType>,
+                   plan: SplitPlan|
+     -> Vec<u32> {
+        let o = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
+        let (po_b, pm_b, pl_b) = plan.partial_bytes(mpad, nh, hd);
+        let parts = (plan.n_splits > 1).then(|| {
+            (
+                be.alloc(po_b, BufferUsage::Activations).unwrap(),
+                be.alloc(pm_b, BufferUsage::Activations).unwrap(),
+                be.alloc(pl_b, BufferUsage::Activations).unwrap(),
+            )
+        });
+        let rec = be.recorder().unwrap();
+        rec.attention_prefill_flash_cm1(
+            q_buf.as_ref(),
+            kc,
+            vc,
+            o.as_ref(),
+            parts
+                .as_ref()
+                .map(|(a, b, c)| (a.as_ref(), b.as_ref(), c.as_ref())),
+            rows,
+            kv_len,
+            nh,
+            nkv,
+            hd,
+            pos,
+            kv,
+            plan,
+        );
+        rec.finish().unwrap();
+        let mut out = vec![0u8; o_bytes];
+        be.download(o.as_ref(), &mut out).unwrap();
+        bits(&out)
+    };
+    let lap = clock();
+    let cm1_f16 = cm1_leg(kf16.as_ref(), vf16.as_ref(), None, plan);
+    let t_cm1_f16 = lap.elapsed();
+    let lap = clock();
+    let cm1_q4 = cm1_leg(
+        kq4.as_ref(),
+        vq4.as_ref(),
+        Some(infr_core::DType::Q4_0),
+        plan,
+    );
+    let t_cm1_q4 = lap.elapsed();
+    let cm1_q4_split = cm1_leg(
+        kq4.as_ref(),
+        vq4.as_ref(),
+        Some(infr_core::DType::Q4_0),
+        forced,
+    );
+    // The natural plan splits a small-row shape, so the single-pass store path needs its own leg to
+    // be covered there at all; with rows 24/100 the two paths are the whole of the kernel's output.
+    let single_plan = split_plan(rows, kv_len, nh, cus, Some(1));
+    let cm1_q4_single = (plan.n_splits > 1).then(|| {
+        cm1_leg(
+            kq4.as_ref(),
+            vq4.as_ref(),
+            Some(infr_core::DType::Q4_0),
+            single_plan,
+        )
+    });
+    drop((q_buf, kq4, vq4, kf16, vf16));
+
+    let mut legs: Vec<(&str, &Vec<u32>)> = vec![
+        ("cm1 f16", &cm1_f16),
+        ("cm1 q4_0", &cm1_q4),
+        ("cm1 q4_0 split4", &cm1_q4_split),
+    ];
+    if let Some(single) = &cm1_q4_single {
+        legs.push(("cm1 q4_0 split1", single));
+    }
+    let mut failures = Vec::new();
+    for (label, leg) in legs.iter().chain([("nonfa", &nonfa_bits)].iter()) {
+        if !leg.iter().any(|&b| b != 0) {
+            failures.push(Err(format!(
+                "{name} {label}: output is all zeros — the leg is not exercising the kernel"
+            )));
+        }
+    }
+    // Rows `rows..mpad` are the Br-tile padding: the neutral-result store rule, not a tolerance.
+    for (label, leg) in &legs {
+        let pad = &leg[rows * nh * hd..];
+        if let Some(i) = pad.iter().position(|&b| b != 0) {
+            failures.push(Err(format!(
+                "{name} {label}: pad row {} (of {rows}..{mpad}) holds {:e} at element {} — rows at \
+                 or past n_rows must store the neutral result",
+                rows + i / (nh * hd),
+                f32::from_bits(pad[i]),
+                i % (nh * hd),
+            )));
+        }
+    }
+    if !failures.is_empty() {
+        return failures;
+    }
+
+    let pairs: Vec<(usize, usize)> = rows_sample
+        .iter()
+        .flat_map(|&r| heads_sample.iter().map(move |&h| (r, h)))
+        .collect();
+    let lap = clock();
+    let parts = exact_prefill(&q, &kd32, &vd32, nh, nkv, hd, kv_len, pos, &pairs);
+    let t_oracle = lap.elapsed();
+    let ms = |d: std::time::Duration| format!("{:.0}", d.as_secs_f64() * 1e3);
+    println!(
+        "{name}: timings (ms, incl. submit + download) — prepass {}, nonfa {}, cm1 f16 {}, \
+         cm1 q4_0 {}, oracle {}",
+        ms(t_prepass),
+        ms(t_nonfa),
+        ms(t_cm1_f16),
+        ms(t_cm1_q4),
+        ms(t_oracle)
+    );
+    let v_max = vd32.iter().fold(0.0f32, |a, x| a.max(x.abs())) as f64;
+    drop(kd32);
+    drop(vd32);
+    let (d_nonfa, exact_max) = max_abs_vs_exact_at(&nonfa_bits, &parts);
+    let floor = (2.0f64).powi(-11) * exact_max;
+    // `attn_qk` writes nonfa's scores as f16, so each score reaches `exp` with a relative error of
+    // up to 2^-11 * |s|; with `sum|dp| <= 2 * 2^-11 * max|s|` that puts nonfa's own rounding at up
+    // to 2^-10 * max|s| * max|v| above the output floor. cm1 keeps its scores in f32.
+    let s_max = parts.iter().fold(0.0f64, |a, &(_, _, s)| a.max(s));
+    let scores_term = (2.0f64).powi(-10) * s_max * v_max;
+    let rel = |d: f64| if exact_max > 0.0 { d / exact_max } else { d };
+    println!(
+        "{name}: max|exact| = {exact_max:e} over {} sampled (row, head) blocks; f16 floor = \
+         {floor:e}; nonfa max|nonfa-exact| = {d_nonfa:e} (rel {:e}), its scores term = \
+         {scores_term:e} (max|s| {s_max}, max|v| {v_max:e})",
+        pairs.len(),
+        rel(d_nonfa),
+    );
+    for (label, leg) in &legs {
+        let d = max_abs_vs_exact_at(leg, &parts).0;
+        println!(
+            "{name} {label}: max|{label}-exact| = {d:e} (rel {:e}), max|{label}-nonfa| = {:e}",
+            rel(d),
+            max_abs_between_bits(leg, &nonfa_bits)
+        );
+        let bound_abs = 4.0 * floor;
+        if d > bound_abs {
+            failures.push(Err(format!(
+                "{name} {label}: {d:e} from exact, absolute bound {bound_abs:e} (4 * f16 floor)"
+            )));
+        }
+        let bound = 2.0 * d_nonfa.max(floor);
+        if d > bound {
+            failures.push(Err(format!(
+                "{name} {label}: {d:e} from exact, bound {bound:e} \
+                 (2 * max(nonfa {d_nonfa:e}, f16 floor {floor:e}))"
+            )));
+        }
+        let bound_nonfa = 2.0 * d.max(floor + scores_term);
+        if d_nonfa > bound_nonfa {
+            failures.push(Err(format!(
+                "{name} {label}: nonfa is {d_nonfa:e} from exact, bound {bound_nonfa:e} \
+                 (2 * max({label} {d:e}, floor {floor:e} + its f16 scores term {scores_term:e}))"
+            )));
+        }
+    }
+    for (a, b) in [("cm1 f16", "cm1 q4_0"), ("cm1 q4_0", "cm1 q4_0 split4")] {
+        let la = legs.iter().find(|l| l.0 == a).unwrap().1;
+        let lb = legs.iter().find(|l| l.0 == b).unwrap().1;
+        match compare_bit_identical(&format!("{a} vs {b}"), la, lb) {
+            Ok(()) => println!("{name}: {a} and {b} are BIT-IDENTICAL (reported, not asserted)"),
+            Err(e) => println!("{name}: {e} (reported, not asserted)"),
+        }
+    }
+    if failures.is_empty() {
+        if mpad > rows {
+            println!(
+                "{name}: rows {rows}..{mpad} (the Br-tile padding) are exactly 0.0 in every cm1 leg"
+            );
+        }
+        println!(
+            "ok: {name} (pos={pos}, mpad={mpad}, natural split {plan:?}, forced split {forced:?})"
+        );
+    }
+    failures
+}
+
 /// Both test fns in this file drive the integrated GPU; the repo runs GPU workloads serially, and
 /// the harness would otherwise run them on two threads at once.
 static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1079,6 +1425,86 @@ fn kv_prefill_q4_0_head_dim_256_nc_fa_matches_nonfa() {
         panic!(
             "{} prefill leg(s) fell outside the tolerance (2x the other leg's distance from \
              exact, beyond the f16 floor and nonfa's f16 scores term):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
+/// The hd-256 coopmat-1 flash route's numeric claim: at the Qwen3.8-27B prefill shape (nh=24,
+/// nkv=4, hd=256, q4_0 KV, rows=256, causal) `attention_prefill_flash_cm1` — with the q4_0 cache
+/// decoded in-shader, the route `kernels.vulkan.flash_cm1` opts into — is as close to exact
+/// attention as the nonfa tier it replaces, at 4k and at 32k depth; and at rows 24 and 100 over a
+/// non-64-aligned kv_len 8200 it leaves its tile padding (rows `rows..mpad`) exactly zero, in both
+/// of its output paths. See `run_cm1_prefill_case`.
+///
+/// The cm1 kernel is coopmat SPIR-V, so it runs only where the driver assembles coopmat (see
+/// [`coopmat_assembles`]): the discrete card, under the lease named in
+/// `INFR_PARITY_DISCRETE_LEASE`. Elsewhere it reports `SKIPPED: no case ran`.
+#[test]
+fn kv_prefill_q4_0_head_dim_256_flash_cm1_matches_exact() {
+    const THIS: &str = "kv_prefill_q4_0_head_dim_256_flash_cm1_matches_exact";
+    let _serial = gpu_serial();
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        no_case_ran(THIS);
+        return;
+    };
+    let name = be.capabilities().name;
+    let Some(device) = device_gate(&name) else {
+        no_case_ran(THIS);
+        return;
+    };
+    if !coopmat_assembles(&name) {
+        eprintln!("skip: {device} cannot assemble the coopmat cm1 / nonfa pipelines");
+        no_case_ran(THIS);
+        return;
+    }
+    if !infr_vulkan::flash_cm1::shmem_support(be.max_shared_memory_bytes()) {
+        eprintln!(
+            "skip: {device} has {} B of shared memory, the cm1 tile needs {} B",
+            be.max_shared_memory_bytes(),
+            infr_vulkan::flash_cm1::shmem_bytes(256, 256, true)
+        );
+        no_case_ran(THIS);
+        return;
+    }
+    println!("device: {device}");
+
+    // Rows straddle the 16-row cm1 tile, nonfa's 64-row tile and the causal end; the 4k case walks
+    // every head, the 32k case each GQA group's first and last (the oracle is the cost).
+    let rows: &[usize] = &[0, 1, 15, 16, 63, 64, 127, 255];
+    let tile_bounds: &[usize] = &[0, 15, 16, 255];
+    let group_heads: &[usize] = &[0, 5, 6, 11, 12, 17, 18, 23];
+    let all_heads: Vec<usize> = (0..24).collect();
+    // Two short shapes put tile padding INSIDE a workgroup's rows: at rows 24 the second Br tile
+    // holds rows 16..31 (real 16..23, pad 24..31) and 32..63 is a whole pad tile; at rows 100 the
+    // seventh tile straddles (96..111) and the eighth (112..127) is fully past the end. Both halves
+    // of the store rule, with `rows..mpad` required to come back exactly zero. kv_len 8200 is not a
+    // Bc=64 multiple, so the last block stages K/V through kvsh instead of reading it straight from
+    // global memory — on the f16 leg too, the only leg that has the choice.
+    let tail_24: &[usize] = &[0, 1, 15, 16, 22, 23];
+    let tail_100: &[usize] = &[0, 15, 16, 95, 96, 99];
+    let cases: [(usize, usize, &[usize], &[usize]); 4] = [
+        (256, 4096, rows, &all_heads),
+        (256, 32768, tile_bounds, group_heads),
+        (24, 8200, tail_24, group_heads),
+        (100, 8200, tail_100, group_heads),
+    ];
+
+    let mut failures = Vec::new();
+    for (rows, kv_len, rows_sample, heads_sample) in cases {
+        for leg in run_cm1_prefill_case(&be, 24, 4, 256, kv_len, rows, rows_sample, heads_sample) {
+            if let Err(e) = leg {
+                eprintln!("FAIL: {e}");
+                failures.push(e);
+            }
+        }
+    }
+    if !failures.is_empty() {
+        panic!(
+            "{} cm1 prefill leg(s) fell outside the tolerance (2x the other leg's distance from \
+             exact beyond the f16 floor, or 4x the floor outright):\n{}",
             failures.len(),
             failures.join("\n")
         );

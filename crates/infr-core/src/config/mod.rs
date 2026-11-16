@@ -311,6 +311,15 @@ cfg_struct! {
         /// 253 t/s). A/B switch for that reroute; see
         /// `infr_vulkan::adapter::prefill_attn_tier`.
         nc_fa_wide: bool = false,
+        /// `INFR_FLASH_CM1` (a real boolean: `1`/`true`/`yes`/`on` vs `0`/`false`/`no`/`off`, any
+        /// other value a config error) — opt-in: the coopmat-1 flash prefill at head_dim 256
+        /// (`attn_flash_cm1.comp`, S/P/O in shared memory, q4_0 KV decoded in-shader). DEFAULT OFF:
+        /// it is the CLOSER leg to the exact f64 oracle (max error 1.57e-4 / 1.14e-4 at kv 4k / 32k
+        /// vs nonfa's 1.92e-4 / 2.69e-4, 7900 XTX) and saves ~0.86 GB at 32k depth, but measures
+        /// SLOWER prefill: 512 @d4k 881.8 vs 913.3 t/s (-3.5%) and @d32k 508.7 vs 558.7 (-9%).
+        /// Off routes hd-256 prefill back to the non-FA coopmat pipeline; A/B switch for that
+        /// reroute, see `infr_vulkan::adapter::prefill_attn_tier`.
+        flash_cm1: bool = false,
         /// `INFR_NO_QK_WARP` (inverted).
         qk_warp: bool = true,
         /// `INFR_NO_PV_WARP` (inverted).
@@ -830,8 +839,8 @@ pub enum ConfigError {
         path: String,
     },
     /// An environment variable held a value the engine rejects LOUDLY today (`INFR_SG`,
-    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists). Those keep erroring — that is
-    /// the behaviour being preserved, not an `unwrap_or` (R1).
+    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists, `INFR_FLASH_CM1`). Those keep
+    /// erroring — that is the behaviour being preserved, not an `unwrap_or` (R1).
     #[error("{key}: {message}")]
     Env {
         /// The `INFR_*` variable.

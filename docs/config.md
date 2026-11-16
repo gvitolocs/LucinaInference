@@ -100,9 +100,12 @@ Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "b
 
 Note the asymmetry with the environment, which is frozen at today's behaviour:
 `ctx = "banana"` in a file fails to load, while `INFR_CTX=banana` is silently
-ignored and falls back. Five environment keys do reject a bad value loudly, at
+ignored and falls back. Six environment keys do reject a bad value loudly, at
 startup, on every subcommand: `INFR_SG`, `INFR_SUBMIT_DISPATCHES`,
-`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`.
+`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`, and
+`INFR_FLASH_CM1` — the one env knob whose grammar is a plain boolean (the same
+spellings the file and `--set` accept, `=2` refused), which is how a default-OFF
+opt-in switch is spelled positively instead of under an `INFR_NO_*` name.
 
 ### Diagnostics announce themselves
 
@@ -218,7 +221,10 @@ and these exist to force one off when bisecting a correctness or perf problem.
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
   tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
-  `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
+  `flash_min_rows`, `pv_splits`, plus the two wide-head reroutes that DEFAULT
+  off — `nc_fa_wide` and `flash_cm1`, both closer to the exact oracle and both
+  slower prefill than the non-FA coopmat route they replace), DeltaNet
+  (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
   `no_replay`, `no_vram_guard`, the BDA chunk caps, and `bda_block_min_mib` —
   the MiB floor of a resident-BDA weight arena block, whose cost in stranded

@@ -10,17 +10,20 @@
 //!
 //! **R5 — no behaviour here.** This module turns strings into `Option<T>` and nothing else. No
 //! clamping, no defaulting, no policy. The only "logic" is per-KEY grammar (presence vs
-//! `presence-inv` vs `flag_from` vs an exact string literal), which IS the string→value step, and
-//! the handful of keys that reject a bad value LOUDLY today and must keep doing so.
+//! `presence-inv` vs `flag_from` vs a strict bool vs an exact string literal), which IS the
+//! string→value step, and the handful of keys that reject a bad value LOUDLY today and must keep
+//! doing so.
 //!
 //! Polarity: a config field is named for the thing being ENABLED. An `INFR_NO_*` key therefore
 //! emits `Some(false)` when it is PRESENT and `None` when it is absent — never `Some(true)`. Note
 //! `INFR_NO_FOO=0` still turns the feature OFF: only presence matters. The
-//! four `budget::flag_from` keys are the exception, where `"0"` and `""` mean off.
+//! four `budget::flag_from` keys are the exception, where `"0"` and `""` mean off. `Grammar::Bool`
+//! is the other exception: positively spelled, its VALUE is what counts, and a value that is not a
+//! boolean is an error — so turning a default-OFF field on never needs a differently-named key.
 
 use std::path::PathBuf;
 
-use super::{ConfigError, PartialConfig};
+use super::{ConfigError, ConfigValue, PartialConfig};
 use crate::{DType, SizeSpec};
 
 /// An environment reader: variable name → value, `None` when unset. An empty value is
@@ -52,6 +55,19 @@ fn set_not_zero(get: Get, key: &str) -> Option<bool> {
 /// Set AND `!= "0"` ⇒ the (positive) field is FALSE — the `INFR_CPU_NO_SPINPOOL` spelling.
 fn set_not_zero_inv(get: Get, key: &str) -> Option<bool> {
     get(key).map(|v| v == "0")
+}
+
+/// A real boolean, ERRORING on anything else — the `Grammar::Bool` reading. The spelling is the
+/// ONE `bool` grammar of the file/`--set` layers ([`ConfigValue`]), so `INFR_FLASH_CM1=on` cannot
+/// mean something different depending on which layer it was typed into, and `=2` is refused at
+/// startup instead of silently meaning on the way a presence knob would.
+fn bool_strict(get: Get, key: &'static str) -> Result<Option<bool>, ConfigError> {
+    let Some(raw) = get(key) else {
+        return Ok(None);
+    };
+    <bool as ConfigValue>::parse_set(&raw)
+        .map(Some)
+        .map_err(|message| ConfigError::Env { key, message })
 }
 
 /// A numeric knob whose bad value falls back to the default today: unparseable ⇒ this layer did
@@ -247,6 +263,9 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // Positive spelling of a default-OFF field: set and `!= "0"` turns the hd>128 reroute on;
     // unset or `=0` keeps the non-FA coopmat route.
     v.nc_fa_wide = set_not_zero(get, "INFR_NC_FA_WIDE");
+    // The hd-256 cm1 flash prefill: a default-OFF field with a positively spelled key, so `=1`
+    // turns it on, `=0`/unset keeps the non-FA route, and a typo is an error rather than a guess.
+    v.flash_cm1 = bool_strict(get, "INFR_FLASH_CM1")?;
     v.qk_warp = presence_inv(get, "INFR_NO_QK_WARP");
     v.pv_warp = presence_inv(get, "INFR_NO_PV_WARP");
     v.pv_splits = opt_num(get, "INFR_PV_SPLITS");

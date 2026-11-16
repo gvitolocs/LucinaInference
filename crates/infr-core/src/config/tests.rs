@@ -84,6 +84,9 @@ fn default_config_matches_documented_defaults() {
     assert!(!d.kernels.vulkan.mmv_decode);
     assert_eq!(d.kernels.vulkan.mmv_mw, None);
     assert_eq!(d.kernels.vulkan.flash_min_rows, 24);
+    // The hd-256 cm1 flash prefill is OFF unless `INFR_FLASH_CM1`/`kernels.vulkan.flash_cm1` says
+    // otherwise — it loses to the non-FA coopmat route on prefill speed (see the knob's doc).
+    assert!(!d.kernels.vulkan.flash_cm1);
     assert_eq!(d.kernels.vulkan.moe_small_m, 8);
     assert_eq!(d.kernels.vulkan.canvas_chunk_n, 3);
     assert!(
@@ -251,7 +254,12 @@ fn bad_value_is_an_error_not_a_silent_default() {
         // Only the value-carrying grammars can HAVE a bad value; a presence knob accepts anything.
         if !matches!(
             key.grammar,
-            Grammar::Int | Grammar::Float | Grammar::Size | Grammar::Mib | Grammar::DeviceList
+            Grammar::Int
+                | Grammar::Float
+                | Grammar::Size
+                | Grammar::Mib
+                | Grammar::DeviceList
+                | Grammar::Bool
         ) {
             continue;
         }
@@ -529,6 +537,46 @@ fn non_presence_grammars_are_preserved() {
         assert_eq!(
             cfg.kernels.cpu.spinpool, want,
             "INFR_CPU_NO_SPINPOOL={value:?}"
+        );
+    }
+    // `Grammar::Bool` — the one env grammar whose VALUE means what it says and whose bad values
+    // are refused. `INFR_FLASH_CM1` is the hd-256 cm1 flash prefill, OFF by default so hd 256 keeps
+    // the non-FA coopmat route. Unset must leave the field UNSPECIFIED, so a file value survives an
+    // empty environment.
+    assert!(
+        !Config::default().kernels.vulkan.flash_cm1,
+        "cm1 flash prefill defaults off"
+    );
+    for (value, want) in [
+        ("1", true),
+        ("true", true),
+        ("on", true),
+        ("yes", true),
+        ("0", false),
+        ("false", false),
+        ("off", false),
+        ("no", false),
+    ] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_FLASH_CM1", value)])]);
+        assert_eq!(
+            cfg.kernels.vulkan.flash_cm1, want,
+            "INFR_FLASH_CM1={value:?}"
+        );
+    }
+    assert!(
+        Config::load_from_layers(&[
+            file_layer("[kernels.vulkan]\nflash_cm1 = true\n"),
+            env_layer(&[]),
+        ])
+        .kernels
+        .vulkan
+        .flash_cm1,
+        "unset INFR_FLASH_CM1 must not clobber the file"
+    );
+    for value in ["2", "", "banana"] {
+        assert!(
+            try_env_layer(&[("INFR_FLASH_CM1", value)]).is_err(),
+            "INFR_FLASH_CM1={value:?} is not a boolean and must be refused, not guessed"
         );
     }
     // Tri-state: unset = vendor default, "0" = force off, anything else = force on.
@@ -1420,6 +1468,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
         "INFR_NC_FA_WIDE",
+        "INFR_FLASH_CM1",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

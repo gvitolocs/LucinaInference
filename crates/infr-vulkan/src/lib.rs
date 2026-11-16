@@ -12,6 +12,7 @@
 mod adapter;
 mod caps;
 pub mod ep;
+pub mod flash_cm1;
 mod gemm;
 pub mod linear;
 mod matmul;

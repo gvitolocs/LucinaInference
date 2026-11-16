@@ -51,6 +51,11 @@ pub enum Grammar {
     SetNotZeroInv,
     /// `"0"` ⇒ `Some(false)`, any other value ⇒ `Some(true)`, unset ⇒ `None`.
     TriState,
+    /// A real boolean, the SAME spelling as the file/`--set` `bool` grammar (`1`/`true`/`yes`/`on`
+    /// vs `0`/`false`/`no`/`off`); anything else is an error, not a fallback. Unlike every presence
+    /// grammar the VALUE means what it says, which is how a default-OFF field gets turned on: by
+    /// the feature's own name, never by an `INFR_NO_*` key whose `=1` would mean the opposite.
+    Bool,
     /// An integer.
     Int,
     /// A float.
@@ -73,10 +78,11 @@ pub enum Grammar {
 
 /// What a BAD value does in the ENVIRONMENT layer today — which R1 freezes.
 ///
-/// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); five reject it loudly and
-/// must keep doing so. The FILE layer is stricter for everyone: a value that does not parse into
-/// a known key's type is always a hard error there, which is why `ctx = "banana"` fails to load
-/// from a file while `INFR_CTX=banana` is still silently ignored.
+/// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); six reject it loudly and must
+/// keep doing so — the five R1 froze plus the `Bool` knob, whose grammar has no swallowable value.
+/// The FILE layer is stricter for everyone: a value that does not parse into a known key's type is
+/// always a hard error there, which is why `ctx = "banana"` fails to load from a file while
+/// `INFR_CTX=banana` is still silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BadValue {
     /// Falls back to the default. The layer reports "not specified".
@@ -203,6 +209,7 @@ knobs! {
     "INFR_NO_FLASH_WARP"  => "kernels.vulkan.flash_warp",       PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_NC_FA"       => "kernels.vulkan.nc_fa",            PresenceInv,      Ignored, "1",  migrated;
     "INFR_NC_FA_WIDE"     => "kernels.vulkan.nc_fa_wide",       SetNotZero,       Ignored, "1",  migrated;
+    "INFR_FLASH_CM1"      => "kernels.vulkan.flash_cm1",        Bool,             Error,   "1",  migrated;
     "INFR_NO_QK_WARP"     => "kernels.vulkan.qk_warp",          PresenceInv,      Ignored, "1",  migrated;
     "INFR_NO_PV_WARP"     => "kernels.vulkan.pv_warp",          PresenceInv,      Ignored, "1",  migrated;
     "INFR_PV_SPLITS"      => "kernels.vulkan.pv_splits",        Int,              Ignored, "2",  migrated;

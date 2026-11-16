@@ -1,8 +1,8 @@
 #version 460
 // Flash-attention split-K combine: merge the n_splits partials (Os_s, m_s, l_s) per (query row,
 // head) into the final O. global m = max_s m_s; O = Σ_s exp(m_s-m)·Os_s; l = Σ_s exp(m_s-m)·l_s;
-// out = O/l. One workgroup per (row, head); thread d owns output element d. Plain rescale-sum (no
-// coopmat, no cross-workgroup writes) — each output is computed by one workgroup reading disjoint
+// out = O/l. One workgroup per (row, head); thread d owns output elements d, d+128, ... Plain
+// rescale-sum (no coopmat, no cross-workgroup writes) — each output is computed by one workgroup reading disjoint
 // partial slices, so no race (unlike the deleted split-K flash whose combine raced on RADV).
 #extension GL_KHR_shader_subgroup_basic : require
 
@@ -18,21 +18,22 @@ void main() {
     uint unit = gl_WorkGroupID.x;     // row*nh + head
     uint row = unit / pc.nh;
     uint h = unit % pc.nh;
-    uint d = gl_LocalInvocationID.x;
-    if (d >= pc.hd) { return; }
-
-    // global max + per-split weights (n_splits small; each thread recomputes — cheap)
-    float m = -1e30;
-    for (uint s = 0u; s < pc.n_splits; s++) {
-        m = max(m, pm[(s * pc.mpad + row) * pc.nh + h]);
+    // Thread d owns output dims d, d+128, ... — one pass for hd <= 128, two for the hd 256
+    // attn_flash_cm1 partials.
+    for (uint d = gl_LocalInvocationID.x; d < pc.hd; d += gl_WorkGroupSize.x) {
+        // global max + per-split weights (n_splits small; each thread recomputes — cheap)
+        float m = -1e30;
+        for (uint s = 0u; s < pc.n_splits; s++) {
+            m = max(m, pm[(s * pc.mpad + row) * pc.nh + h]);
+        }
+        float acc = 0.0;
+        float l = 0.0;
+        for (uint s = 0u; s < pc.n_splits; s++) {
+            float ms = pm[(s * pc.mpad + row) * pc.nh + h];
+            float w = exp(ms - m);
+            acc += w * po[((s * pc.mpad + row) * pc.nh + h) * pc.hd + d];
+            l += w * pl[(s * pc.mpad + row) * pc.nh + h];
+        }
+        o[row * (pc.nh * pc.hd) + h * pc.hd + d] = (l > 0.0) ? acc / l : 0.0;
     }
-    float acc = 0.0;
-    float l = 0.0;
-    for (uint s = 0u; s < pc.n_splits; s++) {
-        float ms = pm[(s * pc.mpad + row) * pc.nh + h];
-        float w = exp(ms - m);
-        acc += w * po[((s * pc.mpad + row) * pc.nh + h) * pc.hd + d];
-        l += w * pl[(s * pc.mpad + row) * pc.nh + h];
-    }
-    o[row * (pc.nh * pc.hd) + h * pc.hd + d] = (l > 0.0) ? acc / l : 0.0;
 }
