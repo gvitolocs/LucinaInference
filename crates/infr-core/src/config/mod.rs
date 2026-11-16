@@ -367,6 +367,25 @@ cfg_struct! {
         bda_chunk_elems: Option<u64> = None,
         /// `INFR_BDA_CHUNK_BYTES`: byte cap per BDA addressing unit.
         bda_chunk_bytes: Option<u64> = None,
+        /// `INFR_BDA_BLOCK_MIN_MIB`: the size floor, in MiB, of one resident-BDA weight arena block
+        /// (`infr-vulkan`'s `BdaWeightArena`), minimum **1** — `Config::validate` refuses 0 in every
+        /// layer, because 0 means one dedicated `vkAllocateMemory` per small weight. Every block that
+        /// gets opened because a tensor didn't fit the previous one is at least this big, so the
+        /// difference between the floor and what a block actually holds is stranded VRAM: MEASURED at
+        /// 2,299 MiB stranded over 267 blocks on a Qwen3.8-27B load with the old 64 MiB floor, 2 MiB
+        /// over 410 blocks at 4 MiB. Raising it trades stranded bytes for `vkAllocateMemory` calls at
+        /// load.
+        ///
+        /// Two device limits bear on what a value can actually do, and neither is an error to set: one
+        /// block is capped at the device's `maxMemoryAllocationSize` (Maintenance3 properties, ~4 GiB
+        /// on RADV), so an oversized value lands on that cap rather than failing the alloc; and
+        /// inside `BDA_ALLOC_HEADROOM` allocations of the device's `maxMemoryAllocationCount` the
+        /// arena raises its floor to the larger 64 MiB regardless (`infr-vulkan`'s
+        /// `bda_alloc_floor_for_count`), so the weights still to come pack into fewer, bigger blocks.
+        /// That raise is a mitigation, not a cap on the count: blocks keep opening while the weights
+        /// need them, so a small floor on a device with a tight allocation budget can still be what
+        /// runs the slots out.
+        bda_block_min_mib: usize = 4,
         }
     }
 }
@@ -852,6 +871,7 @@ impl Config {
         let env_layer = ConfigLayer::env()?;
         let cli_layer = ConfigLayer::cli(overrides)?;
         let cfg = Config::load_from_layers(&[file_layer.clone(), env_layer, cli_layer]);
+        cfg.validate()?;
         // The file MAY set the diagnostic knobs, but it has to say so — otherwise
         // "why is my server printing timings" is unanswerable from the command line.
         if let Some(path) = &file_path {
@@ -860,6 +880,27 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    /// Refuse a RESOLVED value the engine cannot use. [`Config::load_from_layers`] is infallible by
+    /// design (it is the fold, not a policy check), so this is where a value that parsed fine but
+    /// means something the code will not do gets rejected — once, over the FOLDED config, so it
+    /// catches the file layer and `--set` and the env layer alike.
+    ///
+    /// The env layer refuses the same values at its own site too ([`env::parse`]), because that is
+    /// the one fold the backends read directly (`VulkanBackend::new` builds `Default < env` without
+    /// a file or CLI layer), and an unmigrated read site's own error text must not be pre-empted (R1).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.kernels.vulkan.bda_block_min_mib == 0 {
+            return Err(ConfigError::Value {
+                path: "kernels.vulkan.bda_block_min_mib".to_string(),
+                message:
+                    "must be at least 1 MiB — 0 floors no block at all, so every small weight \
+                          would take its own dedicated `vkAllocateMemory`"
+                        .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The `Default` < environment fold, with no file and no CLI layer.

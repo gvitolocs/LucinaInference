@@ -156,6 +156,10 @@ push_desc = true
 pipeline_cache_disk = true
 gpu_pos = true
 fuse_add = true
+# Size floor of one resident-BDA weight arena block, in MiB. Every block opened because a tensor
+# didn't fit the previous one is at least this big, so floor minus contents = stranded VRAM.
+# Measured on Qwen3.8-27B: 64 -> 2,299 MiB stranded over 267 blocks; 4 -> 2 MiB over 410 blocks.
+bda_block_min_mib = 4
 no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 
 [kernels.cpu]

@@ -284,6 +284,23 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n >= 2)
         .map(Some);
+    // A floor of `0` floors NOTHING: it puts one dedicated `vkAllocateMemory` behind every small
+    // weight, which is the opposite of what the knob is for. Refused rather than clamped, and
+    // `Config::validate` refuses it again on the folded config so the file layer and `--set` cannot
+    // slip past it. An UNPARSEABLE value keeps the manifest's `Ignored` policy — it falls back to
+    // the default like every other Int knob in this layer.
+    if let Some(raw) = get("INFR_BDA_BLOCK_MIN_MIB") {
+        match raw.trim().parse::<usize>() {
+            Ok(0) => {
+                return Err(ConfigError::Env {
+                    key: "INFR_BDA_BLOCK_MIN_MIB",
+                    message: "must be at least 1 MiB — 0 floors no block at all".to_string(),
+                })
+            }
+            Ok(n) => v.bda_block_min_mib = Some(n),
+            Err(_) => {}
+        }
+    }
 
     // `GemvKnobs::resolve`, verbatim — this whole group is already a pure resolver today.
     let g = &mut v.gemv;

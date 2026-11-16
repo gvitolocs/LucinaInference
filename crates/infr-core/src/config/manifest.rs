@@ -229,6 +229,11 @@ knobs! {
     "INFR_BDA_CHUNK_ELEMS" => "kernels.vulkan.bda_chunk_elems", Int, Ignored, "1024", migrated;
     "INFR_BDA_CHUNK_BYTES" => "kernels.vulkan.bda_chunk_bytes", Int, Ignored, "4096", migrated;
 
+    // ── kernels.vulkan — resident-BDA weight arena ───────────────────────────
+    // The MiB floor of one arena block; the stranded-tail cost of every value of it is measured on
+    // the 27B in `infr-vulkan`'s `bda_gguf_matches_the_measured_27b_arena`. `0` is refused (minimum 1).
+    "INFR_BDA_BLOCK_MIN_MIB" => "kernels.vulkan.bda_block_min_mib", Int, Ignored, "4", migrated;
+
     // ── kernels.vulkan.gemv ──────────────────────────────────────────────────
     "INFR_NO_GEMV_RM"     => "kernels.vulkan.gemv.no_rm",     Presence,       Ignored, "1",     migrated;
     "INFR_GEMV_RM"        => "kernels.vulkan.gemv.rm",        Int,            Ignored, "4",     migrated;

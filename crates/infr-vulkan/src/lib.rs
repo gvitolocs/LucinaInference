@@ -275,6 +275,13 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
+    /// `maxMemoryAllocationCount` — how many `vkAllocateMemory`s this device accepts IN TOTAL
+    /// (`VkPhysicalDeviceLimits`; Vulkan guarantees 4096, drivers report far more or nothing). The
+    /// COUNT half of the allocation limits, where [`Self::max_mem_alloc_size`] is the SIZE half:
+    /// the resident-BDA weight arena opens one dedicated allocation per block, so a small block
+    /// floor is what makes this one worth watching — see [`bda_alloc_floor_for_count`]. `0` = the
+    /// device did not report it, which turns the guard off rather than refusing everything.
+    max_mem_alloc_count: u64,
     /// `maxPushConstantsSize` — every kernel's push block is checked against THIS rather than
     /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
     /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
@@ -691,9 +698,12 @@ const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
         | vk::BufferUsageFlags::INDIRECT_BUFFER.as_raw(),
 );
 
-/// On-demand block size floor for a resident-BDA arena block (see [`BdaWeightArena`]) — big enough
-/// to amortize a dedicated `vkAllocateMemory` across a run of small tensors, small enough not to
-/// waste much on the tail.
+/// The original 64 MiB "amortize one `vkAllocateMemory` across a run of small tensors" block size.
+/// The resident-BDA weight arena does NOT floor itself at this any more — it has its own, much
+/// smaller [`BDA_BLOCK_MIN`] (measured: 2,299 MiB of the 27B's VRAM was sitting in this size's block
+/// tails). It still sizes one live decision: [`bda_alloc_floor_for_count`] substitutes it as the
+/// fallback floor once the device's `maxMemoryAllocationCount` slots run short, so a model that
+/// would otherwise open hundreds more allocations packs the remaining weights into blocks this big.
 const ARENA_OVERFLOW_BLOCK: u64 = 64 * 1024 * 1024;
 
 /// The UMA OVERFLOW memory type: a host-visible type on a NON-device-local heap. `None` on a
@@ -788,6 +798,67 @@ const GUARD_HEADROOM: u64 = 256 * 1024 * 1024;
 /// is let through unasked. Public so a caller proving that an allocation set MUST be refused (the
 /// seam's KV refuse rung) can count exactly the allocations the guard will see.
 pub const VRAM_GUARD_MIN_ALLOC: u64 = 1 << 20;
+
+/// The budget proper: what device-local bytes an allocation may land on, `total` minus
+/// [`GUARD_HEADROOM`]. Saturating so a `total` of 0 — a device the probe could not read — leaves a
+/// budget of 0 and refuses, rather than waving the first big allocation through.
+fn vram_budget_at(total: u64) -> u64 {
+    total.saturating_sub(GUARD_HEADROOM)
+}
+
+/// Does a device-local allocation of `want` bytes fit that budget, given what is already `used`?
+/// Saturating so a `used` already past the budget never wraps into a permission. The non-erroring
+/// probe ([`VulkanBackend::vram_budget_fits`]) answers exactly this and nothing else; the hard guard
+/// answers it through [`vram_guard_decide`], which is how the two agree to the byte on where
+/// "full" is.
+fn vram_budget_fits_at(want: u64, used: u64, total: u64) -> bool {
+    used.saturating_add(want) <= vram_budget_at(total)
+}
+
+/// One alloc-time VRAM guard verdict — the entire output of
+/// [`VulkanBackend::check_vram_budget`]'s decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VramGuard {
+    /// The check did not run: `want` under [`VRAM_GUARD_MIN_ALLOC`], or the sanctioned
+    /// `kernels.vulkan.no_vram_guard` escape hatch.
+    Skipped,
+    /// The allocation is allowed.
+    Fits,
+    /// Refuse it, with every number the error message prints — so the message-building path computes
+    /// no arithmetic of its own and cannot drift from this decision.
+    Over {
+        want: u64,
+        used: u64,
+        budget: u64,
+        total: u64,
+    },
+}
+
+/// The guard's whole decision, in one pure place: the skip, the budget arithmetic, and the numbers
+/// a refusal carries. `device` is the driver read — `(used, total)` — and is called ONLY when the
+/// guard actually runs, because the sub-MiB skip exists to avoid exactly that query.
+fn vram_guard_decide(
+    want: u64,
+    no_vram_guard: bool,
+    device: impl FnOnce() -> (/*used*/ u64, /*total*/ u64),
+) -> VramGuard {
+    if no_vram_guard || want < VRAM_GUARD_MIN_ALLOC {
+        return VramGuard::Skipped;
+    }
+    let (used, total) = device();
+    if vram_budget_fits_at(want, used, total) {
+        VramGuard::Fits
+    } else {
+        // The refusal names the budget it ran out of, so compute it for the message too.
+        let budget = vram_budget_at(total);
+        VramGuard::Over {
+            want,
+            used,
+            budget,
+            total,
+        }
+    }
+}
 
 /// Free bytes on the DEVICE-LOCAL heaps alone — what the UMA spill decision keys off (unlike
 /// [`vram_info`]'s UMA figure, which spans every heap). Live VK_EXT_memory_budget when present, so
@@ -977,12 +1048,98 @@ const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 /// widest today is a 16-byte vec4 load) with headroom to spare for future wider kernels.
 const BDA_WEIGHT_ALIGN: u64 = 256;
 
-/// Minimum size for a resident-BDA arena block (see [`VulkanBackend::bda_weight_alloc`]). Blocks
-/// are opened ON DEMAND — one per call that outgrows the current block's remainder — so without a
-/// floor a run of small tensors would each pay for a separate dedicated `vkAllocateMemory`. Reuses
-/// [`ARENA_OVERFLOW_BLOCK`]'s size: the same "big enough to amortize, small enough not to waste"
-/// reasoning applies unchanged.
-const BDA_BLOCK_MIN: u64 = ARENA_OVERFLOW_BLOCK;
+/// Default minimum size for a resident-BDA arena block (see [`VulkanBackend::bda_weight_alloc`]),
+/// overridable by `kernels.vulkan.bda_block_min_mib` / `INFR_BDA_BLOCK_MIN_MIB`. Blocks are opened
+/// ON DEMAND — one per call that outgrows the current block's remainder — so without a floor a run
+/// of small tensors would each pay for a separate dedicated `vkAllocateMemory`.
+///
+/// MEASURED on the 8060S, Qwen3.8-27B-UD-Q4_K_XL (851 weight carves, none fused — the XL dtype
+/// mix defeats both fusion gates): with this floor at 64 MiB the carves land in 267 blocks and
+/// strand 2,299 MiB in their tails against 16,400 MiB of real weights, 76 % of it from the
+/// `ffn_gate`/`ffn_up`/`ffn_down` trio alone. At 4 MiB: 410 blocks, 2.0 MiB stranded. Below 4 MiB
+/// buys nothing (1 MiB → 437 blocks, 1.0 MiB stranded) and a mid-size floor is worse than either end
+/// (8 MiB → 50 MiB stranded, 128 MiB → 892 MiB). The price is +143 `vkAllocateMemory` calls,
+/// load-only, which [`VulkanBackend::make_buf_ex`]'s own doc sanctions ("fine once per tensor at
+/// load, wrong per token"). `bda_gguf_matches_the_measured_27b_arena` replays both floors off the
+/// GGUF header, no device needed.
+///
+/// llama.cpp never pays a floor at all: `ggml_backend_alloc_ctx_tensors_from_buft_impl` sizes each
+/// backend buffer to exactly the sum of the padded tensors it is about to hold, splitting only at the
+/// buffer type's `max_size` (llama.cpp 3612199ed, `ggml/src/ggml-alloc.c:1173` and :1181-1197), and
+/// `alloc_tensor_range` hands that sum straight to `ggml_backend_buft_alloc_buffer` (:1132) — one
+/// allocation per run of tensors, sized to it, so there is no fixed block for a tail to get stuck in.
+const BDA_BLOCK_MIN: u64 = 4 * 1024 * 1024;
+
+/// How many of the device's `maxMemoryAllocationCount` allocation slots the resident-BDA weight
+/// arena leaves unclaimed for everyone else. Every arena block is one dedicated
+/// `vkAllocateMemory`, and at [`BDA_BLOCK_MIN`]'s floor a 27B takes ~410 of them where the old 64 MiB
+/// floor took 267 — so the COUNT needs a bound of its own next to the size bound
+/// (`max_mem_alloc_size`). 256 is deliberately not tight: the staging ring, the KV cache, the
+/// pipeline cache and the driver's own allocations are all still to come when a model loads, and
+/// Vulkan only guarantees 4096 allocations per device (`VkPhysicalDeviceLimits`, the value this is
+/// checked against at runtime).
+const BDA_ALLOC_HEADROOM: u64 = 256;
+
+/// The allocation-COUNT half of the floor decision, pure so it is testable without a device.
+///
+/// `blocks_opened` is what THIS arena has committed (`baseline` is the allocator's live block count
+/// from just before its first block, so the two together estimate the device's live count without
+/// walking the allocator's whole report per alloc — `generate_report` is a reporting path's price,
+/// see [`VulkanBackend::vram_committed`]). While at least [`BDA_ALLOC_HEADROOM`] slots remain under
+/// `max_allocations`, `configured` stands. Inside the margin the arena does NOT stop opening blocks
+/// (a tensor that fits nowhere must still land somewhere, and refusing it would fail the load): it
+/// raises its floor to `fallback`, so the remaining weights pack into a handful of large blocks
+/// instead of hundreds of small ones. That is strictly better than an allocation failure, and it is
+/// the old 64 MiB behaviour ([`ARENA_OVERFLOW_BLOCK`]) — the trade the knob exists to avoid, taken
+/// only when the device's slot budget forces it.
+///
+/// `max_allocations == 0` means the device did not report the limit: no guard, `configured` stands.
+fn bda_alloc_floor_for_count(
+    baseline: u64,
+    blocks_opened: u64,
+    max_allocations: u64,
+    headroom: u64,
+    configured: u64,
+    fallback: u64,
+) -> u64 {
+    if max_allocations == 0 {
+        return configured;
+    }
+    let live = baseline.saturating_add(blocks_opened);
+    if live.saturating_add(headroom) >= max_allocations {
+        fallback.max(configured)
+    } else {
+        configured
+    }
+}
+
+/// The resident-BDA arena's whole floor decision: what the knob asked for, and what the device
+/// allows. [`VulkanBackend::bda_weight_alloc`] computes nothing else to reach a floor, so these two
+/// numbers are the ones a load runs on — and a test here is a test of that site, not of a copy of it.
+///
+/// `configured` is [`BDA_BLOCK_MIN`]'s knob (its DEFAULT is the constant; the resolved value is what
+/// this scales, so the two ends of the trade can be A/B'd on one model without a rebuild). `floor`
+/// then applies the COUNT half of the device's allocation limits
+/// ([`bda_alloc_floor_for_count`], next to the size half [`plan_bda`] applies).
+fn bda_floor_for_device(
+    block_min_mib: usize,
+    baseline_allocations: u64,
+    blocks_opened: u64,
+    max_mem_alloc_count: u64,
+) -> (/*configured*/ u64, /*floor*/ u64) {
+    let configured = (block_min_mib as u64).saturating_mul(1 << 20);
+    (
+        configured,
+        bda_alloc_floor_for_count(
+            baseline_allocations,
+            blocks_opened,
+            max_mem_alloc_count,
+            BDA_ALLOC_HEADROOM,
+            configured,
+            ARENA_OVERFLOW_BLOCK,
+        ),
+    )
+}
 
 /// Upper bound on ONE resident-BDA addressing unit's byte size (see [`BdaWeightArena`]'s addressing
 /// invariant). The 64-bit promotion protects the arena/expert BASE, but a tensor's (or a per-expert
@@ -1040,9 +1197,58 @@ struct BdaArenaBlock {
 /// offsets remain u32 — each addressing unit (one dense tensor / one per-expert slice) must stay
 /// < 4 Gi elements and < 4 GiB bytes; enforced today by model reality, revisit for >4 GiB single
 /// tensors.
-#[derive(Default)]
 struct BdaWeightArena {
     blocks: Vec<BdaArenaBlock>,
+    /// Allocator blocks (≈ `vkAllocateMemory` calls) live just before this arena's FIRST block,
+    /// sampled once by [`VulkanBackend::bda_weight_alloc`] — the base the allocation-count guard
+    /// ([`bda_alloc_floor_for_count`]) adds its own `blocks.len()` to. Sampled once, not per block:
+    /// the only unbounded grower during a weight load is this arena, and reading the allocator's
+    /// report is a reporting path's price.
+    baseline_allocations: u64,
+    /// The count guard has fired and been reported once (see `bda_weight_alloc`'s warning).
+    count_backoff_logged: bool,
+}
+
+/// What [`plan_bda`] decided about one resident-BDA weight request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BdaPlace {
+    /// Carve it out of the block at `index` (position in the arena's creation order), starting at
+    /// the [`BDA_WEIGHT_ALIGN`]-aligned `offset`.
+    Fit { index: usize, offset: u64 },
+    /// No open block had room, so open a new one of `block_size` bytes; the tensor starts at 0.
+    Open { block_size: u64 },
+}
+
+/// The placement unit of a resident-BDA request: its logical size rounded up to
+/// [`BDA_WEIGHT_ALIGN`], with a zero-byte tensor claiming one unit so it still gets a distinct
+/// device address.
+fn bda_want(size: u64) -> u64 {
+    size.max(1).next_multiple_of(BDA_WEIGHT_ALIGN)
+}
+
+/// The whole placement decision of [`BdaWeightArena`], as a pure function: FIRST-FIT over the open
+/// blocks in creation order, else a new block of `bda_want(size).max(floor).min(max_alloc)`.
+///
+/// `blocks` is each open block's `(capacity, cursor)` in creation order — the only two numbers per
+/// block this decision reads; the `VkBuffer`/device-address/accounting side lives in
+/// [`VulkanBackend::bda_weight_alloc`], which is a thin driver over the answer.
+///
+/// First-fit (the earliest block with room, not the last one) is what stops a big exact-size block
+/// stranding a fresh `floor` behind every small tensor that follows it, and `floor` is what stops a
+/// run of 20 KiB norms from each paying its own `vkAllocateMemory` — see [`BDA_BLOCK_MIN`] for what
+/// both ends of that trade measured on the 27B. `floor` is a parameter rather than the constant
+/// because the knob exists to be A/B'd (`kernels.vulkan.bda_block_min_mib`).
+fn plan_bda(blocks: &[(u64, /*cursor*/ u64)], size: u64, floor: u64, max_alloc: u64) -> BdaPlace {
+    let want = bda_want(size);
+    for (index, &(capacity, cursor)) in blocks.iter().enumerate() {
+        let offset = cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
+        if offset + want <= capacity {
+            return BdaPlace::Fit { index, offset };
+        }
+    }
+    BdaPlace::Open {
+        block_size: want.max(floor).min(max_alloc),
+    }
 }
 
 // ── VulkanBackend ─────────────────────────────────────────────────────────────
@@ -2275,6 +2481,11 @@ impl VulkanBackend {
         } else {
             maint3_props.max_memory_allocation_size
         };
+        // The companion COUNT limit, kept RAW (0 = unreported → the guard stands down). Unlike the
+        // size above there is no conservative fallback to invent: 4096 is what Vulkan merely
+        // guarantees, and `VulkanShared`'s own pooled blocks, staging ring, KV cache and pipeline
+        // cache already live under the same ceiling, so the arena reads the real number or nothing.
+        let max_mem_alloc_count = props.limits.max_memory_allocation_count as u64;
         let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
             .to_string_lossy()
             .into_owned();
@@ -2589,6 +2800,7 @@ impl VulkanBackend {
                 caps,
                 has_mem_budget,
                 max_mem_alloc_size,
+                max_mem_alloc_count,
                 max_push_constants: props.limits.max_push_constants_size,
                 rte_f16: AtomicBool::new(false),
                 i8cm_layout_ok: OnceLock::new(),
@@ -3106,22 +3318,22 @@ impl VulkanBackend {
     /// Sub-MiB allocations skip the check (no per-tiny-alloc driver query; they cannot
     /// individually blow the budget and stay covered by the next large allocation's check).
     fn check_vram_budget(&self, want: u64) -> Result<()> {
-        if want < VRAM_GUARD_MIN_ALLOC || self.cfg.kernels.vulkan.no_vram_guard {
-            return Ok(());
-        }
-        // The probe is the single source of truth for "does `want` fit?" so the hard guard here and
-        // the VRAM-first KV spill can never disagree (the guard errors iff the probe says it won't
-        // fit). Only build the detailed error — and re-query the driver for its fields — on failure.
-        if self.vram_budget_fits(want) {
-            return Ok(());
-        }
+        // The decision is [`vram_guard_decide`]; this supplies the driver's two numbers and carries
+        // out the answer. The closure is what keeps the sub-MiB skip free of a driver query.
+        let (want, used, budget, total) =
+            match vram_guard_decide(want, self.cfg.kernels.vulkan.no_vram_guard, || {
+                self.vram_used_total()
+            }) {
+                VramGuard::Skipped | VramGuard::Fits => return Ok(()),
+                VramGuard::Over {
+                    want,
+                    used,
+                    budget,
+                    total,
+                } => (want, used, budget, total),
+            };
+        // Only the message's two facts about HOW the numbers were obtained still need the driver.
         let v = self.vram();
-        let used = if v.live {
-            v.total.saturating_sub(v.available)
-        } else {
-            self.shared.device_used.load(Ordering::Relaxed)
-        };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
         let pool = if v.uma {
             "unified memory (all heaps — this GPU shares system RAM)"
         } else {
@@ -3143,11 +3355,25 @@ impl VulkanBackend {
                 "tracked by this process; no VK_EXT_memory_budget"
             },
             fmt_bytes(budget),
-            fmt_bytes(v.total),
+            fmt_bytes(total),
             // Who holds the `used` figure. Appended, never prepended: the message's first line is
             // what a user pastes, and every matcher of it keys on the "budget exceeded" wording.
             self.vram_breakdown_line(),
         )))
+    }
+
+    /// The two numbers the guard decides on: bytes in use on the budgeted heap(s), and that heap
+    /// set's total. The live `VK_EXT_memory_budget` reading when present (it accounts for other
+    /// processes and everything we already hold), otherwise this backend's own tracked bytes against
+    /// the reported total.
+    fn vram_used_total(&self) -> (/*used*/ u64, /*total*/ u64) {
+        let v = self.vram();
+        let used = if v.live {
+            v.total.saturating_sub(v.available)
+        } else {
+            self.shared.device_used.load(Ordering::Relaxed)
+        };
+        (used, v.total)
     }
 
     /// Non-erroring budget probe: would a device-local allocation of `want` bytes fit under the SAME
@@ -3159,14 +3385,8 @@ impl VulkanBackend {
     /// unlike the guard it ignores `INFR_NO_VRAM_GUARD` and the sub-MiB skip — it is a placement
     /// decision, not a safety gate, so it always reports the honest budget answer.
     fn vram_budget_fits(&self, want: u64) -> bool {
-        let v = self.vram();
-        let used = if v.live {
-            v.total.saturating_sub(v.available)
-        } else {
-            self.shared.device_used.load(Ordering::Relaxed)
-        };
-        let budget = v.total.saturating_sub(GUARD_HEADROOM);
-        used.saturating_add(want) <= budget
+        let (used, total) = self.vram_used_total();
+        vram_budget_fits_at(want, used, total)
     }
 
     /// First device-local memory type compatible with `type_bits` (from a buffer's requirements).
@@ -3385,9 +3605,9 @@ impl VulkanBackend {
     }
 
     /// Sub-allocate `size` bytes for a resident weight tensor from the BDA arena (see
-    /// [`BdaWeightArena`]). Bump-allocates within the current block at [`BDA_WEIGHT_ALIGN`]; when the
-    /// request doesn't fit the current block's remainder, opens a fresh dedicated block (never
-    /// splitting a tensor across two blocks). Returns a `VkBuffer` that shares the
+    /// [`BdaWeightArena`]). [`plan_bda`] makes the placement decision — a free byte range of an open
+    /// block at [`BDA_WEIGHT_ALIGN`], or a fresh dedicated block (a tensor is never split across two
+    /// blocks); this carries the answer out. It returns a `VkBuffer` that shares the
     /// block's single `vk::Buffer` handle (`Backing::BdaSub`) with `sub_offset` set to this tensor's
     /// offset within it — see that variant's doc for why the handle must never be bound as a
     /// descriptor at its full range.
@@ -3407,27 +3627,57 @@ impl VulkanBackend {
                  tensor this large needs a wider addressing scheme, not a bigger allocation"
             )));
         }
-        let want = (size as u64).max(1).next_multiple_of(BDA_WEIGHT_ALIGN);
+        let want = bda_want(size as u64);
         let mut guard = self.bda_weight_arena.lock().unwrap();
-        let arena = guard.get_or_insert_with(BdaWeightArena::default);
-
-        // First-fit over ALL open blocks, not just the last: a big tensor opens an exact-size
-        // (fully consumed) block, so last-block-only would strand every earlier block's tail and
-        // open a fresh `BDA_BLOCK_MIN` block for EACH tiny tensor that follows a big one — ~64 MiB
-        // stranded per norm gamma, GiBs across a model's layers (caught live: Qwen3-30B-A3B
-        // tripped the VRAM guard flag-on while fitting comfortably flag-off).
-        for b in arena.blocks.iter_mut() {
-            let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
-            if off + want <= b.size {
-                b.cursor = off + want;
-                return Ok(VkBuffer {
+        let arena = guard.get_or_insert_with(|| BdaWeightArena {
+            blocks: Vec::new(),
+            // The ONE device query this path makes, at the arena's first request: how many
+            // allocator blocks (≈ `vkAllocateMemory`s) are already live before we open any.
+            baseline_allocations: self.vram_committed().blocks as u64,
+            count_backoff_logged: false,
+        });
+        // The knob's floor, as the DEVICE's allocation-count budget allows it
+        // ([`bda_floor_for_device`] — see it for what each of these four inputs is).
+        let (configured, floor) = bda_floor_for_device(
+            self.cfg.kernels.vulkan.bda_block_min_mib,
+            arena.baseline_allocations,
+            arena.blocks.len() as u64,
+            self.shared.max_mem_alloc_count,
+        );
+        if floor != configured && !arena.count_backoff_logged {
+            arena.count_backoff_logged = true;
+            tracing::warn!(
+                "[infr] resident-BDA weight arena is within {BDA_ALLOC_HEADROOM} allocations of \
+                 the device's maxMemoryAllocationCount ({} live + {} opened by this arena vs {} \
+                 allowed): the remaining weights pack into {} MiB blocks instead of {} MiB ones — \
+                 stranded tail up, allocation count down",
+                arena.baseline_allocations,
+                arena.blocks.len(),
+                self.shared.max_mem_alloc_count,
+                floor >> 20,
+                configured >> 20,
+            );
+        }
+        // Where the request goes is [`plan_bda`], kept pure — with the per-block `(capacity, cursor)`
+        // snapshot it reads, the whole arithmetic is testable without a device (see
+        // `bda_gguf_matches_the_measured_27b_arena`). Everything below just carries out its answer.
+        let open: Vec<(u64, u64)> = arena.blocks.iter().map(|b| (b.size, b.cursor)).collect();
+        match plan_bda(&open, size as u64, floor, self.shared.max_mem_alloc_size) {
+            // An earlier block has room (first-fit, creation order — [`plan_bda`] for why not
+            // last-block-only; caught live as Qwen3-30B-A3B tripping the VRAM guard flag-on while
+            // fitting comfortably flag-off).
+            BdaPlace::Fit { index, offset } => {
+                let b = &mut arena.blocks[index];
+                b.cursor = offset + want;
+                let (buffer, handle) = (b.handle.buf.buffer, Arc::clone(&b.handle));
+                Ok(VkBuffer {
                     shared: Arc::clone(&self.shared),
-                    buffer: b.handle.buf.buffer,
-                    backing: Backing::BdaSub(Arc::clone(&b.handle)),
+                    buffer,
+                    backing: Backing::BdaSub(handle),
                     size,
                     mem_size: 0,
                     location: MemoryLocation::GpuOnly,
-                    sub_offset: off as usize,
+                    sub_offset: offset as usize,
                     // `device_addr()` derives a `BdaSub`'s address from the block's `base_addr` +
                     // `sub_offset` — no own address needed here.
                     own_addr: None,
@@ -3440,67 +3690,65 @@ impl VulkanBackend {
                             .vram_stats
                             .charge_carve(crate::vram_stats::UNTRACKED_ARENA, size as u64),
                     )),
+                })
+            }
+            // No open block has room: a fresh dedicated block, floored and capped exactly as
+            // [`plan_bda`] computed. A single tensor bigger than the cap can't be placed at all;
+            // report it rather than silently truncating.
+            BdaPlace::Open { block_size } => {
+                if want > block_size {
+                    return Err(be(format!(
+                        "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({}) \
+                         — cannot fit in a single arena block",
+                        self.shared.max_mem_alloc_size
+                    )));
+                }
+                let mut block_buf = self.make_buf_ex(
+                    block_size as usize,
+                    MemoryLocation::GpuOnly,
+                    "resident-bda",
+                    true,
+                    true,
+                )?;
+                // The block itself is device memory NO usage row will ever claim: the tensors carved
+                // out of it are claimed individually (see the `vram_untracked` docs), so the block's
+                // committed bytes go in here and each tensor's logical bytes come back out of it as
+                // it is carved. What the row nets down to is the stranded tail + alignment padding —
+                // the part of a 16 GiB weight set that `weights` cannot see.
+                self.tag_untracked(&mut block_buf, crate::vram_stats::UNTRACKED_ARENA);
+                let buffer = block_buf.buffer;
+                // `make_buf_ex(device_address=true)` already stored the block's address in
+                // `own_addr`; reuse it instead of a second identical `get_buffer_device_address`.
+                let base_addr = block_buf.own_addr.expect(
+                    "resident-bda block built with device_address=true carries an own_addr",
+                );
+                let handle = Arc::new(BdaBlockHandle {
+                    buf: block_buf,
+                    base_addr,
                 });
+                arena.blocks.push(BdaArenaBlock {
+                    handle: Arc::clone(&handle),
+                    size: block_size,
+                    cursor: want,
+                });
+                Ok(VkBuffer {
+                    shared: Arc::clone(&self.shared),
+                    buffer,
+                    backing: Backing::BdaSub(handle),
+                    size,
+                    mem_size: 0,
+                    location: MemoryLocation::GpuOnly,
+                    sub_offset: 0,
+                    own_addr: None,
+                    vram: None,
+                    vram_untracked: Some(Box::new(
+                        self.shared
+                            .vram_stats
+                            .charge_carve(crate::vram_stats::UNTRACKED_ARENA, size as u64),
+                    )),
+                })
             }
         }
-
-        // The current block (if any) has no room: open a fresh dedicated block sized to the
-        // request, floored at `BDA_BLOCK_MIN` and capped at `max_mem_alloc_size` — a whole
-        // multi-GiB model can't be one `vkAllocateMemory`, same reasoning as `WeightArena`'s block
-        // cap. A single tensor bigger than the cap can't be placed at all; report it rather than
-        // silently truncating.
-        let block_bytes = want.max(BDA_BLOCK_MIN).min(self.shared.max_mem_alloc_size);
-        if want > block_bytes {
-            return Err(be(format!(
-                "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({} bytes) \
-                 — cannot fit in a single arena block",
-                self.shared.max_mem_alloc_size
-            )));
-        }
-        let mut block_buf = self.make_buf_ex(
-            block_bytes as usize,
-            MemoryLocation::GpuOnly,
-            "resident-bda",
-            true,
-            true,
-        )?;
-        // The block itself is device memory NO usage row will ever claim: the tensors carved out of
-        // it are claimed individually (see the `vram_untracked` docs), so the block's committed
-        // bytes go in here and each tensor's logical bytes come back out of it as it is carved.
-        // What the row nets down to is the stranded tail + alignment padding — the part of a 16 GiB
-        // weight set that `weights` cannot see.
-        self.tag_untracked(&mut block_buf, crate::vram_stats::UNTRACKED_ARENA);
-        let buffer = block_buf.buffer;
-        // `make_buf_ex(device_address=true)` already stored the block's address in `own_addr`;
-        // reuse it instead of a second identical `get_buffer_device_address`.
-        let base_addr = block_buf
-            .own_addr
-            .expect("resident-bda block built with device_address=true carries an own_addr");
-        let handle = Arc::new(BdaBlockHandle {
-            buf: block_buf,
-            base_addr,
-        });
-        arena.blocks.push(BdaArenaBlock {
-            handle: Arc::clone(&handle),
-            size: block_bytes,
-            cursor: want,
-        });
-        Ok(VkBuffer {
-            shared: Arc::clone(&self.shared),
-            buffer,
-            backing: Backing::BdaSub(handle),
-            size,
-            mem_size: 0,
-            location: MemoryLocation::GpuOnly,
-            sub_offset: 0,
-            own_addr: None,
-            vram: None,
-            vram_untracked: Some(Box::new(
-                self.shared
-                    .vram_stats
-                    .charge_carve(crate::vram_stats::UNTRACKED_ARENA, size as u64),
-            )),
-        })
     }
 
     /// Test-support hook: sub-allocate a resident-BDA weight tensor via `Self::bda_weight_alloc`
@@ -4614,6 +4862,9 @@ fn probe_device_facts(
 mod tests {
     use super::*;
     use infr_core::Backend;
+    // `Gguf::metadata`/`tensors` are trait methods, so the BDA replay needs the trait in scope; `as _`
+    // because nothing here names it.
+    use infr_core::loader::WeightSource as _;
 
     /// A `Buffer` impl that is NOT a `VkBuffer` — stands in for what the multi-backend paths can
     /// actually hand a Vulkan op (another backend's buffer, or a `TpBuffer`/`EpBuffer` wrapper).
@@ -4927,34 +5178,89 @@ mod tests {
         );
     }
 
-    /// `kernels.vulkan.no_vram_guard` (`INFR_NO_VRAM_GUARD`) — a SANCTIONED negative field.
-    /// Set, it turns the alloc-time budget check into a no-op; clear, an ask several times the
-    /// device's capacity is refused. Drives `check_vram_budget` directly, so it asserts the guard
-    /// itself and allocates nothing.
+    /// The alloc-time VRAM guard's verdict, reached with NO device: [`vram_guard_decide`] is what
+    /// `check_vram_budget` decides with, so this is the guard itself — the fit, the exactly-at-limit
+    /// edge, the one-byte-over refusal, both skips, and a budget the driver never reported. Its
+    /// `device` closure stands in for the `VK_EXT_memory_budget` query, which is also what lets the
+    /// skip cases assert the query is never MADE (the sub-MiB skip exists to avoid its cost, not
+    /// merely its answer). The ignored GPU version of this check could only ever run on a machine
+    /// with a card, so none of these edges had evidence.
     #[test]
-    #[ignore = "requires a Vulkan-capable GPU"]
-    fn config_no_vram_guard_disables_the_budget_check() {
-        let build = |off: bool| {
-            let mut cfg = Config::default();
-            cfg.kernels.vulkan.no_vram_guard = off;
-            VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
-        };
-        let guarded = build(false);
-        let huge = guarded.vram().total.saturating_mul(4);
-        assert!(
-            guarded.check_vram_budget(huge).is_err(),
-            "the guard must refuse {huge} bytes on a device with {} total",
-            guarded.vram().total
-        );
-        // The sub-MiB skip is unconditional and unchanged.
-        assert!(guarded.check_vram_budget(1024).is_ok());
-        drop(guarded);
+    fn vram_guard_decides_without_a_device() {
+        let (mib, gib) = (1u64 << 20, 1u64 << 30);
+        // The refusal text hard-codes "minus 256 MiB headroom" and the skip's doc says one MiB.
+        assert_eq!(GUARD_HEADROOM, 256 * mib);
+        assert_eq!(VRAM_GUARD_MIN_ALLOC, mib);
 
-        let unguarded = build(true);
-        assert!(
-            unguarded.check_vram_budget(huge).is_ok(),
-            "`no_vram_guard = true` must make the check a no-op"
+        let total = 24 * gib; // a 24 GiB card
+        let budget = total - GUARD_HEADROOM; // 23.5 GiB of it spendable
+        let asked = std::cell::Cell::new(false);
+        let decide = |want: u64, used: u64, total: u64, off: bool| {
+            vram_guard_decide(want, off, || {
+                asked.set(true);
+                (used, total)
+            })
+        };
+
+        // Comfortably inside, and exactly on the line: the budget is inclusive.
+        assert_eq!(decide(gib, 8 * gib, total, false), VramGuard::Fits);
+        assert!(asked.get(), "a checked allocation must read the driver");
+        assert_eq!(decide(mib, budget - mib, total, false), VramGuard::Fits);
+        // One byte over: refused, carrying the four numbers the message prints — the message path
+        // computes none of its own arithmetic.
+        assert_eq!(
+            decide(mib, budget, total, false),
+            VramGuard::Over {
+                want: mib,
+                used: budget,
+                budget,
+                total
+            },
+            "used + want one past the budget must be refused"
         );
+        // A `used` already past the budget must not saturate INTO a permission.
+        assert!(matches!(
+            decide(mib, u64::MAX, total, false),
+            VramGuard::Over { .. }
+        ));
+        // A device that reported no budget at all: fail closed, refuse.
+        assert_eq!(
+            decide(mib, 0, 0, false),
+            VramGuard::Over {
+                want: mib,
+                used: 0,
+                budget: 0,
+                total: 0
+            },
+            "a zero total is a zero budget, not an open one"
+        );
+        // The two skips, each with driver numbers that would have been refused had they been read.
+        for (want, off) in [(mib - 1, false), (4 * gib, true)] {
+            asked.set(false);
+            assert_eq!(
+                decide(want, u64::MAX, 0, off),
+                VramGuard::Skipped,
+                "want {want}, no_vram_guard {off}: the guard must not run"
+            );
+            assert!(
+                !asked.get(),
+                "the skip must answer without querying the driver (want {want}, no_vram_guard {off})"
+            );
+        }
+        // And the probe the VRAM-first KV spill decides with agrees with the guard to the byte — that
+        // is why both call [`vram_budget_fits_at`].
+        for (w, u, t) in [
+            (mib, budget - mib, total),
+            (mib, budget, total),
+            (mib, 0, 0),
+            (gib, 8 * gib, total),
+        ] {
+            assert_eq!(
+                vram_budget_fits_at(w, u, t),
+                matches!(decide(w, u, t, false), VramGuard::Fits),
+                "probe and guard disagree on want {w}, used {u}, total {t}"
+            );
+        }
     }
 
     /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
@@ -5050,6 +5356,684 @@ mod tests {
             act.device_addr().is_none(),
             "an ordinary Activations buffer must not report a device_addr"
         );
+    }
+
+    /// [`plan_bda`]'s arithmetic on a synthetic request list, with no device: the alignment unit,
+    /// the block floor, the `max_mem_alloc_size` cap, and first-fit in creation order.
+    #[test]
+    fn plan_bda_places_a_synthetic_sequence() {
+        let mib = 1024 * 1024;
+        let floor = 64 * mib;
+        let max_alloc = 4 * 1024 * mib;
+
+        // An empty arena still opens a WHOLE floored block for a 20 KiB norm — that is the floor's
+        // job (the alternative is one `vkAllocateMemory` per small tensor).
+        assert_eq!(
+            plan_bda(&[], 20 * 1024, floor, max_alloc),
+            BdaPlace::Open { block_size: floor }
+        );
+        // A request over the floor opens its own size, rounded up to [`BDA_WEIGHT_ALIGN`].
+        assert_eq!(
+            plan_bda(&[], floor + 1, floor, max_alloc),
+            BdaPlace::Open {
+                block_size: floor + 256
+            }
+        );
+        // ... but never past `max_mem_alloc_size`; the caller rejects what is left unplaceable.
+        assert_eq!(
+            plan_bda(&[], 2 * mib, floor, mib),
+            BdaPlace::Open { block_size: mib }
+        );
+        // A zero-byte request claims one aligned unit, so it still lands at a distinct address.
+        assert_eq!(
+            plan_bda(&[], 0, floor, max_alloc),
+            BdaPlace::Open { block_size: floor }
+        );
+
+        // An unaligned cursor: the tensor starts at the ALIGNED offset above it, and a tensor that
+        // ends exactly at the block's capacity fits (`<=`, not `<`).
+        assert_eq!(
+            plan_bda(&[(1024, 100)], 100, floor, max_alloc),
+            BdaPlace::Fit {
+                index: 0,
+                offset: 256
+            }
+        );
+        assert_eq!(
+            plan_bda(&[(1024, 300)], 100, floor, max_alloc),
+            BdaPlace::Fit {
+                index: 0,
+                offset: 512
+            }
+        );
+        assert_eq!(
+            plan_bda(&[(512, 256)], 256, floor, max_alloc),
+            BdaPlace::Fit {
+                index: 0,
+                offset: 256
+            }
+        );
+        assert_eq!(
+            plan_bda(&[(512, 512)], 256, floor, max_alloc),
+            BdaPlace::Open { block_size: floor }
+        );
+
+        // FIRST-fit, in creation order: a full (exact-size) block is skipped and an EARLIER block's
+        // tail is drained before any new block is opened. Last-block-only would open a fresh floored
+        // block here and strand ~64 MiB behind the small tensor.
+        let blocks = [(floor, 256u64), (994 * mib, 994 * mib)];
+        assert_eq!(
+            plan_bda(&blocks, 1000, floor, max_alloc),
+            BdaPlace::Fit {
+                index: 0,
+                offset: 256
+            }
+        );
+
+        // The same sequence at both floors: two tensors over the floor open their own exact size
+        // either way, and the three small ones land in ONE floored block — so the only difference
+        // between the two runs is that block's size, i.e. exactly the difference between the floors.
+        let seq = [70 * mib, 20 * 1024, 20 * 1024, 1000, 70 * mib];
+        let at = |floor: u64| replay_bda(&seq, floor, max_alloc);
+        let (big, small) = (at(floor), at(4 * mib));
+        assert_eq!(big.blocks, 3);
+        assert_eq!(small.blocks, 3);
+        assert_eq!(
+            big.requested, small.requested,
+            "the floor must not change what the caller asked for"
+        );
+        assert_eq!(
+            big.padding, small.padding,
+            "the floor must not change the alignment padding either"
+        );
+        assert_eq!(
+            big.stranded(),
+            small.stranded() + (64 * mib - 4 * mib),
+            "the 64 MiB floor strands exactly one floored block's worth more than the 4 MiB one"
+        );
+        assert!(
+            small.stranded() >= small.padding,
+            "stranded bytes can never fall below the alignment padding inside them: {} < {}",
+            small.stranded(),
+            small.padding
+        );
+    }
+
+    /// What replaying [`plan_bda`] over a request list reports.
+    #[derive(Clone, Copy, Debug)]
+    struct BdaReplay {
+        /// Blocks opened.
+        blocks: usize,
+        /// Bytes actually committed to the device: the sum of the block sizes.
+        committed: u64,
+        /// Bytes the caller asked for: the sum of the logical tensor sizes.
+        requested: u64,
+        /// [`BDA_WEIGHT_ALIGN`] rounding on top of the requested bytes — the one part of
+        /// `committed - requested` that is not a stranded block tail.
+        padding: u64,
+    }
+
+    impl BdaReplay {
+        /// VRAM the device holds that no tensor's bytes account for: stranded block tails + padding.
+        fn stranded(&self) -> u64 {
+            self.committed - self.requested
+        }
+    }
+
+    /// Drive [`plan_bda`] over `sequence` the way `bda_weight_alloc` does, and tally what it costs.
+    /// A tensor never straddles blocks and sub-tensors are never freed, so the only state this needs
+    /// per open block is its `(capacity, cursor)`.
+    fn replay_bda(sequence: &[u64], floor: u64, max_alloc: u64) -> BdaReplay {
+        let mut blocks: Vec<(u64, u64)> = Vec::new();
+        let (mut committed, mut requested, mut padding) = (0u64, 0u64, 0u64);
+        for &size in sequence {
+            let want = bda_want(size);
+            requested += size;
+            padding += want - size;
+            match plan_bda(&blocks, size, floor, max_alloc) {
+                BdaPlace::Fit { index, offset } => blocks[index].1 = offset + want,
+                BdaPlace::Open { block_size } => {
+                    assert!(
+                        want <= block_size,
+                        "{size} bytes (want {want}) cannot fit a {block_size}-byte block at floor \
+                         {floor} / cap {max_alloc}"
+                    );
+                    blocks.push((block_size, want));
+                    committed += block_size;
+                }
+            }
+        }
+        BdaReplay {
+            blocks: blocks.len(),
+            committed,
+            requested,
+            padding,
+        }
+    }
+
+    /// `kernels.vulkan.bda_block_min_mib`'s shipped default IS [`BDA_BLOCK_MIN`] — the two live in
+    /// different crates, so this is the only thing tying them together.
+    #[test]
+    fn bda_block_min_default_is_the_config_knob() {
+        assert_eq!(BDA_BLOCK_MIN, 4 * 1024 * 1024);
+        assert_eq!(
+            Config::default().kernels.vulkan.bda_block_min_mib as u64 * 1024 * 1024,
+            BDA_BLOCK_MIN
+        );
+    }
+
+    /// [`bda_alloc_floor_for_count`] against every shape of the limit it reads, with the real
+    /// numbers: [`BDA_BLOCK_MIN`], [`ARENA_OVERFLOW_BLOCK`], [`BDA_ALLOC_HEADROOM`], the 410 blocks a
+    /// 4 MiB floor costs on the measured 27B, and Vulkan's guaranteed-minimum
+    /// `maxMemoryAllocationCount` of 4096.
+    #[test]
+    fn bda_alloc_count_guard_only_ever_raises_the_floor() {
+        let (small, big) = (BDA_BLOCK_MIN, ARENA_OVERFLOW_BLOCK);
+        let at = |baseline: u64, opened: u64, limit: u64, configured: u64| {
+            bda_alloc_floor_for_count(baseline, opened, limit, BDA_ALLOC_HEADROOM, configured, big)
+        };
+        // The limit could not be read: the guard must not act on an invented ceiling.
+        assert_eq!(at(3_900, 400, 0, small), small);
+        // A device with room — including the measured 27B on the spec floor: 3,000 allocations
+        // already live plus all 410 blocks still leaves 430 clear of the ceiling, more than the
+        // margin, so nothing changes.
+        assert_eq!(at(3_000, 0, 4096, small), small);
+        assert_eq!(at(3_000, 410, 4096, small), small);
+        // At the margin and past it: back off to the larger floor.
+        assert_eq!(at(3_430, 410, 4096, small), big);
+        assert_eq!(at(4_090, 410, 4096, small), big);
+        // A baseline already AT the ceiling must not wrap into a permission.
+        assert_eq!(at(u64::MAX, 410, 4096, small), big);
+        // And it only ever RAISES: a knob set above the fallback stays where the user put it.
+        assert_eq!(at(4_090, 0, 4096, 128 << 20), 128 << 20);
+    }
+
+    /// [`bda_floor_for_device`] — the same decision with the site's OWN inputs and constants: the
+    /// config default's MiB count, the real [`BDA_ALLOC_HEADROOM`] and [`ARENA_OVERFLOW_BLOCK`], and
+    /// the 4096 allocations Vulkan guarantees. This is what catches the failure a rename can't: the
+    /// knob's value reaching the arena scaled wrong, or the wrong fallback wired in.
+    #[test]
+    fn bda_floor_for_device_is_the_knob_until_the_slots_run_short() {
+        let mib = Config::default().kernels.vulkan.bda_block_min_mib;
+        // A device with room: the floor IS the knob, in bytes.
+        let (configured, floor) = bda_floor_for_device(mib, 0, 0, 4096);
+        assert_eq!(
+            (configured, floor),
+            (BDA_BLOCK_MIN, BDA_BLOCK_MIN),
+            "the shipped default must land on the constant it documents"
+        );
+        // The measured 27B's full 410 blocks, from a cold allocator, stay on the small floor.
+        assert_eq!(bda_floor_for_device(mib, 0, 410, 4096).1, BDA_BLOCK_MIN);
+        // The scaling is MiB, and saturating: a hand-built `Config` can carry a value `validate`
+        // never saw, and it must not panic its way into an arena.
+        assert_eq!(bda_floor_for_device(8, 0, 0, 4096).1, 8 << 20);
+        assert_eq!(bda_floor_for_device(usize::MAX, 0, 0, 4096).1, u64::MAX);
+        // Inside the margin: the site's fallback, and it is a RAISE — `configured` still reports
+        // what the knob said, which is what the backoff warning prints.
+        let (configured, floor) = bda_floor_for_device(mib, 3_900, 0, 4096);
+        assert_eq!(floor, ARENA_OVERFLOW_BLOCK);
+        assert!(configured < floor);
+        // A device that reported no limit: guard off, knob stands even at 3,900 live allocations.
+        assert_eq!(bda_floor_for_device(mib, 3_900, 410, 0).1, BDA_BLOCK_MIN);
+    }
+
+    /// The SIZE half of the same limits. [`plan_bda`] caps the block it opens at `max_alloc`, so a
+    /// floor above the device's `maxMemoryAllocationSize` collapses to the cap rather than failing
+    /// the load — the one thing that fails is a request larger than the cap, which is the
+    /// `want > block_size` error in [`VulkanBackend::bda_weight_alloc`].
+    #[test]
+    fn bda_floor_above_the_device_cap_collapses_to_the_cap() {
+        let cap: u64 = 4 << 20; // a device accepting no single allocation larger than 4 MiB
+        let size: u64 = 20_480; // a norm-sized weight, comfortably under it
+        for floor in [16 << 20, 1 << 40, u64::MAX] {
+            let BdaPlace::Open { block_size } = plan_bda(&[], size, floor, cap) else {
+                panic!("an empty arena has nothing to fit into, so it must open");
+            };
+            assert_eq!(
+                block_size, cap,
+                "floor {floor} must collapse to the cap, never overshoot it"
+            );
+            assert!(
+                bda_want(size) <= block_size,
+                "floor {floor}: a {size}-byte weight still lands"
+            );
+        }
+        // The real error case: the request alone exceeds the cap, so even a capped-out block cannot
+        // hold it. Nothing about the floor changed that — a 4 MiB floor on a 4 MiB cap does it too.
+        let BdaPlace::Open { block_size } = plan_bda(&[], cap + 1, 4 << 20, cap) else {
+            panic!("an empty arena has nothing to fit into, so it must open");
+        };
+        assert_eq!(block_size, cap);
+        assert!(
+            bda_want(cap + 1) > block_size,
+            "and this is precisely the condition the alloc site rejects"
+        );
+    }
+
+    /// `pad_to_u32_align`, the rounding the loader puts on the bytes before `make_alloc`. A FUSED
+    /// group is padded ONCE, after concatenation (`WBytes::Concat` joins the raw component bytes),
+    /// so this is applied to the group total, never per component.
+    fn bda_request_bytes(bytes: u64) -> u64 {
+        (bytes + 3) & !3
+    }
+
+    /// What `infr-llama`'s loader would upload for this file, derived from its metadata and tensor
+    /// table plus the config defaults the loader runs with — the replay's request list AND the
+    /// assumptions behind it, so the replay cannot silently stop matching a real load.
+    ///
+    /// Three terms are NOT derivable inside `infr-vulkan` and are stated where they are used:
+    /// `caps.combined_gu` and `caps.embed_gather`, which the Vulkan backend advertises unconditionally
+    /// in its `Capabilities` literal (this file, the caps block in `VulkanShared::new`), and the three
+    /// DIMENSION terms of the loader's QKV gate (`c.layer_head_dim(l) == c.head_dim`,
+    /// `c.layer_n_kv(l) == c.n_kv`, `c.has_own_kv(l)`), which live in `infr-llama`'s `Config` and are
+    /// not reconstructible from a GGUF header — so `qkv_dtypes_allow` carries only the dtype half the
+    /// loader's `.all()` can fail on, which is enough to prove fusion is OFF and enough to refuse the
+    /// replay when it might not be.
+    struct BdaLoadPlan {
+        /// Resident repeating layers: `block_count - nextn_predict_layers` (`infr-llama`
+        /// `config.rs:845`), which is what the loader loop `0..c.n_layer` walks (`runner.rs:783`).
+        resident_layers: usize,
+        /// The `nextn_predict_layers` beyond them — uploaded only through the MTP path, which
+        /// `spec.mtp` (default `false`) keeps shut.
+        mtp_layers: usize,
+        /// `full_attention_interval`: layer `l` is full attention when `(l+1) % interval == 0`
+        /// (`config.rs:504-508`), DeltaNet otherwise.
+        attn_interval: usize,
+        /// `fuse_gu_decision` (`runner.rs:32-41`): `combined_gu` AND every dense layer's gate and up
+        /// sharing a dtype.
+        fuse_gu: bool,
+        /// The dtype half of `fuse_qkv_decision` (`runner.rs:49-74`), with `kernels.qkv_fuse`
+        /// (default `true`) already ANDed in. See the struct doc for what is missing.
+        qkv_dtypes_allow: bool,
+        /// `untied_lm` (`runner.rs:483`): the file has its own `output.weight`.
+        untied_lm: bool,
+        /// `gpu_embed` (`runner.rs:484-490`), minus `caps.embed_gather` (unconditional on Vulkan).
+        gpu_embed: bool,
+        /// The arena's request list, in upload order.
+        requests: Vec<u64>,
+        /// Names this plan placed, so the file can be checked against it.
+        placed: Vec<String>,
+    }
+
+    impl BdaLoadPlan {
+        /// Every tensor the file carries in the resident range (plus the globals) that this plan did
+        /// NOT place. Non-empty means the loader uploads something the replay does not model — a new
+        /// per-layer tensor, an MoE bank, a bias — so the byte totals below are no longer the
+        /// measured run's.
+        fn unmodelled(&self, gguf: &infr_gguf::Gguf) -> Vec<String> {
+            let placed: std::collections::HashSet<&str> =
+                self.placed.iter().map(String::as_str).collect();
+            let mut out: Vec<String> = gguf
+                .tensors()
+                .iter()
+                .map(|t| t.name.as_str())
+                .filter(|name| {
+                    let resident = match name.strip_prefix("blk.") {
+                        // `blk.64.attn_q.weight` → 64 < resident_layers; the MTP block's tensors are
+                        // the loader's separate path, so they are out of scope here.
+                        Some(rest) => rest
+                            .split('.')
+                            .next()
+                            .and_then(|l| l.parse::<usize>().ok())
+                            .is_some_and(|l| l < self.resident_layers),
+                        None => true,
+                    };
+                    resident && !placed.contains(name)
+                })
+                .map(str::to_string)
+                .collect();
+            out.sort();
+            out
+        }
+    }
+
+    /// Derive [`BdaLoadPlan`] from the GGUF header. Only the header is read.
+    fn bda_load_plan(gguf: &infr_gguf::Gguf) -> BdaLoadPlan {
+        let md = gguf.metadata();
+        let arch = md
+            .str("general.architecture")
+            .expect("general.architecture");
+        assert_eq!(
+            arch, "qwen35",
+            "this replay is the qwen35 loader sequence; `{arch}` is a different arch"
+        );
+        let key = |k: &str| format!("{arch}.{k}");
+        let num = |k: &str| {
+            md.u64(&key(k))
+                .unwrap_or_else(|| panic!("{} absent from the GGUF metadata", key(k)))
+        };
+        let mtp_layers = md.u64(&key("nextn_predict_layers")).unwrap_or(0) as usize;
+        let resident_layers = num("block_count") as usize - mtp_layers;
+        let attn_interval = num("full_attention_interval") as usize;
+
+        // name → (dtype, bytes), the two things the loader's decisions and the request sizes need.
+        let mut table: std::collections::HashMap<String, (infr_core::DType, usize)> =
+            std::collections::HashMap::new();
+        for t in gguf.tensors() {
+            table.insert(t.name.clone(), (t.dtype, t.nbytes));
+        }
+        let dt = |name: &str| table.get(name).map(|&(d, _)| d);
+        let bytes = |name: &str| -> u64 {
+            table
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} absent from the GGUF tensor table"))
+                .1 as u64
+        };
+        let blk = |l: usize, s: &str| format!("blk.{l}.{s}");
+
+        // ── the loader's fusion gates, from the file's dtypes (`runner.rs:32-74`) ──────────
+        // `combined_gu` is the Vulkan backend's unconditional `true`; `kernels.qkv_fuse` its default.
+        let cfg = Config::default();
+        let fuse_gu = (0..resident_layers).all(|l| {
+            let g = blk(l, "ffn_gate.weight");
+            dt(&g).is_some() && dt(&g) == dt(&blk(l, "ffn_up.weight"))
+        });
+        let qkv_dtypes_allow = cfg.kernels.qkv_fuse
+            && (0..resident_layers).all(|l| {
+                let q = dt(&blk(l, "attn_q.weight"));
+                q.is_some()
+                    && q == dt(&blk(l, "attn_k.weight"))
+                    && q == dt(&blk(l, "attn_v.weight"))
+                    && q.is_some_and(|d| {
+                        crate::linear::native_dense_supported(d) && d != infr_core::DType::F16
+                    })
+            });
+
+        // ── the embedding/lm_head decisions (`runner.rs:483-490`, `:1023-1043`) ────────────
+        let untied_lm = table.contains_key("output.weight");
+        let gpu_embed = num("embedding_length").is_multiple_of(32)
+            && dt("token_embd.weight").is_some_and(crate::linear::embed_gather_supported)
+            && cfg.spec.gpu_embed;
+
+        // The gated-DeltaNet mixers (`ssm_*`, `attn_qkv`) and the full-attention block
+        // (`attn_q/k/v`, `attn_q_norm`/`attn_k_norm`, `attn_output`) are the two lists the runner
+        // walks per layer (`runner.rs:793-918`); both end on `post_attention_norm` (qwen35's name for
+        // the pre-FFN norm, `runner.rs:930`) and the FFN trio. `attn_v` is loaded when the file has it
+        // (`has_wv`, `runner.rs:157-163`, read at `:899`); the q/k norms are part of the measured
+        // upload — the 267-block row only reproduces with them, which is what pins `c.qk_norm` here.
+        let delta = [
+            "attn_norm.weight",
+            "attn_qkv.weight",
+            "attn_gate.weight",
+            "ssm_conv1d.weight",
+            "ssm_alpha.weight",
+            "ssm_beta.weight",
+            "ssm_a",
+            "ssm_dt.bias",
+            "ssm_norm.weight",
+            "ssm_out.weight",
+            "post_attention_norm.weight",
+        ];
+        let mut plan = BdaLoadPlan {
+            resident_layers,
+            mtp_layers,
+            attn_interval,
+            fuse_gu,
+            qkv_dtypes_allow,
+            untied_lm,
+            gpu_embed,
+            requests: Vec::new(),
+            placed: Vec::new(),
+        };
+        // One arena request per FUSED group too, so the group's components are recorded as placed.
+        let push = |names: &[&str], total: u64, plan: &mut BdaLoadPlan| {
+            plan.requests.push(bda_request_bytes(total));
+            plan.placed.extend(names.iter().map(|n| n.to_string()));
+        };
+        // One UNfused tensor — `l` is `None` for a global. It records the full GGUF name, because that
+        // is the handle `unmodelled` checks the file against; a bare suffix would place nothing.
+        let one = |l: Option<usize>, s: &str, plan: &mut BdaLoadPlan| {
+            let name = l.map_or_else(|| s.to_string(), |l| blk(l, s));
+            push(&[name.as_str()], bytes(&name), plan);
+        };
+        for l in 0..resident_layers {
+            let ffn = |plan: &mut BdaLoadPlan| {
+                let (g, u, d) = (
+                    blk(l, "ffn_gate.weight"),
+                    blk(l, "ffn_up.weight"),
+                    blk(l, "ffn_down.weight"),
+                );
+                if fuse_gu {
+                    push(&[g.as_str(), u.as_str()], bytes(&g) + bytes(&u), plan);
+                } else {
+                    push(&[g.as_str()], bytes(&g), plan);
+                    push(&[u.as_str()], bytes(&u), plan);
+                }
+                push(&[d.as_str()], bytes(&d), plan);
+            };
+            if (l + 1).is_multiple_of(attn_interval) {
+                one(Some(l), "attn_norm.weight", &mut plan);
+                let (q, k, v) = (
+                    blk(l, "attn_q.weight"),
+                    blk(l, "attn_k.weight"),
+                    blk(l, "attn_v.weight"),
+                );
+                if qkv_dtypes_allow {
+                    let total = bytes(&q) + bytes(&k) + bytes(&v);
+                    push(&[q.as_str(), k.as_str(), v.as_str()], total, &mut plan);
+                } else {
+                    one(Some(l), "attn_q.weight", &mut plan);
+                    one(Some(l), "attn_k.weight", &mut plan);
+                    // `has_wv[l]`: the file carries `attn_v.weight` for this layer or it does not.
+                    if table.contains_key(&v) {
+                        one(Some(l), "attn_v.weight", &mut plan);
+                    }
+                }
+                for s in [
+                    "attn_q_norm.weight",
+                    "attn_k_norm.weight",
+                    "attn_output.weight",
+                    "post_attention_norm.weight",
+                ] {
+                    one(Some(l), s, &mut plan);
+                }
+                ffn(&mut plan);
+            } else {
+                for s in delta {
+                    one(Some(l), s, &mut plan);
+                }
+                ffn(&mut plan);
+            }
+        }
+        // Globals, in the loader's order (`runner.rs:1023-1043`): the norm, the lm_head (`output`,
+        // or — tied — `token_embd` itself), then the embedding ONLY for `gpu_embed && untied_lm`.
+        one(None, "output_norm.weight", &mut plan);
+        let lm_head = if untied_lm {
+            "output.weight"
+        } else {
+            "token_embd.weight"
+        };
+        one(None, lm_head, &mut plan);
+        if gpu_embed && untied_lm {
+            one(None, "token_embd.weight", &mut plan);
+        }
+        plan
+    }
+
+    /// The measured 2,299 MiB `arena-block` row, reproduced from the GGUF header with no GPU and no
+    /// model run — [`BDA_BLOCK_MIN`]'s doc carries the numbers, and this is the regression lock on
+    /// them.
+    ///
+    /// What it replays is [`bda_load_plan`], so the loader's decisions — MTP resident or not, the two
+    /// fusion gates, tied vs untied lm_head, GPU embedding gather — are DERIVED from the file and
+    /// asserted to be what the measured run was before a single byte is placed. If a future loader
+    /// fuses qkv, ships a tied lm_head, keeps MTP resident, or uploads a tensor this plan does not
+    /// model, this test says which assumption broke instead of quietly printing different numbers.
+    ///
+    /// Run (only the header is read; `--ignored` selects an ignored test, so it is paired with
+    /// `--exact` to run THIS one and nothing else):
+    /// `LI_BDA_GGUF=/path/to/Qwen3.8-27B-UD-Q4_K_XL.gguf cargo test -p infr-vulkan --lib bda_gguf --
+    /// --ignored --exact tests::bda_gguf_matches_the_measured_27b_arena --nocapture`.
+    #[test]
+    #[ignore = "reads a real model's GGUF header: set LI_BDA_GGUF=<path>"]
+    fn bda_gguf_matches_the_measured_27b_arena() {
+        // Set-but-empty counts as unset: `VAR="" cmd` is how a shell passes an unresolved
+        // `$(find …)` through, and it must skip rather than fail to open "".
+        let Some(path) = std::env::var_os("LI_BDA_GGUF").filter(|p| !p.is_empty()) else {
+            eprintln!(
+                "skip: LI_BDA_GGUF is unset or empty — point it at Qwen3.8-27B-UD-Q4_K_XL.gguf \
+                 (only the header is read) to replay the measured load"
+            );
+            return;
+        };
+        let gguf =
+            infr_gguf::Gguf::open(&std::path::PathBuf::from(path)).expect("open GGUF header");
+        let plan = bda_load_plan(&gguf);
+
+        // ── the assumptions, each derived and checked ────────────────────────────────────
+        // Layer `l` is full attention when `(l+1) % interval == 0`, so the count is a FLOOR division:
+        // 65 resident layers at interval 4 is still 16 attention layers (3, 7, …, 63).
+        let attn = plan.resident_layers / plan.attn_interval;
+        println!(
+            "load plan: {} resident layers (full attention every {}, so {} attn / {} DeltaNet), \
+             {} MTP layer(s), fuse_gu={}, qkv_dtypes_allow={}, untied_lm={}, gpu_embed={}, {} \
+             requests",
+            plan.resident_layers,
+            plan.attn_interval,
+            attn,
+            plan.resident_layers - attn,
+            plan.mtp_layers,
+            plan.fuse_gu,
+            plan.qkv_dtypes_allow,
+            plan.untied_lm,
+            plan.gpu_embed,
+            plan.requests.len(),
+        );
+        // MTP OFF. The measured run charged blk.64's 334.75 MiB to neither `weights` nor
+        // `arena-block`: the resident loop is `0..n_layer` (`runner.rs:783`, `n_layer` from
+        // `config.rs:845`) and only `spec.mtp` opens the separate MTP uploader, which binds the SAME
+        // `Weights` path and would therefore show up here.
+        assert!(
+            !Config::default().spec.mtp,
+            "`spec.mtp` now defaults ON, so every load uploads the {n} NextN layer(s) through the \
+             MTP path too and the resident-only replay below is no longer what a run costs",
+            n = plan.mtp_layers
+        );
+        assert_eq!(
+            plan.mtp_layers,
+            1,
+            "the measured file carries one NextN block; {n} means a different model than the run \
+             this row was measured on",
+            n = plan.mtp_layers
+        );
+        assert_eq!(
+            plan.resident_layers, 64,
+            "65 blocks - 1 NextN = the 64 resident layers"
+        );
+        // No fused group. One GGUF tensor = one arena request, which is the whole shape of the
+        // measured 267-block row: the UD-Q4_K_XL dtype mix breaks both gates.
+        assert!(
+            !plan.fuse_gu,
+            "`fuse_gu_decision` (`runner.rs:32-41`) now holds on this file, so gate+up reach the \
+             arena as ONE carve per layer — re-derive the sequence against the loader, the \
+             per-tensor carves below are not what a load costs",
+        );
+        assert!(
+            !plan.qkv_dtypes_allow,
+            "the dtype half of `fuse_qkv_decision` (`runner.rs:49-74`) holds on this file, so qkv \
+             MIGHT fuse — and the dim half of that gate (`layer_head_dim`/`layer_n_kv`/`has_own_kv`) \
+             cannot be evaluated from `infr-vulkan`. Re-derive against the loader rather than \
+             assume the split form.",
+        );
+        // The globals: this file is untied, and the GPU embedding gather puts a SECOND embedding
+        // carve after `output.weight` (`runner.rs:1041`) — that pairing is why the measured `weights`
+        // row is GGUF-minus-blk.64 with `token_embd` in it once. `caps.embed_gather` is the Vulkan
+        // backend's unconditional `true`; only the measured adapter's `n_embd % 32` and dtype support
+        // are derived here.
+        assert!(
+            plan.untied_lm,
+            "no `output.weight` in the file: this checkpoint is tied, so lm_head IS the embedding \
+             tensor and the measured row's separate ~995 MiB `output.weight` block does not exist",
+        );
+        assert!(
+            plan.gpu_embed,
+            "`gpu_embed` is off (`n_embd % 32`, the table's dtype, or `spec.gpu_embed` — see \
+             `runner.rs:484-490`), so `token_embd.weight` is uploaded once instead of a second time \
+             for the gather, and the measured 682 MiB embedding block this replay places is not real",
+        );
+        let unmodelled = plan.unmodelled(&gguf);
+        assert!(
+            unmodelled.is_empty(),
+            "the file carries {n} resident tensor(s) this plan does not place — {unmodelled:?} — so \
+             the loader uploads (or the plan omits) weights the measured row never had",
+            n = unmodelled.len()
+        );
+
+        // The shape of the load, which the derivation above must produce independently: 48 DeltaNet
+        // layers x 14 + 16 attention layers x 11 + 3 globals. Checked BEFORE any byte is placed, so a
+        // plan that has drifted says so rather than printing a different replay.
+        let seq = &plan.requests;
+        assert_eq!(
+            seq.len(),
+            851,
+            "the derived plan asks for {n} arena requests, not the measured run's 851",
+            n = seq.len()
+        );
+
+        let mib = 1024 * 1024;
+        // The measured run's largest block was `output.weight`'s 994.68 MiB, so any cap at or above
+        // a GiB is inert here; 4 GiB is the addressing unit's own ceiling (`BDA_ADDRESSING_UNIT_MAX`).
+        let max_alloc = 4 * 1024 * mib;
+        let report = |who: &str, r: &BdaReplay| {
+            println!(
+                "{who}: {} blocks, committed {:.1} MiB, weights {:.1} MiB, stranded {:.1} MiB (of \
+                 which {:.3} MiB is alignment padding)",
+                r.blocks,
+                r.committed as f64 / mib as f64,
+                r.requested as f64 / mib as f64,
+                r.stranded() as f64 / mib as f64,
+                r.padding as f64 / mib as f64,
+            )
+        };
+
+        let old = replay_bda(seq, 64 * mib, max_alloc);
+        let new = replay_bda(seq, BDA_BLOCK_MIN, max_alloc);
+        report("floor 64 MiB", &old);
+        report("floor 4 MiB ", &new);
+
+        // (a) The measured row, at the floor that produced it: 267 blocks, 2,299 MiB stranded.
+        assert_eq!(
+            old.blocks, 267,
+            "arena blocks (the live report said `resident-bda … x267`)"
+        );
+        assert!(
+            old.stranded().abs_diff(2299 * mib) <= mib,
+            "stranded measured at 2,299.2 MiB, replayed {:.1}",
+            old.stranded() as f64 / mib as f64
+        );
+        assert!(
+            old.committed.abs_diff(18_699 * mib) <= 2 * mib,
+            "committed measured at 18,699.7 MiB, replayed {:.1}",
+            old.committed as f64 / mib as f64
+        );
+
+        // (b) The recovery: the SAME bytes requested, with the tail gone. That is the 2.3 GiB back,
+        // not the same 2.3 GiB re-labelled.
+        assert_eq!(
+            new.requested, old.requested,
+            "a floor change must not change what the loader asks for"
+        );
+        assert!(
+            new.stranded() < 8 * mib,
+            "the 4 MiB floor must strand under 8 MiB, got {:.1}",
+            new.stranded() as f64 / mib as f64
+        );
+        assert_eq!(
+            new.blocks, 410,
+            "a smaller floor buys the tail back with more, smaller blocks"
+        );
+
+        // (c) Stranded bytes can never fall below the alignment padding inside them — the guard
+        // against "fixing" the row by charging `want` instead of `size` at the carve, which would
+        // move tail bytes into `weights` without giving any VRAM back.
+        for r in [old, new] {
+            assert!(
+                r.stranded() >= r.padding,
+                "{} MiB stranded is below the {} MiB of alignment padding it must contain",
+                r.stranded() as f64 / mib as f64,
+                r.padding as f64 / mib as f64
+            );
+        }
     }
 
     /// Slice 0 of the KV-cache u64/BDA migration (issue #74): pure allocator-seam enablement — a

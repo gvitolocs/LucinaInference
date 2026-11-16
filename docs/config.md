@@ -220,7 +220,14 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
+  `no_replay`, `no_vram_guard`, the BDA chunk caps, and `bda_block_min_mib` —
+  the MiB floor of a resident-BDA weight arena block, whose cost in stranded
+  VRAM is measured on the 27B in `infr-vulkan`'s
+  `bda_gguf_matches_the_measured_27b_arena`). `bda_block_min_mib` takes a
+  minimum of **1** — `0` is rejected like any other bad value — and no setting
+  escapes the device's two limits on this path: a block is capped at
+  `maxMemoryAllocationSize`, and near `maxMemoryAllocationCount` the arena
+  backs off to the larger 64 MiB floor regardless. Note `f16 = false` also
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
   today.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per

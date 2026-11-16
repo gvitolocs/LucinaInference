@@ -297,6 +297,92 @@ fn bad_value_is_an_error_not_a_silent_default() {
     }
 }
 
+/// `kernels.vulkan.bda_block_min_mib` is a floor, not a scale, so `0` is not "the smallest legal
+/// value" — it is "no floor", which puts one dedicated `vkAllocateMemory` behind every small weight.
+/// Every layer that can carry it refuses it: the env layer at its own site (the fold the Vulkan
+/// backend reads directly), the file layer and `--set` through [`Config::validate`] on the folded
+/// config. `1` and an absurd value are accepted untouched, because the ceiling is a DEVICE fact the
+/// arena applies at the alloc site (`max_mem_alloc_size`, and the allocation-`count` backoff in
+/// `bda_alloc_floor_for_count`) rather than something the config layer can know.
+#[test]
+fn bda_block_min_mib_refuses_zero_and_passes_everything_else() {
+    // ── the env layer: 0 refused, everything else as spelled ────────────────
+    let err = try_env_layer(&[("INFR_BDA_BLOCK_MIN_MIB", "0")]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Env {
+                key: "INFR_BDA_BLOCK_MIN_MIB",
+                ..
+            }
+        ),
+        "0 must be refused, not clamped: {err:?}"
+    );
+
+    let resolved = |raw: &str| -> Config {
+        let layer = try_env_layer(&[("INFR_BDA_BLOCK_MIN_MIB", raw)]).expect("a parseable value");
+        Config::load_from_layers(&[layer])
+    };
+    let one = resolved("1");
+    assert_eq!(one.kernels.vulkan.bda_block_min_mib, 1);
+    one.validate().expect("1 MiB is a legal floor");
+    // Bigger than any device's `maxMemoryAllocationSize` — still the user's value as far as the
+    // config layer is concerned.
+    let huge = resolved("4294967296");
+    assert_eq!(huge.kernels.vulkan.bda_block_min_mib, 4_294_967_296);
+    huge.validate()
+        .expect("an oversized floor is legal; the arena caps it per device");
+    // Unparseable keeps the manifest's `Ignored` policy: the default, not an error.
+    assert_eq!(
+        Config::load_from_layers(
+            &[try_env_layer(&[("INFR_BDA_BLOCK_MIN_MIB", "banana")]).unwrap()]
+        )
+        .kernels
+        .vulkan
+        .bda_block_min_mib,
+        Config::default().kernels.vulkan.bda_block_min_mib,
+        "an unparseable value must fall back, like every other Int knob here"
+    );
+
+    // ── the file layer and `--set`: refused on the folded config ────────────
+    for (what, layer) in [
+        (
+            "file",
+            file_layer("[kernels.vulkan]\nbda_block_min_mib = 0\n"),
+        ),
+        (
+            "--set",
+            cli::parse(&ConfigOverrides {
+                sets: vec!["kernels.vulkan.bda_block_min_mib=0".to_string()],
+                ..Default::default()
+            })
+            .expect("--set layer"),
+        ),
+    ] {
+        let cfg = Config::load_from_layers(&[layer]);
+        assert_eq!(
+            cfg.kernels.vulkan.bda_block_min_mib, 0,
+            "the {what} layer parses 0 into the field; the refusal is `validate`'s"
+        );
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Value { path, message } => {
+                assert_eq!(path, "kernels.vulkan.bda_block_min_mib", "{what}");
+                assert!(
+                    message.contains("at least 1"),
+                    "{what} rejection should say the minimum: {message}"
+                );
+            }
+            other => panic!("expected a value error from the {what} layer, got {other:?}"),
+        }
+    }
+
+    // The default itself is legal, or every run would fail at startup.
+    Config::default()
+        .validate()
+        .expect("the shipped default validates");
+}
+
 /// The `Mib` and `Size` STRING spellings, at the layer that owns them.
 ///
 /// These cases arrived here from `budget.rs`'s `mib_grammar` and `pager.rs`'s
@@ -1326,6 +1412,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// they were born reading `Config` (R3), so they are `migrated` from
     /// their first commit and this list exists only to keep the count honest.
     const POST_MIGRATION: &[&str] = &[
+        "INFR_BDA_BLOCK_MIN_MIB",
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
         "INFR_LAYER_MAJOR",
