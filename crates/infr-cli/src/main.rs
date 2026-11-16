@@ -381,6 +381,61 @@ enum Cmd {
         #[command(flatten)]
         sampling: SamplingOpts,
     },
+    /// Print the next-token distribution over an EXACT token-id prompt — the number
+    /// `run --raw` cannot show, and the one a greedy divergence against llama.cpp is actually
+    /// decided by: prefill the ids (no BOS, no chat template, no special-token parsing), take the
+    /// LAST position's raw logits, and report a full-vocabulary softmax over them. That is
+    /// llama-server's `n_probs` with `post_sampling_probs: false`, which softmaxes the raw logits of
+    /// the whole vocabulary and lets no sampler touch them; a tie is only tellable from a numeric
+    /// bug if both tools print the same numbers. One-shot: no KV session is kept, so every
+    /// invocation starts from an empty cache. On Vulkan the row comes from the SAME session
+    /// `run --raw` builds — the same weight placement and KV window — and the line printed before
+    /// the report names what that session settled on. The engine is tuned with the global `--set`
+    /// (`--set device.dev=cpu`, `--set kv.type_k=q4_0`), the same as any other subcommand.
+    ///
+    /// READING IT AGAINST llama.cpp — what a harness has to know; the first four are differences
+    /// that are correct, not bugs:
+    ///
+    /// 1. Compare MARGINS on the `logit` fields, which are the raw f32 the model produced and so
+    ///    are exact on both sides. Probabilities carry f32-vs-f64 noise of about 1e-5 relative:
+    ///    llama.cpp accumulates its softmax denominator in f32, this divides by an f64
+    ///    log-sum-exp. A probability gap below ~1e-5 is a tie, not a discrepancy.
+    /// 2. On an EXACT tie this lists the LOWER id first; llama.cpp `partial_sort`s by logit with no
+    ///    tie comparator, so the order of its tied entries is unspecified. Diff tied entries by
+    ///    probability, never by rank.
+    /// 3. `piece` keeps control tokens (`<|im_end|>` prints as itself). llama-server prints an
+    ///    empty piece for those unless it runs with `--special` — pass it, or compare on `id`.
+    /// 4. Set `--max-new` to the value of the run you are diagnosing: it sizes the KV the way that
+    ///    run did, and the VRAM placement decided from that size (KV dtype, prefill chunk,
+    ///    streamed or paged weights) changes the logits themselves.
+    /// 5. `argmax` is the row's GREEDY pick. `run --raw` samples at the GGUF's own generation
+    ///    config — a gemma4 GGUF sets temp 1 — so the token it prints first equals `argmax` only
+    ///    when the run side is made greedy with `--temp 0`.
+    NextProbs {
+        /// Model: a path to a `.gguf`, or an `org/repo[:quant]` HuggingFace ref.
+        model: String,
+        /// File of WHITESPACE-SEPARATED token ids to prefill verbatim — the format
+        /// `run --raw --print-prompt-ids` / `--print-ids` write. Its LAST id is the position the
+        /// distribution is read at.
+        #[arg(long, value_name = "PATH")]
+        ids_file: PathBuf,
+        /// How many entries to report, highest probability first.
+        #[arg(long, default_value_t = 10, value_name = "N")]
+        top: usize,
+        /// The generation window to size the KV cache for, exactly as `run --raw` sizes it
+        /// (`ids + N + 1`): set it to the `--max-new` of the run being diagnosed, so the KV sizing
+        /// and the VRAM placement decisions that follow from it match that run's — a window the
+        /// memory no longer fits buys a different KV dtype or a different prefill chunk, and either
+        /// moves the logits. Config `sampling.max_new` / INFR_MAX_NEW; default 2048, which is
+        /// `run`'s. Only this one number of the sampling layer is read here, and never a sampler.
+        /// No effect on `--dev cpu`, whose cache is sized to the prompt and which runs no sweep.
+        #[arg(long, value_name = "N")]
+        max_new: Option<usize>,
+        /// Emit one JSON object `{"n_ids", "argmax", "top": [{"id", "piece", "logit", "prob"}],
+        /// "logsumexp"}` instead of one line per entry.
+        #[arg(long)]
+        json: bool,
+    },
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
         model: String,
@@ -662,6 +717,16 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             layer.sampling.ignore_eos = Some(true);
         }
         Cmd::Pull { .. } | Cmd::Devices | Cmd::Multi { .. } | Cmd::Compare { .. } => {}
+        // `next-probs` reports the RAW logits: no sampler and no sampling knob is read, and the
+        // device/KV choices arrive through the global `--set` / `INFR_*` layers. Its `--max-new` is
+        // the exception that is not a sampling decision at all — it is the `sampling.max_new` of the
+        // run being diagnosed, which is what that run sized its KV (and therefore its placement)
+        // against, so the flag specifies that one path and nothing else.
+        Cmd::NextProbs { max_new, .. } => {
+            if let Some(m) = max_new {
+                layer.sampling.max_new = Some(*m);
+            }
+        }
     }
     Ok(layer)
 }
@@ -698,6 +763,15 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             parallel,
             ..
         } => cmd_serve(&model, &addr, parallel, cfg, specified),
+        // `--max-new` reached the config layer in `cli_flag_layer`, so it is read back from `cfg`
+        // here exactly as `cmd_run` reads its generation cap — and no other sampling knob is.
+        Cmd::NextProbs {
+            model,
+            ids_file,
+            top,
+            json,
+            ..
+        } => cmd_next_probs(&model, &ids_file, top, json, cfg, specified),
         Cmd::Multi {
             models,
             addr,
@@ -1407,6 +1481,210 @@ fn cmd_run(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `infr next-probs` — the next-token distribution over an exact id prompt
+// ---------------------------------------------------------------------------
+
+/// Read the `--ids-file`: WHITESPACE-separated token ids — the format [`write_token_ids`] produces,
+/// which is what `run --raw --print-prompt-ids` / `--print-ids` hand out, so the ids a parity run
+/// compared ARE the ids this prefills. Splitting on any whitespace (not just newlines) makes a file
+/// and a hand-typed `printf '1 2 3'` the same input.
+fn read_token_ids_file(path: &Path) -> anyhow::Result<Vec<u32>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("read --ids-file {}: {e}", path.display()))?;
+    let mut ids = Vec::new();
+    for (n, field) in text.split_whitespace().enumerate() {
+        ids.push(field.parse::<u32>().map_err(|e| {
+            anyhow!(
+                "--ids-file {}: field #{n} `{field}` is not a token id: {e}",
+                path.display()
+            )
+        })?);
+    }
+    if ids.is_empty() {
+        anyhow::bail!("--ids-file {}: no token ids in it", path.display());
+    }
+    Ok(ids)
+}
+
+/// The row's log-sum-exp, in f64 and MAX-SUBTRACTED — the softmax denominator in log space, which is
+/// what keeps the `exp` of a ±1e4 logit from overflowing, or the sum it is divided by from
+/// underflowing to zero. `None` for an empty row: an empty vocabulary has no sum to take.
+fn logsumexp(logits: &[f32]) -> Option<f64> {
+    if logits.is_empty() {
+        return None;
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum: f64 = logits.iter().map(|&l| (f64::from(l) - max).exp()).sum();
+    Some(max + sum.ln())
+}
+
+/// The `n` highest-probability entries of the softmax over the FULL vocabulary of `logits`, as
+/// `(id, logit, prob)` sorted by prob DESCENDING with ties broken by the LOWER id.
+///
+/// This is what llama-server reports for `n_probs` with `post_sampling_probs: false`:
+/// `get_token_probabilities` (`tools/server/server-common.cpp` at v1.0.0) takes every vocab logit of
+/// the row — no top-k, no temperature, no filter — softmaxes over all of them, and sorts by
+/// probability; `populate_token_probs` (`tools/server/server-context.cpp`, same tag) reports each
+/// entry's id, piece and probability, and consults no sampler at all on that branch. The one
+/// deliberate difference: llama.cpp accumulates `cum_sum` in f32 over ~150k terms, while this divides
+/// by the f64 [`logsumexp`], so a row whose logits sit near 1e4 still reports probabilities here.
+/// `n` larger than the vocabulary reports the vocabulary; an empty row is refused rather than
+/// answered with an empty list.
+fn top_probs(logits: &[f32], n: usize) -> anyhow::Result<Vec<(u32, f32, f64)>> {
+    let lse = logsumexp(logits).context("top_probs: an empty logits row has no distribution")?;
+    let mut out: Vec<(u32, f32, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(id, &l)| (id as u32, l, (f64::from(l) - lse).exp()))
+        .collect();
+    out.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    out.truncate(n.min(out.len()));
+    Ok(out)
+}
+
+/// `infr next-probs` — see [`Cmd::NextProbs`]. One-shot: the ids are prefilled causally into a cache
+/// that exists for this call only, and the LAST position's raw logits are reported.
+fn cmd_next_probs(
+    model: &str,
+    ids_file: &Path,
+    top: usize,
+    json: bool,
+    cfg: &Arc<Config>,
+    specified: &PartialConfig,
+) -> anyhow::Result<()> {
+    let ids = read_token_ids_file(ids_file)?;
+    let (gguf, tok) = resolve(model, cfg)?;
+    // Stamped next to the mapping it guards, as on every other path that reads a model file more
+    // than once (here: the load, then the prefill).
+    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
+    // The prefill primitives below are single-device autoregressive forwards; a multi-GPU config
+    // would be silently ignored by them, so refuse rather than report a distribution this seam
+    // never computed. The same gates as `--raw`, for the same reason.
+    if infr_llama::seam::pipeline_devices(cfg).is_some()
+        || infr_llama::seam::tensor_parallel_devices(cfg).is_some()
+        || infr_llama::seam::expert_parallel_devices(cfg).is_some()
+    {
+        anyhow::bail!(
+            "next-probs is the single-device parity path — not compatible with \
+             INFR_PIPELINE / INFR_TENSOR_PARALLEL / INFR_EXPERT_PARALLEL"
+        );
+    }
+    if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
+        anyhow::bail!(
+            "next-probs is autoregressive; diffusion-gemma denoises a fixed canvas, so its last \
+             row is not a next-token distribution"
+        );
+    }
+    // The KV window, resolved exactly as `cmd_run` resolves its generation cap: whichever layer
+    // named `sampling.max_new` (`--max-new`, `--set`, INFR_MAX_NEW) wins, else `run`'s
+    // autoregressive default of 2048. Nothing here samples with it — it is the size the run being
+    // diagnosed gave its cache, and VRAM placement is priced against that size, so it is the number
+    // that has to match.
+    let kv_max_new = if specified.is_path_set("sampling.max_new") {
+        cfg.sampling.max_new
+    } else {
+        2048
+    };
+    let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    // NOT `apply_model_sampling_defaults`: this prints the RAW row, exactly like llama-server with
+    // `post_sampling_probs: false`, where no sampler is consulted before the probabilities are
+    // taken. Printing the sampling banner here would advertise knobs this command does not read.
+    let (logits, placement) = match selected_backend(cfg)? {
+        // The row must come from the forward the run made, or it diagnoses nothing. THIS is the
+        // session `run --raw` builds — the shared `SeamModel::vulkan_ids_tap`, the same
+        // `vulkan_moe_binder` placement sweep, the same KV window — and not the bit-parity oracle's
+        // naive all-resident upload, which is a different executor wherever the sweep moves and
+        // cannot even hold a large MoE on the card. That the experts page here is the point: the
+        // model a parity harness most wants explained is one this command could not previously run.
+        Backend::Vulkan(_) => {
+            let mut logits = Vec::new();
+            let p = loaded.prefill_logits_vulkan_like_run(&ids, kv_max_new, &mut logits)?;
+            (logits, Some(p))
+        }
+        // CPU needs no run-shaped twin because there is nothing to twin: `prefill_logits_cpu` is the
+        // same mmap-binder forward `run --raw` runs, and the two Vulkan-side things that move a row
+        // — the sweep's pins, and `reclamp_ctx_to_live_room`'s re-chunking — both need a device
+        // budget this backend does not report. Hence no placement to report either.
+        Backend::Cpu => (loaded.prefill_logits_cpu(&ids)?, None),
+        Backend::Metal => anyhow::bail!(
+            "next-probs needs a logits primitive and the Metal backend has none yet \
+             (--set device.dev=cpu or --set device.dev=Vulkan0 do)"
+        ),
+    };
+    watch.check()?;
+    // What produced these numbers, named BEFORE them and on stderr so a piped `--json` stays
+    // parseable: two rows from differently-placed forwards are not the same measurement.
+    let note = match placement.as_ref() {
+        Some(p) => next_probs_forward_note(p),
+        None => {
+            // The formats as the layers named them, each side on its own — the CPU runner reads
+            // `kv.type_k/v` straight from the config — and `false` for the auto-quant rung, a
+            // placement-ladder decision this backend never runs.
+            let named = (cfg.kv.type_k_specified || cfg.kv.type_v_specified)
+                .then_some((cfg.kv.type_k, cfg.kv.type_v));
+            format!(
+                "next-probs forward: cpu reference | kv {} | no placement sweep, cache sized to the \
+                 prompt (so --max-new changes nothing here)",
+                kv_dtype_note(false, named)
+            )
+        }
+    };
+    // print-ok: program OUTPUT — the `next-probs` forward note, deliberately on stderr.
+    eprintln!("{note}");
+    let lse = logsumexp(&logits).context("the model returned an empty logits row")?;
+    let entries: Vec<(u32, String, f32, f64)> = top_probs(&logits, top)?
+        .into_iter()
+        .map(|(id, logit, prob)| loaded.token_piece(id).map(|piece| (id, piece, logit, prob)))
+        .collect::<anyhow::Result<_>>()?;
+    // The greedy pick is the row's MAXIMUM, which `top_probs` already put first whenever it reported
+    // anything; only `--top 0` — an empty report — needs the extra one-entry sort. Both break a tie
+    // by the LOWER id, and so does the runner's greedy scan, so this is the id a GREEDY `run --raw`
+    // took — a run at the GGUF's own temperature samples, and its first token is only this id by
+    // luck.
+    let argmax = match entries.first() {
+        Some((id, ..)) => *id,
+        None => top_probs(&logits, 1)?[0].0,
+    };
+    let report = next_probs_report(ids.len(), argmax, lse, &entries, json);
+    // print-ok: program OUTPUT — the whole report, `--json`'s one object or the summary line plus
+    // one line per entry.
+    println!("{report}");
+    Ok(())
+}
+
+/// Render a `next-probs` report: with `--json` one object
+/// `{"n_ids", "argmax", "top": [{"id", "piece", "logit", "prob"}…], "logsumexp"}`, otherwise a
+/// summary line and ONE LINE PER ENTRY. Kept apart from the forward so the shape of what a parity
+/// harness parses is testable without a model — the numbers themselves are [`top_probs`]'s business.
+fn next_probs_report(
+    n_ids: usize,
+    argmax: u32,
+    lse: f64,
+    entries: &[(u32, String, f32, f64)],
+    json: bool,
+) -> String {
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(id, piece, logit, prob)| {
+                serde_json::json!({"id": id, "piece": piece, "logit": logit, "prob": prob})
+            })
+            .collect();
+        return serde_json::json!({"n_ids": n_ids, "argmax": argmax, "top": rows, "logsumexp": lse})
+            .to_string();
+    }
+    let mut out = format!("n_ids={n_ids} argmax={argmax} logsumexp={lse:.9}\n");
+    for (rank, (id, piece, logit, prob)) in entries.iter().enumerate() {
+        // The piece is a Rust-escaped string so a leading space or a newline in it stays visible to
+        // the eye and to `diff`.
+        out.push_str(&format!(
+            "{rank:>4} {id:>7} prob={prob:.9} logit={logit:.6} piece={piece:?}\n"
+        ));
+    }
+    out.trim_end().to_string()
 }
 
 /// `read_line` that gives up when a signal has latched the shutdown.
@@ -2422,7 +2700,7 @@ fn print_bench_avg_mtp(
     reps: usize,
     json: bool,
     mtp: Option<&MtpBenchStats>,
-    placement: Option<&infr_llama::BenchPlacement>,
+    placement: Option<&infr_llama::VulkanPlacement>,
 ) {
     let Some(m) = mtp else {
         print_bench_avg(samples, label, depth, suffix, reps, json, placement);
@@ -2461,7 +2739,7 @@ fn print_bench_avg_mtp(
 fn bench_json_line(
     samples: &[f64],
     mtp: Option<&MtpBenchStats>,
-    placement: Option<&infr_llama::BenchPlacement>,
+    placement: Option<&infr_llama::VulkanPlacement>,
 ) -> String {
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     let reps_ts: Vec<String> = samples.iter().map(|s| format!("{s:.2}")).collect();
@@ -2509,10 +2787,37 @@ fn spread_note(samples: &[f64], avg: f64) -> String {
     )
 }
 
+/// The KV cache format to print, in the one spelling `infr bench` ([`placement_note`]) and
+/// `infr next-probs` both use. A format the user NAMED (`kv.type_k` / `kv.type_v`) is printed as
+/// named and wins over the placement ladder, so a q4_0 request does not read as the ladder's f16;
+/// it is what the config ASKED for, not a re-read of the graph — the runner gates each named format
+/// on this backend and this weight layout and quietly falls back to f16 when one rejects it. With
+/// nothing named, the ladder's auto-quant rung is the answer — and `q8 = false` on a backend that
+/// runs no ladder, where the format is simply the f16 default.
+fn kv_dtype_note(
+    q8: bool,
+    named: Option<(Option<infr_core::DType>, Option<infr_core::DType>)>,
+) -> String {
+    match named {
+        Some((k, v)) => {
+            let name = |d: Option<infr_core::DType>| {
+                d.map_or("f16".to_string(), |d| format!("{d:?}").to_lowercase())
+            };
+            let (k, v) = (name(k), name(v));
+            if k == v {
+                k
+            } else {
+                format!("{k}/{v}")
+            }
+        }
+        None => (if q8 { "q8_0" } else { "f16" }).to_string(),
+    }
+}
+
 /// The `ubatch=N kv=f16 submit=unlimited` fragment `infr bench` appends so a throughput number can
-/// be attributed later — see [`infr_llama::BenchPlacement`] for why these three and not others.
+/// be attributed later — see [`infr_llama::VulkanPlacement`] for why these three and not others.
 /// Empty for the CPU/Metal arms, which have no Vulkan placement to report.
-fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
+fn placement_note(p: Option<&infr_llama::VulkanPlacement>) -> String {
     let Some(p) = p else {
         return String::new();
     };
@@ -2520,20 +2825,7 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
         " [ubatch {}{}, kv {}, submit {}]",
         p.ubatch,
         if p.ubatch_pinned { " pinned" } else { "" },
-        match p.kv_named {
-            Some((k, v)) => {
-                let name = |d: Option<infr_core::DType>| {
-                    d.map_or("f16".to_string(), |d| format!("{d:?}").to_lowercase())
-                };
-                let (k, v) = (name(k), name(v));
-                if k == v {
-                    k
-                } else {
-                    format!("{k}/{v}")
-                }
-            }
-            None => (if p.kv_q8 { "q8_0" } else { "f16" }).to_string(),
-        },
+        kv_dtype_note(p.kv_q8, p.kv_named),
         if p.submit_cap == 0 {
             "unlimited".to_string()
         } else {
@@ -2542,11 +2834,37 @@ fn placement_note(p: Option<&infr_llama::BenchPlacement>) -> String {
     )
 }
 
+/// The line `infr next-probs` prints on stderr BEFORE its report: what this forward really ran as.
+/// A distribution is evidence about the run it came from, and the choices below are the ones that
+/// move the last-position logits — a q8_0 cache, a shorter prefill chunk, weights that stream or
+/// experts that page — so a reader comparing two machines has to see them to know whether they
+/// compared the same forward at all. [`placement_note`] is `bench`'s sentence over the same record;
+/// this one adds the KV window, the weights and the compute tier, because a probability is not
+/// attributable without them.
+fn next_probs_forward_note(p: &infr_llama::VulkanPlacement) -> String {
+    let weights = match (p.dense_streamed, p.experts_paged) {
+        (true, true) => "dense weights streamed, experts paged",
+        (true, false) => "dense weights streamed",
+        (false, true) => "experts paged",
+        (false, false) => "weights resident",
+    };
+    format!(
+        "next-probs forward: ctx {} | kv {} | prefill chunk {}{} | {weights} | compute {}",
+        p.want_ctx,
+        kv_dtype_note(p.kv_q8, p.kv_named),
+        // The height the prefill loop actually cut at, CLAMPED to this window — what the runner and
+        // the activation reserve both worked from.
+        p.ubatch.min(p.want_ctx),
+        if p.ubatch_pinned { " (pinned)" } else { "" },
+        if p.coopmat_f16 { "coopmat" } else { "scalar" },
+    )
+}
+
 /// Shared bench-result reporter: average the per-rep t/s samples and print either the JSON shape
 /// (`[{"avg_ts": ..}]`, llama-bench-comparable) or `label[ @ dN][tag]: X t/s (N reps)`. One
 /// implementation for the dense-CPU / qwen35 bench tails (they previously each had a copy).
 ///
-/// Both shapes carry the per-rep spread and — on Vulkan — the [`infr_llama::BenchPlacement`] the
+/// Both shapes carry the per-rep spread and — on Vulkan — the [`infr_llama::VulkanPlacement`] the
 /// run settled on. The JSON keeps `avg_ts` as its first key and only ADDS fields, so
 /// `llama-bench -o json` consumers (including this CLI's own `ModelBench::infr_json`) are
 /// unaffected.
@@ -2557,7 +2875,7 @@ fn print_bench_avg(
     tag: &str,
     reps: usize,
     json: bool,
-    placement: Option<&infr_llama::BenchPlacement>,
+    placement: Option<&infr_llama::VulkanPlacement>,
 ) {
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     if json {
@@ -4910,12 +5228,12 @@ mod tests {
             verify_pct: 60.0,
             catchup_pct: 10.0,
         };
-        let place = infr_llama::BenchPlacement {
+        let place = infr_llama::VulkanPlacement {
             ubatch: 256,
             ubatch_pinned: true,
             kv_q8: true,
-            kv_named: None,
             submit_cap: 112,
+            ..placement_resident(256)
         };
         for (name, line) in [
             ("bare", bench_json_line(&samples, None, None)),
@@ -4967,38 +5285,91 @@ mod tests {
         assert_eq!(spread_note(&[], 0.0), "");
     }
 
-    /// The placement note must distinguish "the splitter never armed" from "it armed at N" —
-    /// they are different runs and an A/B across them is not a comparison.
-    #[test]
-    fn placement_note_distinguishes_unlimited_from_split() {
-        let base = infr_llama::BenchPlacement {
-            ubatch: 1024,
+    /// A Vulkan placement record in its healthy shape — resident, unpinned, f16 KV, unlimited
+    /// submits, coopmat at the given prefill chunk — so a test varies the ONE decision it is about
+    /// instead of restating the eight it is not.
+    fn placement_resident(ubatch: usize) -> infr_llama::VulkanPlacement {
+        infr_llama::VulkanPlacement {
+            ubatch,
             ubatch_pinned: false,
             kv_q8: false,
             kv_named: None,
             submit_cap: 0,
-        };
+            want_ctx: 4096,
+            dense_streamed: false,
+            experts_paged: false,
+            coopmat_f16: true,
+        }
+    }
+
+    /// The placement note must distinguish "the splitter never armed" from "it armed at N" —
+    /// they are different runs and an A/B across them is not a comparison.
+    #[test]
+    fn placement_note_distinguishes_unlimited_from_split() {
+        let base = placement_resident(1024);
         let s = placement_note(Some(&base));
         assert_eq!(s, " [ubatch 1024, kv f16, submit unlimited]");
-        let split = infr_llama::BenchPlacement {
-            ubatch: 256,
+        let split = infr_llama::VulkanPlacement {
             ubatch_pinned: true,
             kv_q8: true,
-            kv_named: None,
             submit_cap: 112,
+            ..placement_resident(256)
         };
         assert_eq!(
             placement_note(Some(&split)),
             " [ubatch 256 pinned, kv q8_0, submit split/112]"
         );
         assert_eq!(placement_note(None), "");
-        let named = infr_llama::BenchPlacement {
+        let named = infr_llama::VulkanPlacement {
             kv_named: Some((Some(infr_core::DType::Q4_0), Some(infr_core::DType::Q4_0))),
             ..base
         };
         assert_eq!(
             placement_note(Some(&named)),
             " [ubatch 1024, kv q4_0, submit unlimited]"
+        );
+    }
+
+    /// The forward note is what makes a printed distribution attributable, so it has to name every
+    /// decision that moves the last-position logits — and say nothing about the ones that do not
+    /// (`submit_cap` leaves the dispatched kernels byte-identical, so it is `bench`'s business, not
+    /// the row's). The chunk is the height CLAMPED to the window, which is what the loop cut at.
+    #[test]
+    fn next_probs_forward_note_names_the_choices_that_move_the_row() {
+        let p = infr_llama::VulkanPlacement {
+            kv_q8: true,
+            dense_streamed: true,
+            submit_cap: 112,
+            ..placement_resident(512)
+        };
+        assert_eq!(
+            next_probs_forward_note(&p),
+            "next-probs forward: ctx 4096 | kv q8_0 | prefill chunk 512 | dense weights streamed \
+             | compute coopmat"
+        );
+        // A window smaller than the chunk: the prefill cannot run taller than the cache.
+        let short = infr_llama::VulkanPlacement {
+            want_ctx: 64,
+            ..placement_resident(1024)
+        };
+        assert!(
+            next_probs_forward_note(&short).contains("prefill chunk 64 "),
+            "{}",
+            next_probs_forward_note(&short)
+        );
+        // A format the user named is reported as named, not as the ladder's f16, and the two sides
+        // differ independently.
+        let named = infr_llama::VulkanPlacement {
+            kv_named: Some((Some(infr_core::DType::Q4_0), Some(infr_core::DType::F16))),
+            experts_paged: true,
+            ubatch_pinned: true,
+            coopmat_f16: false,
+            ..placement_resident(256)
+        };
+        assert_eq!(
+            next_probs_forward_note(&named),
+            "next-probs forward: ctx 4096 | kv q4_0/f16 | prefill chunk 256 (pinned) | experts \
+             paged | compute scalar"
         );
     }
 
@@ -5135,5 +5506,163 @@ mod tests {
             .to_string()
             .contains("read --prompt-file"));
         std::fs::remove_dir(&dir).expect("remove temp dir");
+    }
+
+    /// The probabilities of a 5-logit row, divided by the sum over ALL five (the whole vocabulary of
+    /// this synthetic row), computed by hand in doubles: if `top_probs` disagrees with these digits it
+    /// is not reporting the distribution llama-server reports.
+    #[test]
+    fn top_probs_matches_a_hand_computed_softmax_over_the_full_vocabulary() {
+        let logits = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let want = [
+            (4u32, 5.0f32, 0.636408646558831f64),
+            (3, 4.0, 0.234121657252737),
+            (2, 3.0, 0.086128544436269),
+            (1, 2.0, 0.031684920796124),
+            (0, 1.0, 0.011656230956040),
+        ];
+        let got = top_probs(&logits, 5).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want) {
+            assert_eq!(
+                (g.0, g.1),
+                (w.0, w.1),
+                "sorted by prob descending, raw logit kept: {g:?}"
+            );
+            assert!((g.2 - w.2).abs() < 1e-12, "{g:?} vs {w:?}");
+        }
+        // 5 + ln(e^-4 + e^-3 + e^-2 + e^-1 + 1).
+        assert!((logsumexp(&logits).unwrap() - 5.451914395937593).abs() < 1e-12);
+        // A shorter request keeps the leading entries, in order.
+        assert_eq!(
+            top_probs(&logits, 2)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.0)
+                .collect::<Vec<_>>(),
+            [4, 3]
+        );
+    }
+
+    /// `exp(10000)` is `inf` and `exp(-10000)` is 0 in any width, so the max-subtraction is the whole
+    /// reason a row at that scale reports anything at all — and two ids share the maximum here, which
+    /// is the tie a greedy divergence and a "numeric bug" look identical without.
+    #[test]
+    fn top_probs_survives_logits_at_1e4_and_breaks_the_max_tie_by_lower_id() {
+        let logits = [10000.0f32, 9999.0, -10000.0, 10000.0, 0.0];
+        let got = top_probs(&logits, 5).unwrap();
+        for (_, _, p) in &got {
+            assert!(p.is_finite(), "non-finite probability {p}");
+        }
+        assert_eq!(
+            got.iter().map(|e| e.0).collect::<Vec<_>>(),
+            [0, 3, 1, 2, 4],
+            "the two maxima come first, lower id first, and the two underflowed zeros are tied too"
+        );
+        assert!((got[0].2 - 0.422318798251518).abs() < 1e-12);
+        assert!((got[1].2 - 0.422318798251518).abs() < 1e-12);
+        assert!((got[2].2 - 0.155362403496964).abs() < 1e-12);
+        assert_eq!(got[3].2, 0.0);
+        let mass: f64 = got.iter().map(|e| e.2).sum();
+        assert!((mass - 1.0).abs() < 1e-12, "the row's mass is {mass}");
+    }
+
+    #[test]
+    fn top_probs_clamps_n_to_the_vocabulary_and_refuses_an_empty_row() {
+        let logits = [0.5f32, -0.5];
+        assert_eq!(top_probs(&logits, 3).unwrap().len(), 2);
+        assert_eq!(top_probs(&logits, 0).unwrap(), []);
+        // No logits is not an empty distribution: it is a caller that prefilled nothing, and saying so
+        // beats printing a report with no argmax in it.
+        assert!(top_probs(&[], 10).is_err());
+        assert_eq!(logsumexp(&[]), None);
+    }
+
+    /// The report's SHAPE, decided without a model: `--json` is ONE object carrying the four keys and
+    /// the entry fields a parity harness reads; the text form is the summary line plus one line per
+    /// entry, in the order given.
+    #[test]
+    fn next_probs_report_is_one_json_object_or_one_line_per_entry() {
+        let entries = vec![
+            (4u32, " the".to_string(), 5.0f32, 0.636408646558831f64),
+            (3, "\n".to_string(), 4.0, 0.234121657252737),
+        ];
+        let j = next_probs_report(128, 4, 5.451914395937593, &entries, true);
+        assert_eq!(j.lines().count(), 1, "--json is one object on one line");
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["n_ids"], 128);
+        assert_eq!(v["argmax"], 4);
+        assert!((v["logsumexp"].as_f64().unwrap() - 5.451914395937593).abs() < 1e-9);
+        let top = v["top"].as_array().unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["id"], 4);
+        assert_eq!(top[0]["piece"], " the");
+        assert_eq!(top[0]["logit"], 5.0);
+        assert!((top[0]["prob"].as_f64().unwrap() - 0.636408646558831).abs() < 1e-12);
+        assert_eq!(top[1]["id"], 3);
+
+        let t = next_probs_report(128, 4, 5.451914395937593, &entries, false);
+        let lines: Vec<&str> = t.lines().collect();
+        assert_eq!(lines.len(), 3, "the summary line plus one per entry: {t}");
+        assert_eq!(lines[0], "n_ids=128 argmax=4 logsumexp=5.451914396");
+        assert!(
+            lines[1].starts_with("   0       4 prob=0.636408647 logit=5.000000"),
+            "{}",
+            lines[1]
+        );
+        // A newline inside a piece stays escaped, so the line count IS the entry count.
+        assert!(lines[2].ends_with("piece=\"\\n\""), "{}", lines[2]);
+    }
+
+    /// `--ids-file` round-trips exactly what `--print-ids` / `--print-prompt-ids` wrote, and takes the
+    /// same ids typed on one line.
+    #[test]
+    fn next_probs_ids_file_reads_whitespace_separated_ids_and_refuses_an_empty_one() {
+        let dir = std::env::temp_dir().join(format!("infr-cli-next-probs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("ids.txt");
+        write_token_ids(&path, &[7, 0, 151645]).unwrap();
+        assert_eq!(read_token_ids_file(&path).unwrap(), [7, 0, 151645]);
+        std::fs::write(&path, "  1\t2\n3  \n").unwrap();
+        assert_eq!(read_token_ids_file(&path).unwrap(), [1, 2, 3]);
+        std::fs::write(&path, "1 two 3\n").unwrap();
+        assert!(read_token_ids_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("is not a token id"));
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(read_token_ids_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("no token ids"));
+        std::fs::remove_file(&path).expect("remove ids file");
+        std::fs::remove_dir(&dir).expect("remove temp dir");
+    }
+
+    /// The whole `next-probs` path over a model that exists on this box:
+    /// `INFR_TEST_GGUF=/path/to.m.gguf cargo test -p infr-cli -- --ignored --nocapture`. The ids come
+    /// from the model's own raw tokenizer, so the prompt prefilled here is the one `run --raw` would
+    /// have sent, and what it prints is the row to set next to llama-server's `n_probs` answer.
+    #[test]
+    #[ignore = "needs the GGUF named by INFR_TEST_GGUF and a device to prefill it on"]
+    fn next_probs_reports_the_last_position_of_a_real_prompt() -> anyhow::Result<()> {
+        let gguf =
+            std::env::var("INFR_TEST_GGUF").context("set INFR_TEST_GGUF to a `.gguf` path")?;
+        let cfg = Arc::new(Config::load(&ConfigOverrides::default())?);
+        // The provenance half of the same resolution, as `main()` threads the pair.
+        let specified = specified_by_the_layers(&ConfigOverrides::default())?;
+        let loaded = infr_llama::SeamModel::load_with(Path::new(&gguf), None, cfg.clone())?;
+        let ids = loaded.encode_raw("The capital of France is")?;
+        let dir = std::env::temp_dir().join(format!(
+            "infr-cli-next-probs-ignored-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("ids.txt");
+        write_token_ids(&path, &ids)?;
+        cmd_next_probs(&gguf, &path, 10, true, &cfg, &specified)?;
+        std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&dir)?;
+        Ok(())
     }
 }

@@ -516,7 +516,7 @@ pub(crate) fn generate_dense_vulkan(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    generate_dense_vulkan_session(
+    generate_dense_vulkan_tap(
         vk,
         g,
         cfg,
@@ -525,11 +525,52 @@ pub(crate) fn generate_dense_vulkan(
         ple,
         prompt,
         max_new,
-        on_token,
-        &mut None,
+        // A generation sizes its KV to exactly what it may generate.
         prompt.len() + max_new + 1,
+        on_token,
+        None, // logits_out
+    )
+}
+
+/// The ONE one-shot Vulkan session: [`generate_dense_vulkan`] (and with it `infr run --raw`) and
+/// `infr next-probs` both reach [`generate_dense_vulkan_session`] through HERE, so the session they
+/// report from is one construction rather than two that can drift apart — the same empty cache, the
+/// same [`vulkan_moe_binder`] placement sweep (auto-q8 KV, prefill chunk height, dense streaming /
+/// expert paging), no grammar constraint, no per-sequence request.
+///
+/// Two arguments are what a distribution report needs and a plain generation has no reason to
+/// separate:
+/// - `want_ctx` is the KV window the placement is PRICED against, decoupled from how many tokens
+///   this call samples. next-probs passes the `--max-new` window of the run it is diagnosing while
+///   generating exactly one token: the residency/streaming decision and the chunk height are made
+///   against `want_ctx`, and a run whose KV was sized differently can land on a different one of
+///   each — which moves the last-position logits, so a near-tie would otherwise be
+///   indistinguishable from a placement artifact.
+/// - `logits_out` is the runner's frontier-row tap: the LAST prompt token's raw logits, taken
+///   before sampling. `None` for every ordinary generation.
+///
+/// A caller that needs to know what the session settled on reads it back afterwards — see
+/// [`SeamModel::prefill_logits_vulkan_like_run`](crate::SeamModel::prefill_logits_vulkan_like_run),
+/// which does and prints it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_dense_vulkan_tap(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    want_ctx: usize,
+    on_token: impl FnMut(u32),
+    logits_out: Option<&mut Vec<f32>>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_vulkan_session(
+        vk, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, &mut None, want_ctx,
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
+        logits_out,
     )
 }
 
@@ -552,6 +593,11 @@ pub(crate) fn generate_dense_vulkan_session(
     want_ctx: usize,
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
+    // [`generate_dense_backend`]'s frontier-row logits tap: the LAST prompt token's raw row, taken
+    // before sampling. `None` everywhere but `infr next-probs`, whose whole report must come off the
+    // session this function builds. LAST, so adding it could not reshuffle the `Option`-heavy tail
+    // above — the same rule `req`'s doc states.
+    logits_out: Option<&mut Vec<f32>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
@@ -570,9 +616,12 @@ pub(crate) fn generate_dense_vulkan_session(
         let _gp = req.and_then(|r| r.gate_pass());
         vulkan_moe_binder(vk, g, cfg, ec, true, want_ctx)?
     };
+    // The tail's six `Option`s are `generate_dense_backend`'s hooks, in its declared order:
+    // verify, verify_ids, logits_out, h_out, denoise_req — and only `logits_out` is ever non-`None`
+    // from here.
     let out = generate_dense_backend(
         vk, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
-        constraint, None, None, None, None, None, req,
+        constraint, None, None, logits_out, None, None, req,
     )?;
     // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
     // (persists across calls on the same session — see `MoePagerSession`). A no-op when no paged

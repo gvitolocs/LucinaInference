@@ -208,6 +208,7 @@ impl ParallelSeam {
                 self.max_ctx,
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
+                None, // logits_out
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
@@ -449,6 +450,7 @@ impl ParallelSeam {
             self.max_ctx,
             constraint,
             Some(req),
+            None, // logits_out
         )?;
         Ok(stats)
     }

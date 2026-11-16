@@ -10,20 +10,26 @@ use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-/// The placement/dispatch choices a Vulkan bench run actually settled on — reported next to the
-/// throughput figure by [`SeamModel::bench_vulkan`]'s caller.
+/// The placement/dispatch choices a Vulkan forward actually settled on — reported by
+/// [`SeamModel::bench_vulkan`]'s caller next to the throughput figure and by
+/// [`SeamModel::prefill_logits_vulkan_like_run`]'s next to a distribution.
 ///
-/// **Why a throughput number is not interpretable without this.** Two of the inputs are decided at
-/// RUN time rather than by the shape being measured: the prefill chunk comes off the placement
-/// ladder (`crate::seam::ubatch_rows`, which the VRAM residency sweep may pin below the default),
-/// and the submit cap is latched from a wall-clock sample of the first slow forward
+/// **Why a number is not interpretable without this.** Two of the inputs are decided at RUN time
+/// rather than by the shape being measured: the prefill chunk comes off the placement ladder
+/// (`crate::seam::ubatch_rows`, which the VRAM residency sweep may pin below the default), and the
+/// submit cap is latched from a wall-clock sample of the first slow forward
 /// (`VulkanBackend::observe_forward`). Both change how the same graph is executed while leaving the
 /// dispatched KERNELS byte-identical, so neither is visible in `INFR_PROF_OPS` and a run that
 /// differs in either looks like unexplained variance. Printing them makes an old number
 /// attributable and an A/B checkable — if the two legs disagree here, they did not measure the
 /// same thing.
+///
+/// The fields BEYOND those three matter for a third kind of number: a probability distribution. A
+/// q8_0-vs-f16 cache, a different chunk height, weights that stream instead of sitting resident, or
+/// a device on the other side of the coopmat boundary all produce DIFFERENT last-position logits
+/// from the same ids, so `infr next-probs` has to say which forward it looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BenchPlacement {
+pub struct VulkanPlacement {
     /// Prefill chunk height in rows, as the prefill loop and the activation reserve saw it.
     pub ubatch: usize,
     /// The height came from the user (`-u` / `INFR_UBATCH`), not from the placement ladder.
@@ -36,9 +42,22 @@ pub struct BenchPlacement {
     /// Dispatches per submit; `0` = unlimited, one command buffer per forward (every healthy
     /// discrete GPU). Anything else means the submit splitter armed during this run.
     pub submit_cap: usize,
+    /// The KV capacity this forward sized its cache to — `prompt + kv_max_new + 1`, the window the
+    /// placement ladder priced. Two reports from different capacities are not from the same session.
+    pub want_ctx: usize,
+    /// Dense weights stream from host RAM through the pager arena instead of sitting resident.
+    pub dense_streamed: bool,
+    /// MoE expert banks page through the arena instead of sitting resident.
+    pub experts_paged: bool,
+    /// The device's f16 cooperative-matrix tier: which BUILT kernel set the GEMMs and the batched
+    /// attention of this forward dispatched (false = the scalar/vector fallback). The two round
+    /// differently, so two rows are only comparable when this agrees too. There is no finer
+    /// "attention tier" to report: the flash / register-O / split-K pick is made per call inside the
+    /// recorder from the shapes it is handed, and every one of those builds is gated on this first.
+    pub coopmat_f16: bool,
 }
 
-/// What the device held at the two points of a Vulkan bench — the VRAM twin of [`BenchPlacement`],
+/// What the device held at the two points of a Vulkan bench — the VRAM twin of [`VulkanPlacement`],
 /// reported by [`SeamModel::bench_vulkan`] because a throughput number alone cannot tell you what
 /// it cost to get.
 ///
@@ -864,6 +883,7 @@ impl SeamModel {
             max_ctx,
             constraint,
             req,
+            None, // logits_out
         )?;
         // The cold init may have re-clamped the window against the memory the device reported free
         // once the weights were resident (`crate::seam::reclamp_ctx_to_live_room`), so the slot's
@@ -919,7 +939,7 @@ impl SeamModel {
 
     /// [`encode`](Self::encode) plus llama.cpp's `/completion` BOS rule — `infr run --raw`'s
     /// prompt, i.e. bare text with BOS prepended iff the GGUF sets `add_bos_token` and still no
-    /// chat template. See [`crate::tokenize_raw`] for the cited reference lines.
+    /// chat template. See `tokenizer.rs`'s `tokenize_raw` for the cited reference lines.
     pub fn encode_raw(&self, text: &str) -> Result<Vec<u32>> {
         crate::tokenize_raw(&self.gguf, &self.tokenizer, text)
     }
@@ -1009,10 +1029,29 @@ impl SeamModel {
             .map_err(|e| anyhow!("decode: {e}"))
     }
 
-    /// DiffusionGemma Phase-1 validation: a causal prefill of `tokens` on the CPU reference
-    /// backend, returning the LAST token's raw logits (`[vocab]`, pre-softmax, post-softcap). Not
-    /// specific to diffusion-gemma — works for any arch on this seam — but this is its only
-    /// caller today (see `docs/diffusion-gemma.md`).
+    /// Detokenize ONE id to its text piece WITH special tokens kept — [`decode`](Self::decode)'s
+    /// marker-preserving twin, the same call [`crate::chat::OaiRenderer::decode_ids`] makes. A
+    /// distribution report has to be able to NAME an EOG token instead of printing it as an empty
+    /// string.
+    pub fn token_piece(&self, id: u32) -> Result<String> {
+        self.tokenizer
+            .decode(&[id], false)
+            .map_err(|e| anyhow!("token_piece({id}): {e}"))
+    }
+
+    /// A causal prefill of `tokens` on the CPU reference backend, returning the LAST token's raw
+    /// logits (`[vocab]`, pre-softmax, post-softcap). DiffusionGemma Phase-1 validation
+    /// (`docs/diffusion-gemma.md`) and `infr next-probs --dev cpu` are its callers, and it is not
+    /// arch-specific — any model runs here.
+    ///
+    /// next-probs needs no CPU twin of
+    /// [`prefill_logits_vulkan_like_run`](Self::prefill_logits_vulkan_like_run) because on this
+    /// backend there is nothing to twin: the mmap binder is the same on both paths, and the two
+    /// things that move a row on Vulkan — the placement sweep's pins and
+    /// `reclamp_ctx_to_live_room`'s re-chunking — never fire here (the first belongs to
+    /// `vulkan_moe_binder`, the second returns as soon as a backend reports no device budget). The
+    /// KV capacity difference (`tokens.len() + 2` versus run's `prompt + max_new + 1`) sizes an
+    /// allocation; every kernel reads the live `kv_len`, not the capacity.
     pub fn prefill_logits_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         crate::seam::verify_dense_cpu(
             &self.gguf,
@@ -1056,7 +1095,10 @@ impl SeamModel {
     }
 
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan
-    /// cross-backend parity check.
+    /// cross-backend parity check — the BIT-PARITY ORACLE, which is why it uploads every tensor
+    /// resident through the naive binder in `seam::verify_dense_vulkan` instead of taking the
+    /// placement sweep. That makes it the wrong path for reporting what a real run produced; see
+    /// [`prefill_logits_vulkan_like_run`](Self::prefill_logits_vulkan_like_run).
     pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
@@ -1069,6 +1111,36 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             tokens,
         )
+    }
+
+    /// `infr next-probs`'s entry: the LAST prompt position's raw logits (`[vocab]`, pre-softmax),
+    /// taken out of the session `infr run --raw` builds — the same
+    /// [`generate_vulkan_ids`](Self::generate_vulkan_ids) forward, the same `vulkan_moe_binder`
+    /// placement sweep, the same KV window — so the row diagnoses THAT.
+    ///
+    /// **Why not [`prefill_logits_vulkan`](Self::prefill_logits_vulkan).** The oracle arm skips the
+    /// placement sweep and sizes the KV to the prompt alone, which is a different executor whenever
+    /// the sweep moves: an auto-q8_0 cache, a shorter prefill chunk, streamed dense layers or paged
+    /// experts each change the last-position logits of a hybrid model. And for the model a parity
+    /// harness most wants explained — a large MoE — "all resident" is not merely different but
+    /// impossible: the upload the oracle insists on exceeds the card where `run --raw` pages
+    /// successfully, so the report would refuse exactly the case it exists for.
+    ///
+    /// `kv_max_new` is the generation window of the run being diagnosed: the KV is sized
+    /// `prompt.len() + kv_max_new + 1`, exactly as `run --raw` sizes it, because the placement
+    /// decisions — and therefore the row — are priced against that window. This call still produces
+    /// ONE token: the tap fires at the first decode row, before its sampler.
+    ///
+    /// Returns what the session actually ran under, since a distribution is only comparable to a
+    /// forward that made the same choices.
+    pub fn prefill_logits_vulkan_like_run(
+        &self,
+        prompt_tokens: &[u32],
+        kv_max_new: usize,
+        logits_out: &mut Vec<f32>,
+    ) -> Result<VulkanPlacement> {
+        self.vulkan_ids_tap(prompt_tokens, 1, kv_max_new, |_id| {}, Some(logits_out))
+            .map(|(_generated, placement)| placement)
     }
 
     /// All-row Vulkan logits (`[tokens.len() * vocab]`) for parity checks on short prompts; see
@@ -1196,9 +1268,29 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
+        self.vulkan_ids_tap(prompt_tokens, max_new, max_new, on_id, None)
+            .map(|(generated, _)| generated)
+    }
+
+    /// The ONE raw-id Vulkan forward this type has: [`generate_vulkan_ids`](Self::generate_vulkan_ids)
+    /// (`infr run --raw`, the llama.cpp parity path) and
+    /// [`prefill_logits_vulkan_like_run`](Self::prefill_logits_vulkan_like_run) (`infr next-probs`)
+    /// both land here, so the session the two report from — one fresh backend, the placement sweep,
+    /// the `prompt + window + 1` KV sizing rule — is a single construction rather than two that can
+    /// drift apart. `kv_max_new` is how many tokens of generation the KV is sized for, which is
+    /// `max_new` itself for every caller but next-probs.
+    fn vulkan_ids_tap(
+        &self,
+        prompt_tokens: &[u32],
+        max_new: usize,
+        kv_max_new: usize,
+        mut on_id: impl FnMut(u32),
+        logits_out: Option<&mut Vec<f32>>,
+    ) -> Result<(Vec<u32>, VulkanPlacement)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
-        let (generated, _stats) = crate::seam::generate_dense_vulkan(
+        let want_ctx = prompt_tokens.len() + kv_max_new + 1;
+        let (generated, _stats) = crate::seam::generate_dense_vulkan_tap(
             &vk,
             &self.gguf,
             &self.cfg,
@@ -1207,9 +1299,35 @@ impl SeamModel {
             self.per_layer_embd.as_ref(),
             prompt_tokens,
             max_new,
-            on_id,
+            want_ctx,
+            &mut on_id,
+            logits_out,
         )?;
-        Ok(generated)
+        Ok((generated, self.vulkan_placement(&vk, want_ctx)))
+    }
+
+    /// What the live session actually settled on, read while the backend that decided it is still
+    /// open: the chunk height and KV format are the pins the placement ladder wrote, the submit cap
+    /// is the backend's own, and streaming/paging are per-backend state that dies with it. Read this
+    /// AFTER the forward — the ladder only pins during a first load, and the splitter only latches
+    /// during a run.
+    fn vulkan_placement(
+        &self,
+        vk: &infr_vulkan::VulkanBackend,
+        want_ctx: usize,
+    ) -> VulkanPlacement {
+        VulkanPlacement {
+            ubatch: crate::seam::ubatch_rows(&self.ecfg),
+            ubatch_pinned: self.ecfg.device.ubatch_specified,
+            kv_q8: crate::seam::kv_auto_q8(),
+            kv_named: (self.ecfg.kv.type_k_specified || self.ecfg.kv.type_v_specified)
+                .then_some((self.ecfg.kv.type_k, self.ecfg.kv.type_v)),
+            submit_cap: vk.submit_cap_now(),
+            want_ctx,
+            dense_streamed: vk.dense_paged(),
+            experts_paged: vk.moe_paged(),
+            coopmat_f16: vk.capabilities().f16_coopmat(),
+        }
     }
 
     /// Multi-GPU PIPELINE (layer-split) twin of [`generate_dense_vulkan`](Self::generate_dense_vulkan):
@@ -1368,7 +1486,7 @@ impl SeamModel {
     /// persistent session) + an untimed pipeline warmup, then per rep — reset the KV, warm it to
     /// `depth` (untimed), and time ONE metric: `pg` = a whole (P prefill + G decode) turn,
     /// `n_gen > 0` = decode at depth, else prefill of `n_prompt` at depth. Returns the per-rep
-    /// tokens/sec samples, the [`BenchPlacement`] the run actually used and the [`BenchVram`] it
+    /// tokens/sec samples, the [`VulkanPlacement`] the run actually used and the [`BenchVram`] it
     /// cost — so a number can be attributed after the fact instead of being an unlabelled,
     /// unexplained throughput figure.
     pub fn bench_vulkan(
@@ -1378,7 +1496,7 @@ impl SeamModel {
         depth: usize,
         pg: Option<(usize, usize)>,
         reps: usize,
-    ) -> Result<(Vec<f64>, BenchPlacement, BenchVram)> {
+    ) -> Result<(Vec<f64>, VulkanPlacement, BenchVram)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
@@ -1406,6 +1524,7 @@ impl SeamModel {
                 want,
                 None, // constraint
                 None, // req: bench is a sole sequence — env sampling, no gate
+                None, // logits_out
             )?;
             Ok(stats)
         };
@@ -1499,14 +1618,7 @@ impl SeamModel {
         // `PlacementScope`, so these read the process-wide fallback pins this session wrote.
         Ok((
             samples,
-            BenchPlacement {
-                ubatch: crate::seam::ubatch_rows(&self.ecfg),
-                ubatch_pinned: self.ecfg.device.ubatch_specified,
-                kv_q8: crate::seam::kv_auto_q8(),
-                kv_named: (self.ecfg.kv.type_k_specified || self.ecfg.kv.type_v_specified)
-                    .then_some((self.ecfg.kv.type_k, self.ecfg.kv.type_v)),
-                submit_cap: vk.submit_cap_now(),
-            },
+            self.vulkan_placement(&vk, want),
             // Same reason as the placement: this is the last moment the counters are reachable, and
             // the shape that was timed is what they measured.
             BenchVram {
