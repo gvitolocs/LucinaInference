@@ -7,9 +7,15 @@
 #   git rev-list --reverse --first-parent <last>..main
 # it re-makes a commit on the clone's `public-main` with the external sync tool — same author,
 # dates and message, a scrubbed tree, merges collapsed to their single scrubbed mainline
-# parent, exactly as the first sync did. It then runs the private-string gate on every re-made
-# commit and gitleaks over the new range, and STOPS. It pushes only with --push, and then only
-# `public-main` -> the remote's `main`.
+# parent, exactly as the first sync did. It then runs the private-string gate in PUBLIC mode on
+# every re-made commit — a public commit may carry neither a private string nor one of the ledger
+# trailers the private main keeps — and gitleaks over the new range, with this repository's
+# .gitleaksignore as the ignore file (the scrubbed clone has no copy of its own yet), and STOPS.
+# It pushes only with --push, and then only `public-main` -> the remote's `main`.
+#
+# A gate that stops does so after the re-make: public-main has moved while the mapping file has
+# not. The next run notices that and resets public-main back to the mapping's last_public before
+# re-making, locally — it never touches the remote.
 #
 # usage: scripts/public-sync.sh [--push]
 set -euo pipefail
@@ -23,7 +29,7 @@ do_push=0
 for a in "$@"; do
   case "$a" in
     --push) do_push=1 ;;
-    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) die "usage: $prog [--push]" ;;
   esac
 done
@@ -85,8 +91,20 @@ new_src=$(git -C "$clone" rev-list --first-parent "$last_source..$source_ref")
 tip_before=$(git -C "$clone" rev-parse refs/heads/public-main)
 did_remake=0
 if [ -n "$new_src" ]; then
-  [ "$tip_before" = "$last_public" ] \
-    || info "note: clone public-main ($tip_before) differs from the mapping's last_public ($last_public)"
+  # A previous run can stop after the re-make and before the mapping is advanced (a gate refused,
+  # the tool refused mid-chain), leaving public-main ahead of last_public. Start from the recorded
+  # baseline instead of building on that half-synced chain: a local update-ref, nothing pushed.
+  if [ "$tip_before" != "$last_public" ]; then
+    git -C "$clone" rev-parse --verify -q "${last_public}^{commit}" >/dev/null \
+      || die "the mapping's last_public ($last_public) is not a commit in the clone; fix $map by hand" 1
+    if git -C "$clone" merge-base --is-ancestor "$last_public" "$tip_before"; then
+      info "public-main is ahead of the mapping's last_public — a previous run stopped after its re-make; resetting it to $(git -C "$clone" rev-parse --short "$last_public")"
+      git -C "$clone" update-ref refs/heads/public-main "$last_public"
+      tip_before=$last_public
+    else
+      die "public-main ($tip_before) has diverged from the mapping's last_public ($last_public) — not resetting it; see docs/ci/PUBLIC-SYNC.md to resolve by hand" 1
+    fi
+  fi
   info "re-making the scrubbed chain from base $(git -C "$clone" rev-parse --short "$base") onto public-main"
   if ! "$tool" rebuild --repo "$clone" --ref refs/heads/public-main --base "$base" -- --first-parent "$base..$source_ref"; then
     die "the sync tool refused (a residual private string, or a blob it could not scrub). public-main may have moved to $(git -C "$clone" rev-parse --short refs/heads/public-main); see docs/ci/PUBLIC-SYNC.md to reset it" 1
@@ -112,22 +130,30 @@ fi
 nverify=$(git -C "$clone" rev-list --first-parent --count "$verify_range")
 info "verifying $nverify commit(s) in $verify_range"
 
-# gate 1: the private-string check on every commit in the range
+# gate 1: the private-string check, in public mode, on every commit in the range — so a ledger
+# trailer the scrub tool failed to drop is refused here too, not only by the tool
 gate=$root/scripts/check-private-strings.sh
 [ -x "$gate" ] || die "the private-string gate '$gate' is missing or not executable"
 while IFS= read -r c; do
   [ -n "$c" ] || continue
-  if ! LI_PRIVATE_REPO="$clone" "$gate" "$c"; then
-    die "public commit $(git -C "$clone" rev-parse --short "$c") still carries a private string — NOT pushing" 1
+  if ! LI_PRIVATE_REPO="$clone" "$gate" --public "$c"; then
+    die "public commit $(git -C "$clone" rev-parse --short "$c") still carries a private string or a ledger trailer — NOT pushing" 1
   fi
 done < <(git -C "$clone" rev-list --first-parent "$verify_range")
 info "private-string gate passed on all $nverify commit(s)"
 
-# gate 2: gitleaks over the same range
+# gate 2: gitleaks over the same range. The ignore file comes from THIS repository's root: the
+# scrubbed clone's own tree only gets its copy on a later sync, so its root is not the place to
+# look for it. `--gitleaks-ignore-path` needs the file to exist, so it is passed only when it does.
 gitleaks_bin=$(command -v gitleaks 2>/dev/null || true)
 [ -n "$gitleaks_bin" ] || gitleaks_bin=$HOME/.local/bin/gitleaks
 [ -x "$gitleaks_bin" ] || die "gitleaks not found (on PATH or \$HOME/.local/bin) — refusing to finish without the secret scan"
-if ! "$gitleaks_bin" git --no-banner --redact --log-opts="$verify_range" "$clone"; then
+gl_args=(--no-banner --redact --log-opts="$verify_range")
+if [ -f "$root/.gitleaksignore" ]; then
+  gl_args+=(--gitleaks-ignore-path="$root/.gitleaksignore")
+  info "gitleaks: ignoring the fingerprints listed in this repository's .gitleaksignore"
+fi
+if ! "$gitleaks_bin" git "${gl_args[@]}" "$clone"; then
   die "gitleaks reported a finding in $verify_range — NOT pushing" 1
 fi
 

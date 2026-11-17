@@ -1378,6 +1378,7 @@ dependencies = [
  "half",
  "infr-core",
  "infr-gguf",
+ "tempfile",
 ]
 
 [[package]]

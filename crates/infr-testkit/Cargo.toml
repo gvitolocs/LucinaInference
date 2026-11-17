@@ -21,3 +21,8 @@ infr-core.workspace = true
 infr-gguf.workspace = true
 half.workspace = true
 bytemuck.workspace = true
+
+[dev-dependencies]
+# The private-string gate self-test builds throwaway git repositories under a temporary directory
+# that is removed when it is dropped, even while a failing assertion unwinds.
+tempfile = "3"

@@ -5,10 +5,18 @@
 # this script is that gate. Procedure: docs/ci/PUBLIC-SYNC.md.
 #
 # usage:
-#   scripts/check-private-strings.sh [--tree]     # the working tree's tracked files (default)
-#   scripts/check-private-strings.sh <rev>        # tracked files at <rev> AND <rev>'s message
+#   scripts/check-private-strings.sh [--tree]         # the working tree's tracked files (default)
+#   scripts/check-private-strings.sh <rev>            # tracked files at <rev> AND <rev>'s message
+#   scripts/check-private-strings.sh --public <rev>   # the <rev> check, and refuse a ledger trailer
 #
-# exit: 0 clean · 1 a private string was found (file:line listed) · 2 LI_PRIVATE_PATTERNS unset
+# exit: 0 clean · 1 a private string — or, in --public mode, a ledger trailer — was found (the
+#   offending file:line or message line is listed) · 2 LI_PRIVATE_PATTERNS unset, or bad usage
+#
+# --public is the mode for commits that are about to become PUBLIC. The private `main` keeps the
+# ledger trailers on every worker commit (that is how the ledger attributes the work), so this
+# check is opt-in and nothing else changes; the sync runs it on the scrubbed clone, where those
+# lines must already have been dropped by the scrub tool. It is the second line of defence
+# behind the scrub tool, and a public commit carrying one is refused.
 #
 # Set LI_PRIVATE_REPO to scan a repository other than this one (public-sync.sh points it at
 # the scrubbed clone to check the commits it re-makes there). The pattern is always read from
@@ -46,12 +54,22 @@ EOF
 fi
 
 # --- what to scan -------------------------------------------------------------
-mode=tree; rev=""
-case "${1:-}" in
-  ""|--tree) ;;
-  -*) echo "check-private-strings: unknown option $1 (usage: [--tree | <rev>])" >&2; exit 2 ;;
-  *) mode=rev; rev=$1 ;;
-esac
+mode=tree; rev=""; public_mode=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tree) mode=tree ;;
+    --public) public_mode=1 ;;
+    -*) echo "check-private-strings: unknown option $1 (usage: [--tree | --public <rev> | <rev>])" >&2; exit 2 ;;
+    *)
+      [ -z "$rev" ] || { echo "check-private-strings: more than one revision given" >&2; exit 2; }
+      mode=rev; rev=$1
+      ;;
+  esac
+  shift
+done
+if [ "$public_mode" = 1 ] && [ "$mode" != rev ]; then
+  echo "check-private-strings: --public judges a commit message, so it needs a <rev>" >&2; exit 2
+fi
 if [ "$mode" = rev ] && ! git -C "$repo" rev-parse --verify -q "${rev}^{commit}" >/dev/null; then
   echo "check-private-strings: '$rev' is not a commit in $repo" >&2; exit 2
 fi
@@ -80,8 +98,22 @@ if [ "$mode" = rev ]; then
   esac
 fi
 
+if [ "$public_mode" = 1 ]; then
+  # The ledger trailers, and the lane's own stamps, that the scrub tool must have dropped. A key
+  # at the start of any message line is a hit; `Change-Id:`-style keys with a suffix are not.
+  ledger_re='^[[:space:]]*(Lead|Run|Change|Refs|Fixes|Lane-Run|Written-By)[[:space:]]*:'
+  ledger=$(git -C "$repo" log -1 --format=%B "$rev" 2>/dev/null | grep -nE "$ledger_re"); lrc=$?
+  case $lrc in
+    0) while IFS= read -r line; do [ -n "$line" ] && note "commit ${rev} message, ledger trailer ${line}"; done <<<"$ledger" ;;
+    1) : ;;
+    *) echo "check-private-strings: ledger-trailer scan failed on $rev" >&2; exit 1 ;;
+  esac
+fi
+
 if [ -n "$matches" ]; then
-  echo "check-private-strings: PRIVATE STRINGS found in ${rev:-the working tree}:" >&2
+  found="PRIVATE STRINGS"
+  [ "$public_mode" = 1 ] && found="PRIVATE STRINGS or ledger trailers"
+  echo "check-private-strings: $found found in ${rev:-the working tree}:" >&2
   printf '%s\n' "$matches" >&2
   exit 1
 fi
