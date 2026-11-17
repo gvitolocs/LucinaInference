@@ -5,8 +5,11 @@
 //!   lucina-parity gate --n-vocab V --ref R --self S1,S2,.. --test T [--k 2]
 //!   lucina-parity tokenize --model M.gguf --lines corpus.txt --out work/infr/tok
 //!   lucina-parity tokens-diff --ref R.tokens.txt --test T.tokens.txt [--lines corpus.txt]
+//!   lucina-parity kl-compare --ref A.logits [--ref B.logits] [--cand C.logits] [--top 10]
+//!                            [--tsv out.tsv] [--json out.json]
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use lucina_parity::kl::{kl_compare, KlOptions};
 use lucina_parity::{first_token_diff, read_tokens, Logits, Report, Tolerance};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +55,28 @@ enum Cmd {
         test: PathBuf,
         #[arg(long, default_value_t = 2.0)]
         k: f64,
+    },
+    /// Compare next-token distributions of llama.cpp `--kl-divergence-base` log-probability files.
+    /// The first `--ref` is the base; the other `--ref` files are the reference against itself and
+    /// set the per-position noise floor every `--cand` is judged against. Refused unless all the
+    /// files carry the identical header and the identical token array. Exits non-zero when a
+    /// candidate is outside the floor at some position.
+    KlCompare {
+        /// log-probability files; the first is the base, the rest measure the reference's own spread
+        #[arg(long = "ref")]
+        references: Vec<PathBuf>,
+        /// log-probability files the pass rule is applied to
+        #[arg(long = "cand")]
+        candidates: Vec<PathBuf>,
+        /// entries of each top-k shown for a failing position
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        /// write one row per (position, file) here
+        #[arg(long)]
+        tsv: Option<PathBuf>,
+        /// write the summary and the failure list here, as JSON
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Tokenize each line (with \n, \t, \\ escapes) like `llama-logits --tokenize-lines`.
     Tokenize {
@@ -234,6 +259,33 @@ fn main() -> Result<()> {
             tol.check(&rep)?;
             // print-ok: the gate's verdict line, on stderr so the JSON above stays parseable.
             eprintln!("PASS");
+        }
+        Cmd::KlCompare {
+            references,
+            candidates,
+            top,
+            tsv,
+            json,
+        } => {
+            let opts = KlOptions {
+                refs: references,
+                cands: candidates,
+                top,
+            };
+            let sum = kl_compare(&opts, tsv.as_deref())?;
+            if let Some(p) = &json {
+                std::fs::write(p, serde_json::to_string_pretty(&sum.json())?)
+                    .with_context(|| format!("write {}", p.display()))?;
+            }
+            for line in sum.report() {
+                // print-ok: `kl-compare`'s summary IS this subcommand's report — the position-by-position
+                // detail goes to `--tsv` and `--json`, stdout is what a human or a log reads.
+                println!("{line}");
+            }
+            let n = sum.failure_count();
+            if n > 0 {
+                bail!("kl-compare: {n} candidate positions outside the reference's own floor");
+            }
         }
         Cmd::Tokenize { model, lines, out } => {
             let m = load_cpu(&model)?;

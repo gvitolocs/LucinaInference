@@ -14,6 +14,12 @@
 //! The tolerance is not a guess: [`Tolerance::from_self_spread`] derives it from how far llama.cpp
 //! moves against itself across configurations it treats as equivalent (batch size, threads, KV
 //! precision). See docs/lucina/stage1-parity.md for the measured spread.
+//!
+//! The `kl` module does the same thing one level further down and on the other input format: it
+//! compares the next-token DISTRIBUTIONS of llama.cpp `--kl-divergence-base` log-probability files,
+//! position by position, with the noise floor measured from the reference against itself.
+
+pub mod kl;
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
