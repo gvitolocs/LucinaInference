@@ -109,7 +109,7 @@ first run never silently blesses an un-synced clone.
 ## The procedure: `scripts/public-sync.sh [--push]`
 
 Inputs come from `scripts/local.env`: `LI_PUBLIC_CLONE`, `LI_PUBLIC_SYNC_TOOL`,
-`LI_PUBLIC_REMOTE`.
+`LI_PUBLIC_REMOTE`, and `LI_PUBLIC_CHECK` (the third check below, needed only to push).
 
 1. Confirm the clone is clean, has `public-main`, and its `origin` tracks the source `main`; fetch
    the latest source `main` into the clone.
@@ -134,9 +134,29 @@ Inputs come from `scripts/local.env`: `LI_PUBLIC_CLONE`, `LI_PUBLIC_SYNC_TOOL`,
 8. **Stop.** Without `--push` nothing leaves the machine: `public-main` holds the new scrubbed
    commits, ready for review, and the script prints the `--push` command to publish them.
 
+9. **Gate 3** — only on the `--push` path, immediately before the push: the public-trailer check
+   over the exact range about to be published,
+
+   ```
+   <check-tool> public-check <clone> <remote>/main..public-main
+   ```
+
+   where `<remote>` is `LI_PUBLIC_REMOTE` as named inside the clone, and `<check-tool>` is
+   `LI_PUBLIC_CHECK` — a machine-local binary kept outside the repository like the scrub tool, so
+   the repository never carries its path or its name. Exit `0` is clean. Exit `1` lists each commit
+   in the range that still carries a `Lead:`/`Run:`/`Change:`/`Refs:`/`Fixes:`/`Lane-Run:` trailer
+   or a lane-writer `Co-Authored-By`. Exit `2` means the range itself is bad. Any non-zero exit
+   prints the tool's output and **refuses the push**; so does `--push` with `LI_PUBLIC_CHECK`
+   unset, or pointing at something that is not executable. The clone is fetched from the remote
+   first, so the range is measured against the remote's real `main`, and a remote-tracking ref the
+   clone cannot see stops the push too rather than checking a made-up range.
+
 `--push` publishes **only** `public-main → the remote's `main`** (a normal fast-forward; it never
-force-pushes and never pushes any other ref). If either gate fails, or the scrub tool refuses, the
-run stops with a non-zero exit, the mapping is not advanced, and no push happens.
+force-pushes and never pushes any other ref). If gate 1 or gate 2 fails, or the scrub tool refuses,
+the run stops with a non-zero exit, the mapping is not advanced, and no push happens. Gate 3 runs
+after step 7, so a refusal there is the one case that leaves the mapping advanced with nothing
+published — which is safe: `public-main` still holds the commits, and a later `--push` re-checks
+all three over the range the remote actually still lacks.
 
 A note on scratch-directory clones: if the clone was set up under a temporary, OS-wiped scratch
 directory it can disappear between sessions. Move it somewhere durable — `work/public-sync/clone`
@@ -148,8 +168,9 @@ IDs, so a move needs no re-sync.
 
 That every commit it is about to publish carries no `LI_PRIVATE_PATTERNS` match in any tracked file
 or message and no ledger trailer in its message (gate 1, public mode), and no secret per `gitleaks`
-(gate 2, over this repository's ignore file), and that the public branch is a one-to-one, scrubbed,
-first-parent-only mirror of source `main`.
+(gate 2, over this repository's ignore file), and — before a push — that the range it is about to
+publish is trailer-clean per the public-trailer check (gate 3), and that the public branch is a
+one-to-one, scrubbed, first-parent-only mirror of source `main`.
 
 ## Recovery
 
@@ -165,6 +186,7 @@ Exactly what such a run leaves behind, in order:
 | gate 1 (step 5) | fully re-made, ahead of `last_public` | unchanged | untouched |
 | gate 2 (step 6) | fully re-made, ahead of `last_public` | unchanged | untouched |
 | after both gates (step 7/8) | fully re-made | advanced with them | untouched unless `--push` succeeded |
+| gate 3 (step 9, `--push` only) | fully re-made | already advanced | untouched — the push refused |
 
 So the branch can be ahead of the mapping while nothing was published, and the mapping is what the
 next run reads. **The next run now repairs that itself:** before re-making it compares

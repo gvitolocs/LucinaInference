@@ -11,7 +11,9 @@
 # every re-made commit — a public commit may carry neither a private string nor one of the ledger
 # trailers the private main keeps — and gitleaks over the new range, with this repository's
 # .gitleaksignore as the ignore file (the scrubbed clone has no copy of its own yet), and STOPS.
-# It pushes only with --push, and then only `public-main` -> the remote's `main`.
+# It pushes only with --push, and then only `public-main` -> the remote's `main`, and only after a
+# third check passes: the public-trailer check (LI_PUBLIC_CHECK, its binary outside the repository)
+# over `<remote>/main..public-main`, the exact range about to be published.
 #
 # A gate that stops does so after the re-make: public-main has moved while the mapping file has
 # not. The next run notices that and resets public-main back to the mapping's last_public before
@@ -167,10 +169,35 @@ fi
 
 # --- push only when asked, and only public-main -> the remote's main ----------------------
 if [ "$do_push" != 1 ]; then
-  info "re-made $(git -C "$clone" rev-parse --short "$new_pub") on public-main and passed both gates — not pushed."
+  info "re-made $(git -C "$clone" rev-parse --short "$new_pub") on public-main and passed gates 1 and 2 — not pushed."
   info "review it, then publish with:  $prog --push"
   exit 0
 fi
+# gate 3 (--push path only, immediately before the push): the public-trailer check over the exact
+# range that is about to be published. The binary is machine-local and kept out of the repository
+# like the scrub tool, so this tracked script names only the variable, never a path.
+# `<check-tool> public-check <clone> <remote>/main..public-main` exits 0 clean, 1 naming every
+# commit that still carries a ledger trailer or a lane-writer Co-Authored-By, 2 on a bad range.
+# Any non-zero exit prints what the tool said and refuses the push.
+git -C "$clone" fetch --quiet "$remote" 2>/dev/null \
+  || info "note: could not fetch '$remote' — bounding the check with the $remote/main last seen"
+push_range="refs/remotes/$remote/main..refs/heads/public-main"
+git -C "$clone" rev-parse --verify -q "refs/remotes/$remote/main" >/dev/null \
+  || die "no refs/remotes/$remote/main in '$clone' — cannot bound the push range, NOT pushing" 1
+need LI_PUBLIC_CHECK
+[ -x "$LI_PUBLIC_CHECK" ] \
+  || die "the public-trailer check '$LI_PUBLIC_CHECK' is missing or not executable (LI_PUBLIC_CHECK)" 1
+pc_out=$("$LI_PUBLIC_CHECK" public-check "$clone" "$push_range" 2>&1) && pc_rc=0 || pc_rc=$?
+if [ "$pc_rc" != 0 ]; then
+  if [ -n "$pc_out" ]; then printf '%s\n' "$pc_out" >&2; fi
+  case "$pc_rc" in
+    1) pc_why="a commit in the range still carries a ledger trailer or a lane-writer Co-Authored-By" ;;
+    2) pc_why="bad range $push_range (exit 2)" ;;
+    *) pc_why="unexpected exit $pc_rc" ;;
+  esac
+  die "public-trailer check refused $push_range: $pc_why — NOT pushing" 1
+fi
+info "public-trailer check passed on $push_range"
 info "pushing public-main -> $remote/main"
 git -C "$clone" push "$remote" refs/heads/public-main:refs/heads/main
 info "pushed $(git -C "$clone" rev-parse --short "$new_pub") to $remote/main"

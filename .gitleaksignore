@@ -1,0 +1,2 @@
+# one false positive: prose sentence in docs/backlog.md:41 (public re-made commit of the kv-inline-bool merge); coordinator allow 2026-11-17
+7c96b3cd1b5af0a21f30ca820d1ac0abc3d5c1da:docs/backlog.md:generic-api-key:41
