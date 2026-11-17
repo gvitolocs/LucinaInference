@@ -466,6 +466,22 @@ pub(crate) fn generate_dense_backend(
     mut h_out: Option<&mut Vec<f32>>,
     // Phase-2 DiffusionGemma canvas denoise (see `DenoiseReq`'s doc). `None` everywhere else.
     denoise_req: Option<DenoiseReq>,
+    // LI-C005 (BENCH-03): the per-chunk BATCHED-PREFILL logits tap, for the reference-format base
+    // dump (`infr next-probs --like-base/--write-base`). When `Some`, the batched-prefill loop runs
+    // the LM head on EVERY row of each chunk's `n_layer`-ending span (that span is the only one that
+    // can carry the head — see `build`'s `l_end == c.n_layer || logits_rows == 0` assert) and,
+    // immediately after that dispatch, calls this sink with
+    // `(chunk_local_row_start, n_rows, row_major_vocab_wide_f32_rows)`; the rows are then DROPPED,
+    // so the peak extra VRAM is ONE dispatch's logits buffer, not the whole prompt's. The reference
+    // (`perplexity.cpp`) scores every position of every `n_ctx`-token chunk on a FRESH empty KV, so
+    // `chunk_local_row_start` equals the dispatch's ABSOLUTE position whenever the session was
+    // started empty — which is exactly how the base mode drives it (see `SeamModel`).
+    //
+    // `None` everywhere else, and the tap must stay `None` on any latency-sensitive path: enabling it
+    // does NOT shrink the prefill chunk height — the numbers infr is judged under must be the same
+    // ones `run --raw` settles on, so the tap keeps the placement's height and refuses with the exact
+    // `pf_logits_staging_bytes(chunk_rows, vocab)` number when the staging will not fit.
+    mut pf_logits: Option<crate::seam::PrefillLogitsSink<'_>>,
     // The in-flight SEQUENCE's own state (`infr serve`): its sampling overrides, its stop-sequence
     // abort latch, and its turn on the GPU baton.
     //
@@ -5329,6 +5345,29 @@ pub(crate) fn generate_dense_backend(
             }
             v
         };
+        // LI-C005 follow-up: the tap pays for its `chunk_rows * vocab * 4` staging out of residual
+        // free VRAM at the first tapped dispatch. Refuse HERE — BEFORE that dispatch, before the
+        // other spans of the chunk burn anything — with the exact numbers, rather than silently
+        // lowering `ubatch` (the placement's chosen chunk height is what `run --raw` and this dump
+        // both have to be judged under; a tap that shrinks it moves the number it measures).
+        //
+        // The probe allocates the TALLEST dispatch's staging and drops it: if the backend will not
+        // grant this size at the top of a fresh prefill, the per-dispatch alloc below will not grant
+        // it after the scratch has grown either. The per-dispatch alloc wraps the same message so a
+        // mid-prefill pressure failure is diagnosable with the same numbers.
+        if pf_logits.is_some() {
+            let tap_rows = chunks.iter().map(|&(s, e)| e - s).max().unwrap_or(0).max(1);
+            let tap_bytes = crate::seam::pf_logits_staging_bytes(tap_rows, c.vocab);
+            be.alloc(tap_bytes, BufferUsage::Staging).map_err(|e| {
+                anyhow!(
+                "next-probs --like-base: the per-dispatch logits staging of {} rows x {} vocab x \
+                 4 B = {} bytes does not fit the device (chunk height {} is the placement's; the \
+                 tap does NOT lower it — an oracle that moves the number it judges is useless). \
+                 Backend: {e}",
+                tap_rows, c.vocab, tap_bytes, tap_rows,
+            )
+            })?;
+        }
         // A chunk's uploaded inputs and its residual stream, materialized on first use and
         // dropped after the chunk's LAST span. Chunk-major (one span) therefore holds exactly one
         // chunk's buffers at a time, as it always did; layer-major holds every chunk's, which is
@@ -5440,6 +5479,12 @@ pub(crate) fn generate_dense_backend(
                     .as_ref()
                     .expect("the chunk's buffers were just materialized");
                 let pf_t0 = std::time::Instant::now();
+                // LI-C005: only the span that ends at `n_layer` can carry the LM head (build
+                // asserts `l_end == c.n_layer || logits_rows == 0`), and its dispatch is the one
+                // whose rows the base-file tap consumes. `chunk-major` prefill has exactly this one
+                // span; `layer-major` has it as its LAST span (the `n_layer-1 .. n_layer` one).
+                let tap_here = pf_logits.is_some() && span.end == c.n_layer;
+                let logits_rows = if tap_here { ch.m } else { 0 };
                 // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
                 // chunk's logits — the decode loop below feeds the LAST prompt token itself and
                 // samples from its own fresh logits — so the LM-head tail (whole-chunk
@@ -5453,7 +5498,7 @@ pub(crate) fn generate_dense_backend(
                 let (pf_g, pf_h) = build(
                     ch.m,
                     cstart,
-                    0,
+                    logits_rows,
                     false,
                     None,
                     false,
@@ -5469,6 +5514,27 @@ pub(crate) fn generate_dense_backend(
                 let t_build = pf_t0.elapsed();
                 let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                 let t_compile = pf_t0.elapsed();
+                // The tap's `[rows, vocab]` logits readback: staged exactly like `verify`'s
+                // `vf_logits_buf` (see that branch), ONE dispatch's worth, downloaded then dropped
+                // below so the whole prompt's logits are never resident at once. The error message
+                // names the numbers because a mid-prefill pressure failure under a different chunk
+                // height than the pre-loop probe would otherwise look like a generic VRAM guard trip.
+                let pf_logits_buf = if tap_here {
+                    let bytes = crate::seam::pf_logits_staging_bytes(ch.m, c.vocab);
+                    Some(be.alloc(bytes, BufferUsage::Staging).map_err(|e| {
+                        anyhow!(
+                            "next-probs --like-base: the tapped dispatch's logits staging of \
+                                 {} rows x {} vocab x 4 B = {} bytes does not fit at chunk \
+                                 position {}: {e}",
+                            ch.m,
+                            c.vocab,
+                            bytes,
+                            cstart,
+                        )
+                    })?)
+                } else {
+                    None
+                };
                 let mut pf_b = Bindings::new();
                 if let Some(ids) = pf_h.tok_ids {
                     pf_b.bind(ids, ch.input.as_ref());
@@ -5494,12 +5560,30 @@ pub(crate) fn generate_dense_backend(
                     &vbufs[..],
                     &wbufs[..],
                 );
+                if let (Some(lh), Some(lb)) = (pf_h.logits, pf_logits_buf.as_ref()) {
+                    pf_b.bind(lh, lb.as_ref());
+                }
                 debug_assert!(
-                    pf_h.logits.is_none(),
-                    "headless prefill build has no logits"
+                    pf_h.logits.is_none() == !tap_here,
+                    "the LM head is present exactly on the tapped head-span dispatch"
                 );
                 be.execute(pf_plan.as_ref(), &pf_b)
                     .map_err(|e| anyhow!("{e}"))?;
+                // LI-C005: download THIS dispatch's rows, hand them to the sink (which quantises,
+                // writes, and drops them), then drop the buffer. `cstart` is the dispatch's
+                // ABSOLUTE row-start; a base-dump session starts on an EMPTY cache, so it is also
+                // the chunk-local start the reference's `first..=last` window is measured from.
+                if tap_here {
+                    let lb = pf_logits_buf
+                        .as_ref()
+                        .expect("a tapped dispatch allocated its logits buffer");
+                    let mut rows = vec![0.0f32; ch.m * c.vocab];
+                    be.download(lb.as_ref(), bytemuck::cast_slice_mut(&mut rows))
+                        .map_err(|e| anyhow!("{e}"))?;
+                    if let Some(sink) = pf_logits.as_mut() {
+                        sink(cstart, ch.m, &rows)?;
+                    }
+                }
                 // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
                 // build, plan compile, and execute (record + submit + GPU) — where a small-batch
                 // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is

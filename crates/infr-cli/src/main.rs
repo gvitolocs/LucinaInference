@@ -1,6 +1,8 @@
 //! `infr` CLI — `pull` / `run` / `serve`, all over the same engine + backend.
 //! See docs/plan.md "Product surface".
 
+mod logits_base;
+
 use clap::{Parser, Subcommand};
 use infr_core::config::{Config, ConfigOverrides, PartialConfig};
 use std::sync::Arc;
@@ -416,9 +418,15 @@ enum Cmd {
         model: String,
         /// File of WHITESPACE-SEPARATED token ids to prefill verbatim — the format
         /// `run --raw --print-prompt-ids` / `--print-ids` write. Its LAST id is the position the
-        /// distribution is read at.
-        #[arg(long, value_name = "PATH")]
-        ids_file: PathBuf,
+        /// distribution is read at. Required unless `--like-base` is given: the base dump takes its
+        /// prefix from the reference file instead, and the two inputs are mutually exclusive.
+        #[arg(
+            long,
+            value_name = "PATH",
+            required_unless_present = "like_base",
+            conflicts_with = "like_base"
+        )]
+        ids_file: Option<PathBuf>,
         /// How many entries to report, highest probability first.
         #[arg(long, default_value_t = 10, value_name = "N")]
         top: usize,
@@ -435,6 +443,33 @@ enum Cmd {
         /// "logsumexp"}` instead of one line per entry.
         #[arg(long)]
         json: bool,
+        /// LI-C005 / BENCH-03 — reference-format base dump. A `llama-perplexity
+        /// --kl-divergence-base FILE` / `--save-all-logits` logits file to imitate: read its `n_ctx`,
+        /// `n_vocab` (must EQUAL the model's — refuse otherwise), `n_chunk` and its `tokens` array,
+        /// prefill EACH `n_ctx`-token chunk on an EMPTY KV exactly the way the reference re-evaluates
+        /// it, and write the log-softmax of every scored position of every chunk into
+        /// `--write-base` in the SAME byte layout the reference reads back with `kl_divergence()`.
+        /// Mutually exclusive with `--ids-file` (which is what the frontier-row report reads).
+        ///
+        /// Why the tokens come from the FILE, not an `--ids-file`: the comparer interleaves this
+        /// output with the input record-for-record, so both must be produced over the exact same
+        /// prefix at the exact same window. One mirror is worth naming: when the GGUF sets
+        /// `add_bos`, llama.cpp puts BOS at CHUNK position 0 while the file keeps the original token
+        /// (`perplexity.cpp:563-569`, KL reader `:1798-1802`), so this mode does the same — the
+        /// written header and token array stay the input's bytes. With `add_bos=false` (Qwen's
+        /// default, `llama-vocab.cpp:1824`/`:2616`) the stored ids ARE the fed prefix and nothing
+        /// changes. The stderr note says which one applied.
+        ///
+        /// Refused before the first dispatch, with the reason: MoE, gemma4 E2B / per-layer-embedding
+        /// models and DeepSeek V4 (none of which the batched-prefill tap can serve), a base file with
+        /// `n_vocab` other than the model's, and `n_ctx < 3` (the exact minimum window that has a
+        /// scored row AND batched rows to produce it).
+        #[arg(long, value_name = "IN.logits", requires = "write_base")]
+        like_base: Option<PathBuf>,
+        /// LI-C005: output path for `--like-base` — a `_logits_` file with the SAME header and
+        /// token array as the input, then one quantised log-softmax record per scored position.
+        #[arg(long, value_name = "OUT.logits")]
+        write_base: Option<PathBuf>,
     },
     /// Start the OpenAI-compatible HTTP API (auto-pulls if missing).
     Serve {
@@ -765,13 +800,44 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
         } => cmd_serve(&model, &addr, parallel, cfg, specified),
         // `--max-new` reached the config layer in `cli_flag_layer`, so it is read back from `cfg`
         // here exactly as `cmd_run` reads its generation cap — and no other sampling knob is.
+        // LI-C005 / BENCH-03: `--like-base` switches this subcommand from the frontier-row report
+        // to a reference-format base dump over EVERY scored position of every window in the input
+        // file, so it routes to its own function rather than threading a fourth optional through
+        // `cmd_next_probs`. `--write-base` is required by `--like-base` at the clap layer, so
+        // unwrapping here is checked.
+        Cmd::NextProbs {
+            model,
+            like_base,
+            write_base,
+            max_new,
+            ..
+        } if like_base.is_some() => {
+            // `--max-new` reached the config layer in `cli_flag_layer`, so it is read back from
+            // `cfg` exactly as the plain report does; the base dump sizes its KV against the same
+            // window the run being compared used.
+            let _ = max_new;
+            cmd_next_probs_base(
+                &model,
+                like_base.as_ref().unwrap(),
+                write_base.as_ref().unwrap(),
+                cfg,
+                specified,
+            )
+        }
         Cmd::NextProbs {
             model,
             ids_file,
             top,
             json,
             ..
-        } => cmd_next_probs(&model, &ids_file, top, json, cfg, specified),
+        } => {
+            // Clap makes `--ids-file` required whenever `--like-base` is absent
+            // (`required_unless_present = "like_base"`), and the `--like-base` form routes to the
+            // arm above, so an unwrapped `ids_file` here is checked by the parser.
+            let ids_file =
+                ids_file.expect("clap: --ids-file is required unless --like-base is set");
+            cmd_next_probs(&model, &ids_file, top, json, cfg, specified)
+        }
         Cmd::Multi {
             models,
             addr,
@@ -1652,6 +1718,207 @@ fn cmd_next_probs(
     // print-ok: program OUTPUT — the whole report, `--json`'s one object or the summary line plus
     // one line per entry.
     println!("{report}");
+    Ok(())
+}
+
+/// LI-R019 blocker 1 — the ids a window is actually FED, mirroring the reference's BOS overwrite.
+///
+/// llama.cpp does not eval a stored window verbatim when the vocabulary asks for BOS: for the first
+/// batch of every chunk it writes `llama_vocab_bos(vocab)` into `tokens[seq_start]`, evals, and puts
+/// the original back (`perplexity.cpp:563-569`; the `--kl-divergence-base` reader repeats this on
+/// re-eval at `:1798-1802`). The FILE keeps the original id, so the header and token array we echo
+/// stay the input's bytes while the FORWARD sees BOS at chunk position 0. `bos = None`
+/// (`add_bos=false`, llama.cpp's default and Qwen's) leaves the window untouched — there the stored
+/// ids ARE the fed prefix.
+fn base_chunk_feed_ids(window: &[u32], bos: Option<u32>) -> Vec<u32> {
+    match (window.split_first(), bos) {
+        (Some((_, rest)), Some(bos)) => std::iter::once(bos).chain(rest.iter().copied()).collect(),
+        _ => window.to_vec(),
+    }
+}
+
+/// The stderr line saying WHICH prefix rule a base dump ran under (LI-R019 blocker 1), printed next
+/// to the forward note. It exists because the two rules produce records that are NOT comparable: a
+/// dump whose windows were fed BOS at position 0 and one whose windows were fed the stored ids are
+/// different forwards, so the file that lands on disk has to come with the sentence saying which.
+fn base_chunk_bos_note(bos: Option<u32>) -> String {
+    match bos {
+        Some(bos) => format!(
+            "next-probs --like-base BOS: fed BOS id {bos} at chunk position 0 of every window (the \
+             stored token is kept everywhere else, and the written header and token array stay the \
+             input's bytes) — mirrors llama.cpp's eval-time overwrite, `perplexity.cpp:563-569` / \
+             KL reader `:1798-1802`"
+        ),
+        None => "next-probs --like-base BOS: none — `tokenizer.ggml.add_bos_token` is not true \
+                 (llama.cpp's default, `llama-vocab.cpp:1824`), so each window is fed exactly the \
+                 stored ids"
+            .to_string(),
+    }
+}
+
+/// `infr next-probs --like-base IN --write-base OUT` — LI-C005 / BENCH-03.
+///
+/// Read the reference's `_logits_` file, prefill EACH window on an EMPTY KV through the SAME
+/// `run --raw` construction as `cmd_next_probs`, and stream every scored position's log-softmax
+/// into OUT in the reference's exact byte format so `llama-perplexity --kl-divergence-base IN` can
+/// compare the two distributions record-for-record. The input's header + token array are echoed
+/// verbatim into the output, so both files start with IDENTICAL bytes and the reference reader
+/// interleaves them 1:1.
+///
+/// The prefix each window is fed comes from the FILE, with the one exception the reference itself
+/// applies: `add_bos` vocabularies get BOS at chunk position 0 for the forward while the file keeps
+/// the stored token (`base_chunk_feed_ids`; `perplexity.cpp:563-569`). With `add_bos=false` —
+/// llama.cpp's default (`llama-vocab.cpp:1824`) and the case for the Qwen file the bench uses — the
+/// stored array IS what the reference consumed, and feeding those bytes back unchanged is what makes
+/// the two engines run the SAME prefix.
+fn cmd_next_probs_base(
+    model: &str,
+    like_base: &Path,
+    write_base: &Path,
+    cfg: &Arc<Config>,
+    specified: &PartialConfig,
+) -> anyhow::Result<()> {
+    // Read the reference dump: header + tokens + the exact prefix bytes we echo into the output.
+    let base = logits_base::read_base(like_base)?;
+    // Multi-device refusal, same reasoning as `cmd_next_probs`: the primitives below are single.
+    if infr_llama::seam::pipeline_devices(cfg).is_some()
+        || infr_llama::seam::tensor_parallel_devices(cfg).is_some()
+        || infr_llama::seam::expert_parallel_devices(cfg).is_some()
+    {
+        anyhow::bail!(
+            "next-probs --like-base is the single-device reference-dump path — not compatible with \
+             INFR_PIPELINE / INFR_TENSOR_PARALLEL / INFR_EXPERT_PARALLEL"
+        );
+    }
+    // The per-chunk tap rides the batched-prefill path in the Vulkan runner. CPU has its own
+    // `prefill_logits_cpu`, but that primitive is single-dispatch and vocab-wide over the WHOLE
+    // prompt (no per-chunk sink) — plumbing the base mode onto it would need a second construction
+    // that can drift from the run-shaped one the reference is calibrated against. Refuse here.
+    match selected_backend(cfg)? {
+        Backend::Vulkan(_) => {}
+        Backend::Cpu => anyhow::bail!(
+            "next-probs --like-base is the Vulkan reference-dump path (`run --raw`'s construction); \
+             the CPU primitive is a different executor and cannot emit per-chunk records \
+             (--set device.dev=Vulkan0)"
+        ),
+        Backend::Metal => anyhow::bail!(
+            "next-probs --like-base needs the per-chunk batched-prefill logits tap, which the Metal \
+             backend does not implement"
+        ),
+    }
+    let (gguf, tok) = resolve(model, cfg)?;
+    if infr_llama::diffusion::is_diffusion_gemma(&gguf) {
+        anyhow::bail!(
+            "next-probs --like-base is autoregressive; diffusion-gemma denoises a fixed canvas, so \
+             its prefill rows are not a next-token distribution"
+        );
+    }
+    // Stamped next to the mapping it guards, exactly as `cmd_next_probs` does.
+    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
+    let loaded = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
+    // LI-R019 blocker 1: the BOS the reference substitutes at chunk position 0 for `add_bos`
+    // vocabularies, if any. Read from the GGUF (the same keys `tokenize_raw` uses), refused here if
+    // the metadata asks for BOS without naming the id.
+    let bos_at_eval = loaded.base_bos_at_eval()?;
+    // The reference refuses a vocab mismatch (`kl_divergence` `:1715`); mirror that here so an
+    // obviously-wrong input is caught BEFORE the first GPU dispatch.
+    let model_vocab = loaded.config().vocab as i32;
+    if base.header.n_vocab != model_vocab {
+        anyhow::bail!(
+            "next-probs --like-base: {} was made with n_vocab={} but this GGUF is n_vocab={} — the \
+             reference itself refuses (`kl_divergence`: n_vocab mismatch with the vocab)",
+            like_base.display(),
+            base.header.n_vocab,
+            model_vocab
+        );
+    }
+    if base.header.n_ctx < 3 {
+        // TWO bounds land on the same exact minimum, 3. (a) The reference scores rows
+        // `first = n_ctx/2` (`perplexity.cpp:540`) through `n_ctx-2`, i.e. `n_ctx - 1 - first`
+        // records (`:613`); at `n_ctx = 3` that is ONE record (row 1), at `n_ctx = 2` it is zero and
+        // the file would be a header with no payload. (b) The tap rides the batched prefill, which
+        // runs only when `prompt.len() - start > 2` (`runner.rs`) and `start` is 0 on this fresh
+        // cache — so a window needs at least 3 ids as well. Below 3, refuse up front instead of
+        // discovering "0 records" in the writer after a GPU run.
+        anyhow::bail!(
+            "next-probs --like-base: n_ctx={} is too small to score any position (the exact minimum \
+             is 3: the reference writes rows first=n_ctx/2 through n_ctx-2, `n_ctx - 1 - first` \
+             records — `perplexity.cpp:540`, `:613` — and the batched-prefill tap needs the window \
+             longer than 2 ids, since its gate is `prompt.len() - start > 2` with start 0 on an \
+             empty KV)",
+            base.header.n_ctx
+        );
+    }
+    // `--max-new` sizes the KV window exactly as `cmd_next_probs` reads it. The reference does not
+    // itself reserve a decode window; when the operator names none, size to `n_ctx + 1` (0 max-new)
+    // so the placement sweep is priced against the window the reference used, not `run`'s 2048.
+    let kv_max_new = if specified.is_path_set("sampling.max_new") {
+        cfg.sampling.max_new
+    } else {
+        0
+    };
+    // The writer streams: header + token prefix are written once, records land per dispatch and are
+    // dropped before the next dispatch. Same reasoning as the runner's `pf_logits` doc — peak extra
+    // VRAM/disk is ONE dispatch, never one whole prompt.
+    let mut writer = logits_base::BaseWriter::create(write_base, base.header, &base.prefix)?;
+    let n_ctx = base.header.n_ctx as usize;
+    let n_chunk = base.header.n_chunk as usize;
+    if base.tokens.len() != n_chunk * n_ctx {
+        anyhow::bail!(
+            "next-probs --like-base: header claims {n_chunk} chunks x {n_ctx} tokens = {} ids, file \
+             carries {}",
+            n_chunk * n_ctx,
+            base.tokens.len()
+        );
+    }
+    // The forward note fires ONCE for the whole run (not per chunk), on stderr, BEFORE any record
+    // hits the disk so a truncated file is still diagnostic. Placement is the same every chunk: one
+    // session construction, one sweep, `prefill_logits_vulkan_base` reads back what it settled on.
+    let mut note_printed = false;
+    for c in 0..n_chunk {
+        let chunk_ids: Vec<u32> = base.tokens[c * n_ctx..(c + 1) * n_ctx]
+            .iter()
+            .map(|&t| t as u32)
+            .collect();
+        // The window as the REFERENCE feeds it: stored ids, with BOS at position 0 when the GGUF
+        // asks for it (`perplexity.cpp:563-569`). The writer still echoes the input's own bytes.
+        let chunk_ids = base_chunk_feed_ids(&chunk_ids, bos_at_eval);
+        writer.begin_chunk();
+        // One forward note for the whole run; capture the placement on the first chunk.
+        let mut sink = |row_start: usize, n_rows: usize, rows: &[f32]| -> anyhow::Result<()> {
+            // `n_rows` is documentation only — `on_rows` derives it from `rows.len()/vocab`.
+            let _ = n_rows;
+            writer.on_rows(row_start, rows)
+        };
+        let placement = loaded.prefill_logits_vulkan_base(&chunk_ids, kv_max_new, &mut sink)?;
+        if !note_printed {
+            // print-ok: program OUTPUT — the base-dump forward note, on stderr so `--json`/pipes of
+            // the (empty) stdout stay clean. Reuses the SAME note text as plain `next-probs`.
+            eprintln!("{}", next_probs_forward_note(&placement));
+            // print-ok: program OUTPUT — which prefix rule applied, on stderr next to the forward
+            // note (LI-R019 blocker 1). A dump made with BOS at position 0 and one made without are
+            // NOT comparable, so the run that produced the file has to say which one it was.
+            eprintln!("{}", base_chunk_bos_note(bos_at_eval));
+            // LI-C005 follow-up: name the staging the tap pays for at the SAME chunk height
+            // `run --raw` settles on. If it does not fit, the runner refuses with these exact
+            // numbers (see `pf_logits_staging_bytes`); the tap never shrinks the height, because
+            // the height is one of the numbers the oracle judges.
+            let chunk_rows = placement.ubatch.min(placement.want_ctx).max(1);
+            let staging =
+                infr_llama::seam::pf_logits_staging_bytes(chunk_rows, model_vocab as usize);
+            // print-ok: program OUTPUT — the tap's staging budget, on stderr next to the forward
+            // note so a truncated dump names the same numbers a refuse would have.
+            eprintln!(
+                "next-probs --like-base tap: {chunk_rows} rows x {model_vocab} vocab x 4 B = \
+                 {staging} bytes of staging per tapped dispatch (kept at the placement's chunk \
+                 height, the same `run --raw` uses)"
+            );
+            note_printed = true;
+        }
+        writer.end_chunk()?;
+    }
+    writer.finish()?;
+    watch.check()?;
     Ok(())
 }
 
@@ -5639,6 +5906,103 @@ mod tests {
         std::fs::remove_dir(&dir).expect("remove temp dir");
     }
 
+    /// LI-R019 blocker 2: what a window is FED versus what is WRITTEN. The reference swaps BOS into
+    /// chunk position 0 for `add_bos` vocabularies and restores the stored id, which is what the file
+    /// keeps (`perplexity.cpp:563-569`; KL reader re-eval `:1798-1802`). With `add_bos=false` —
+    /// llama.cpp's default and Qwen's — nothing moves.
+    #[test]
+    fn base_chunk_feed_swaps_only_position_zero_when_add_bos() {
+        let window = [101u32, 202, 303, 404];
+        // add_bos=false: the stored ids ARE the fed prefix, element for element.
+        assert_eq!(base_chunk_feed_ids(&window, None), window.to_vec());
+        // add_bos=true: ONLY position 0 changes; every other position keeps the file's token.
+        assert_eq!(
+            base_chunk_feed_ids(&window, Some(151643)),
+            vec![151643, 202, 303, 404]
+        );
+        // The stored window is never mutated — the header + token array the writer echoes are the
+        // input's own bytes, so the swap must not leak into them.
+        assert_eq!(window, [101, 202, 303, 404]);
+        // Applied to EVERY chunk the same way (llama re-applies it at each chunk's `seq_start`):
+        // the helper is pure, so two windows of one file get the same treatment.
+        let second = base_chunk_feed_ids(&[9, 8, 7], Some(151643));
+        assert_eq!(second, vec![151643, 8, 7]);
+        // The minimum window the tap serves (3 ids) still gets the swap.
+        assert_eq!(base_chunk_feed_ids(&[7, 8, 9], Some(1)), vec![1, 8, 9]);
+        // Degenerate input cannot panic: an empty window has no position 0 to swap.
+        assert_eq!(base_chunk_feed_ids(&[], Some(1)), Vec::<u32>::new());
+        // And the note says which of the two the run was — the two dumps are not comparable, so the
+        // stderr line is part of the mirror, not decoration.
+        let note = base_chunk_bos_note(Some(151643));
+        assert!(
+            note.contains("fed BOS id 151643 at chunk position 0"),
+            "{note}"
+        );
+        assert!(note.contains("perplexity.cpp:563-569"), "{note}");
+        let note = base_chunk_bos_note(None);
+        assert!(note.contains("BOS: none"), "{note}");
+        assert!(note.contains("fed exactly the stored ids"), "{note}");
+    }
+
+    /// LI-R018 blocker: `infr next-probs m.gguf --like-base IN --write-base OUT` — the exact command
+    /// the bench's block G runs — has to PARSE. `--ids-file` is required only when `--like-base` is
+    /// absent (`required_unless_present`), and the two prefix sources are mutually exclusive
+    /// (`conflicts_with`).
+    #[test]
+    fn next_probs_takes_either_ids_file_or_the_base_pair() {
+        // (a) the frontier-row report: `--ids-file` alone, nothing base-related set.
+        let (ids, like, write) = next_probs_args(&["--ids-file", "in.ids"]).unwrap();
+        assert_eq!(ids, Some(PathBuf::from("in.ids")));
+        assert_eq!((like, write), (None, None));
+        // (b) the base dump: NO `--ids-file`, and the parser does not demand one.
+        let (ids, like, write) =
+            next_probs_args(&["--like-base", "in.logits", "--write-base", "out.logits"]).unwrap();
+        assert_eq!(ids, None, "the prefix comes from the base file");
+        assert_eq!(like, Some(PathBuf::from("in.logits")));
+        assert_eq!(write, Some(PathBuf::from("out.logits")));
+        // (c) `--like-base` with nowhere to write: refused (`requires = "write_base"`).
+        let err = next_probs_args(&["--like-base", "in.logits"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--write-base"), "got: {err}");
+        // (d) both prefix sources at once: refused as a conflict, not silently one-wins.
+        let err = next_probs_args(&[
+            "--like-base",
+            "in.logits",
+            "--write-base",
+            "out.logits",
+            "--ids-file",
+            "in.ids",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--ids-file") && err.contains("--like-base"),
+            "the conflict must name both: got: {err}"
+        );
+        // (e) neither: `--ids-file` is required when `--like-base` is absent.
+        let err = next_probs_args(&[]).unwrap_err().to_string();
+        assert!(err.contains("--ids-file"), "got: {err}");
+    }
+
+    /// Parse `infr next-probs m.gguf <args>` and hand back the three path fields the mode is decided
+    /// from. Parse failures come back as `Err` so the refusal cases can be asserted on their text.
+    fn next_probs_args(
+        args: &[&str],
+    ) -> anyhow::Result<(Option<PathBuf>, Option<PathBuf>, Option<PathBuf>)> {
+        let mut full = vec!["infr", "next-probs", "m.gguf"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.cmd.expect("a subcommand") {
+            Cmd::NextProbs {
+                ids_file,
+                like_base,
+                write_base,
+                ..
+            } => Ok((ids_file, like_base, write_base)),
+            _ => anyhow::bail!("`next-probs` expected"),
+        }
+    }
+
     /// The whole `next-probs` path over a model that exists on this box:
     /// `INFR_TEST_GGUF=/path/to.m.gguf cargo test -p infr-cli -- --ignored --nocapture`. The ids come
     /// from the model's own raw tokenizer, so the prompt prefilled here is the one `run --raw` would
@@ -5662,6 +6026,125 @@ mod tests {
         write_token_ids(&path, &ids)?;
         cmd_next_probs(&gguf, &path, 10, true, &cfg, &specified)?;
         std::fs::remove_file(&path)?;
+        std::fs::remove_dir(&dir)?;
+        Ok(())
+    }
+
+    /// The whole `next-probs --like-base/--write-base` path over a model that exists on this box.
+    /// Builds a synthetic single-chunk `_logits_` file whose token array is the model's OWN raw
+    /// encoding of a sentence, runs `cmd_next_probs_base` on it (which prefills the whole window on
+    /// an EMPTY KV through the `run --raw` construction, exactly as the reference
+    /// `llama-perplexity --kl-divergence-base` does per window), then re-parses the output and
+    /// asserts: (a) header + token prefix bytes are IDENTICAL to the input's, so a
+    /// `kl_divergence`-style reader can interleave them 1:1; (b) the output's total length equals
+    /// `prefix + records_per_chunk(n_ctx) * record_bytes(n_vocab)` — every scored position got a
+    /// record, none extra; (c) the FIRST record's leading `f32` `scale` word is > 0 (a real
+    /// distribution was quantised, not a stub), and the record's argmax slot (its largest entry) is
+    /// 65535 — the reference's guarantee that `argmax → 65535` under the quantiser at `:101`.
+    ///
+    /// Ignored by default because it needs a Vulkan device AND the specific `.gguf` named by
+    /// `INFR_TEST_GGUF`; run with
+    /// `INFR_TEST_GGUF=/path/to.m.gguf cargo test -p infr-cli -- --ignored --nocapture`.
+    /// A model whose `n_vocab` exceeds the memory budget for `n_ctx` windows errors cleanly from
+    /// inside `cmd_next_probs_base` (the re-clamp refuses), which the harness reports.
+    ///
+    /// What it does NOT prove (LI-R019 §1): nothing here compares infr's rows against llama's rows
+    /// on the same logits — that needs llama itself plus a real base file. The per-position mapping
+    /// is pinned by CPU tests instead: `logits_base::tests` feed the writer simulated multi-dispatch
+    /// splits and assert the record for chunk-local position `first + r` is the one that lands at
+    /// record `r`, and the quantiser tests transcribe `:79-107` independently.
+    #[test]
+    #[ignore = "needs the GGUF named by INFR_TEST_GGUF and a Vulkan device to prefill a window on"]
+    fn next_probs_base_dump_round_trips_a_real_window() -> anyhow::Result<()> {
+        let gguf =
+            std::env::var("INFR_TEST_GGUF").context("set INFR_TEST_GGUF to a `.gguf` path")?;
+        let cfg = Arc::new(Config::load(&ConfigOverrides::default())?);
+        let specified = specified_by_the_layers(&ConfigOverrides::default())?;
+        let loaded = infr_llama::SeamModel::load_with(Path::new(&gguf), None, cfg.clone())?;
+        // The whole test is a single window sized to what the model can actually hold; take the
+        // first `n_ctx` ids of the raw encoding as the token array (Qwen-style GGUFs set
+        // `add_bos=false`, so this IS the same prefix the reference prefill ran).
+        let n_ctx: i32 = 32;
+        let ids32: Vec<i32> = loaded
+            .encode_raw("The capital of France is Paris and the capital of Italy is Rome")?
+            .iter()
+            .take(n_ctx as usize)
+            .map(|&t| t as i32)
+            .collect();
+        anyhow::ensure!(
+            ids32.len() == n_ctx as usize,
+            "the model's raw encoding is shorter than {n_ctx} tokens; pick a longer sentence"
+        );
+        let n_vocab = loaded.config().vocab as i32;
+        let n_chunk: i32 = 1;
+
+        // Build IN as the reference's writer would: magic + n_ctx + n_vocab + n_chunk + tokens.
+        let dir = std::env::temp_dir().join(format!(
+            "infr-cli-next-probs-base-ignored-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let in_path = dir.join("in.logits");
+        let out_path = dir.join("out.logits");
+        let mut in_bytes: Vec<u8> = Vec::new();
+        in_bytes.extend_from_slice(&logits_base::MAGIC);
+        in_bytes.extend_from_slice(&n_ctx.to_le_bytes());
+        in_bytes.extend_from_slice(&n_vocab.to_le_bytes());
+        in_bytes.extend_from_slice(&n_chunk.to_le_bytes());
+        for &t in &ids32 {
+            in_bytes.extend_from_slice(&t.to_le_bytes());
+        }
+        std::fs::write(&in_path, &in_bytes)?;
+        drop(loaded);
+
+        // Run the whole mode. The placement sweep is priced against `n_ctx + 0 + 1` here
+        // (`kv_max_new = 0` default), matching the reference's `-c n_ctx`.
+        cmd_next_probs_base(&gguf, &in_path, &out_path, &cfg, &specified)?;
+
+        // Read OUT back and check it against the reference's arithmetic.
+        let out_all = std::fs::read(&out_path)?;
+        assert_eq!(
+            &out_all[..in_bytes.len()],
+            &in_bytes[..],
+            "output header + token prefix must be byte-identical to the input"
+        );
+        let expected_records = logits_base::records_per_chunk(n_ctx);
+        let expected_bytes =
+            in_bytes.len() + expected_records * logits_base::record_bytes(n_vocab as usize);
+        assert_eq!(
+            out_all.len(),
+            expected_bytes,
+            "output length must equal prefix + records_per_chunk * record_bytes"
+        );
+
+        // Every record's argmax slot must be 65535 (`perplexity.cpp:101` maps the max logit to
+        // 65535 under the quantiser, modulo the `f32` `1/scale*(max-min)` rounding that keeps it
+        // off the exact int only in pathological vocabularies — a real model's max is not
+        // degenerate so this fires as a genuine invariant).
+        let rec = logits_base::record_bytes(n_vocab as usize);
+        for r in 0..expected_records {
+            let off = in_bytes.len() + r * rec;
+            let scale = f32::from_le_bytes(out_all[off..off + 4].try_into().unwrap());
+            assert!(
+                scale > 0.0,
+                "record {r} has scale {scale} <= 0 — no distribution"
+            );
+            let entries = &out_all[off + 8..off + 8 + (n_vocab as usize) * 2];
+            let max_entry = entries
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes(*b))
+                .max()
+                .unwrap();
+            assert_eq!(
+                max_entry, 65535,
+                "record {r}: the argmax entry must quantise to 65535, got {max_entry}"
+            );
+        }
+
+        std::fs::remove_file(&in_path)?;
+        std::fs::remove_file(&out_path)?;
         std::fs::remove_dir(&dir)?;
         Ok(())
     }

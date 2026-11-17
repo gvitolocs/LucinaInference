@@ -4,7 +4,7 @@ use crate::*;
 use anyhow::{anyhow, Result};
 use infr_chat::{render_chat_jinja, render_chat_user};
 use infr_core::backend::Backend;
-use infr_core::DType;
+use infr_core::{DType, WeightSource};
 use infr_cpu::CpuBackend;
 use infr_gguf::Gguf;
 use std::path::Path;
@@ -884,6 +884,7 @@ impl SeamModel {
             constraint,
             req,
             None, // logits_out
+            None, // pf_logits
         )?;
         // The cold init may have re-clamped the window against the memory the device reported free
         // once the weights were resident (`crate::seam::reclamp_ctx_to_live_room`), so the slot's
@@ -1139,8 +1140,133 @@ impl SeamModel {
         kv_max_new: usize,
         logits_out: &mut Vec<f32>,
     ) -> Result<VulkanPlacement> {
-        self.vulkan_ids_tap(prompt_tokens, 1, kv_max_new, |_id| {}, Some(logits_out))
+        self.vulkan_ids_tap(
+            prompt_tokens,
+            1,
+            kv_max_new,
+            |_id| {},
+            Some(logits_out),
+            None,
+        )
+        .map(|(_generated, placement)| placement)
+    }
+
+    /// `infr next-probs --like-base/--write-base`'s entry (LI-C005 / BENCH-03): prefill EXACTLY
+    /// `chunk` tokens — the base file's own window, verbatim as it was tokenized except for the
+    /// BOS mirror the caller applies with [`base_bos_at_eval`](Self::base_bos_at_eval), and no chat
+    /// template — through the SAME
+    /// [`prefill_logits_vulkan_like_run`](Self::prefill_logits_vulkan_like_run) construction on an
+    /// EMPTY KV, and hand every prefill row's raw logits to `sink` as
+    /// `(absolute_row_start, n_rows, row_major_vocab_wide_rows)`.
+    ///
+    /// This is the correctness oracle's new comparison: the reference
+    /// (`llama-perplexity --kl-divergence-base`) dumps the log-softmax of every position of every
+    /// window on a fresh empty KV, and we must produce the same distribution at the same prefix, not
+    /// merely the same first differing greedy token. The runner's per-chunk batched-prefill tap
+    /// supplies the rows (see `generate_dense_backend`'s `pf_logits`); each dispatch is downloaded,
+    /// written and dropped, so the peak extra memory is one dispatch, not one window.
+    ///
+    /// `kv_max_new` sizes the KV window exactly as `run --raw` would (`prompt.len() + kv_max_new + 1`)
+    /// so the PLACEMENT — and therefore the distribution — is the one the run being compared made;
+    /// generation itself is zero tokens, the prefill is the whole point.
+    ///
+    /// Refuses, up front and before any dispatch, every model or window the tap cannot serve. The
+    /// batched-prefill path this tap rides is dense-only and skipped by several arches, so on those
+    /// the sink would simply never be called and the caller's writer would then fail on "0 records"
+    /// with a message about ITS bookkeeping rather than about the arch. Better to say what the arch
+    /// means here (LI-R019 blocker 3):
+    ///
+    /// - **MoE**: `batched_prefill_ok` is false unless the expert banks are batch-eligible
+    ///   (`runner.rs`'s `MOE_MMQ_DTYPES` scan); the paged-MoE prefill never runs a vocab-wide head
+    ///   over chunk rows.
+    /// - **gemma4 E2B** (`n_embd_per_layer > 0`): its chunked prefill feeds per-layer embedding rows
+    ///   (`e2b_ipl_rows`) instead of token ids, its spans must start at layer 0 (`build`'s assert)
+    ///   and it is excluded from layer-major prefill; the multi-row vocab-wide head over chunk rows
+    ///   has never been EXECUTED on that input shape, so the tap refuses rather than emitting
+    ///   records nobody has verified.
+    /// - **DeepSeek V4**: excluded from the batched path outright (`batched_prefill_ok`), and a
+    ///   layer-major span cannot carry its `hc_mult`-wide residual across spans.
+    /// - **Windows of 2 tokens or fewer**: the batched path runs only when `prompt.len() - start > 2`
+    ///   (`runner.rs`), and `start == 0` on this fresh cache, so a window needs at least THREE ids —
+    ///   with fewer, prefill falls through to the per-token loop and `sink` stays silent.
+    ///
+    /// qwen35 (hybrid DeltaNet) is NOT refused: its conv/SSM state is written by the SAME
+    /// batched-prefill dispatches as its KV, so an empty-cache chunked prefill of a window is
+    /// exactly what a fresh `run --raw` does for that window — the rows this sink receives ARE
+    /// the hybrid model's, with no extra state to tap and no row to skip.
+    ///
+    /// Returns what the session actually ran under, for the single forward note.
+    pub fn prefill_logits_vulkan_base(
+        &self,
+        chunk: &[u32],
+        kv_max_new: usize,
+        sink: crate::seam::PrefillLogitsSink<'_>,
+    ) -> Result<VulkanPlacement> {
+        if self.cfg.moe.is_some() {
+            anyhow::bail!(
+                "next-probs --like-base: the per-chunk prefill logits tap is dense-only (this model \
+                 is MoE); the batched-prefill path it rides is skipped for MoE, so no rows would be \
+                 produced"
+            );
+        }
+        if self.cfg.n_embd_per_layer > 0 {
+            anyhow::bail!(
+                "next-probs --like-base: the per-chunk prefill logits tap does not support E2B / \
+                 per-layer-embedding models ({} per-layer embeddings); their spans carry per-layer \
+                 rows instead of ids and no vocab-wide head over chunk rows has ever run on them",
+                self.cfg.n_embd_per_layer
+            );
+        }
+        if self.cfg.deepseek4 {
+            anyhow::bail!(
+                "next-probs --like-base: DeepSeek V4 is excluded from the batched-prefill path the \
+                 tap rides (`batched_prefill_ok`), so its per-token prefill would produce no rows"
+            );
+        }
+        if chunk.len() <= 2 {
+            anyhow::bail!(
+                "next-probs --like-base: a window of {} token(s) cannot be tapped — the batched \
+                 prefill runs only when `prompt.len() - start > 2` and `start` is 0 on this empty \
+                 KV, so the exact minimum window is 3 ids",
+                chunk.len()
+            );
+        }
+        self.vulkan_ids_tap(chunk, 0, kv_max_new, |_id| {}, None, Some(sink))
             .map(|(_generated, placement)| placement)
+    }
+
+    /// LI-C005 / LI-R019 blocker 1 — the BOS the reference feeds at CHUNK position 0, if any.
+    ///
+    /// llama.cpp does NOT prefill a window's stored token array verbatim when the vocabulary asks
+    /// for BOS: for the first batch of every chunk it overwrites `tokens[seq_start]` with
+    /// `llama_vocab_bos(vocab)`, evals that, and restores the original (`perplexity.cpp:563-569`,
+    /// and the KL reader does the same on re-eval, `:1798-1802`). The FILE keeps the original id. So
+    /// the oracle has to feed BOS at position 0 too, or its records are computed over a different
+    /// prefix than the base they are compared against.
+    ///
+    /// `Some(bos)` when the GGUF sets `tokenizer.ggml.add_bos_token` true (then
+    /// `tokenizer.ggml.bos_token_id` is required, same as `tokenize_raw`), `None` when it is absent
+    /// or false — `add_bos` defaults to false in llama.cpp (`llama-vocab.cpp:1824`, loaded from the
+    /// key at `:2616`), which is the case for the Qwen file the bench uses, where the stored ids ARE
+    /// the fed prefix and nothing changes.
+    pub fn base_bos_at_eval(&self) -> Result<Option<u32>> {
+        let md = self.gguf.metadata();
+        if !matches!(
+            md.get("tokenizer.ggml.add_bos_token"),
+            Some(infr_core::MetaValue::Bool(true))
+        ) {
+            return Ok(None);
+        }
+        let bos = md.u64("tokenizer.ggml.bos_token_id").ok_or_else(|| {
+            anyhow!(
+                "next-probs --like-base: tokenizer.ggml.add_bos_token is true, \
+                 so the reference replaces the first token of every window with BOS \
+                 (`perplexity.cpp:563-569`), but the GGUF has no tokenizer.ggml.bos_token_id"
+            )
+        })?;
+        let bos =
+            u32::try_from(bos).map_err(|_| anyhow!("invalid tokenizer.ggml.bos_token_id {bos}"))?;
+        Ok(Some(bos))
     }
 
     /// All-row Vulkan logits (`[tokens.len() * vocab]`) for parity checks on short prompts; see
@@ -1268,7 +1394,7 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        self.vulkan_ids_tap(prompt_tokens, max_new, max_new, on_id, None)
+        self.vulkan_ids_tap(prompt_tokens, max_new, max_new, on_id, None, None)
             .map(|(generated, _)| generated)
     }
 
@@ -1286,6 +1412,7 @@ impl SeamModel {
         kv_max_new: usize,
         mut on_id: impl FnMut(u32),
         logits_out: Option<&mut Vec<f32>>,
+        pf_logits: Option<crate::seam::PrefillLogitsSink<'_>>,
     ) -> Result<(Vec<u32>, VulkanPlacement)> {
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
@@ -1302,6 +1429,7 @@ impl SeamModel {
             want_ctx,
             &mut on_id,
             logits_out,
+            pf_logits,
         )?;
         Ok((generated, self.vulkan_placement(&vk, want_ctx)))
     }
@@ -1525,6 +1653,7 @@ impl SeamModel {
                 None, // constraint
                 None, // req: bench is a sole sequence — env sampling, no gate
                 None, // logits_out
+                None, // pf_logits
             )?;
             Ok(stats)
         };
@@ -2163,6 +2292,7 @@ impl DiffusionGemmaCpuSession {
             None,
             None,
             None,
+            None, // pf_logits
             None,
         )?;
         Ok(())
@@ -2212,6 +2342,7 @@ impl DiffusionGemmaCpuSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None, // pf_logits
             None,
         )?;
         Ok(out_logits)
@@ -2254,6 +2385,7 @@ impl DiffusionGemmaVulkanSession {
             None,
             None,
             None,
+            None, // pf_logits
             None,
         )?;
         // Once per prefill (a denoise step would print per step — far too noisy).
@@ -2322,6 +2454,7 @@ impl DiffusionGemmaVulkanSession {
                 sample_temp_inv,
                 reduced: &mut reduced,
             }),
+            None, // pf_logits
             None,
         )?;
         Ok(match reduced {
@@ -2363,6 +2496,7 @@ impl DiffusionGemmaMetalSession {
             None,
             None,
             None,
+            None, // pf_logits
             None,
         )?;
         Ok(())
@@ -2406,6 +2540,7 @@ impl DiffusionGemmaMetalSession {
                 sample_temp_inv: 0.0,
                 reduced: &mut reduced,
             }),
+            None, // pf_logits
             None,
         )?;
         Ok(out_logits)

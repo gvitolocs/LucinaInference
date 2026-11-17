@@ -2115,6 +2115,7 @@ fn run_verify(
         None,
         Some(&mut h),
         None,
+        None, // pf_logits
         None,
     )?;
     if ids.is_empty() {
@@ -2177,6 +2178,7 @@ fn run_verify_full(
         None,
         Some(&mut h),
         None,
+        None, // pf_logits
         None,
     )?;
     Ok((logits, h))
@@ -2237,6 +2239,7 @@ fn run_prime_last(
         want_logits.then_some(&mut logits),
         Some(&mut h),
         None,
+        None, // pf_logits
         None,
     )?;
     anyhow::ensure!(

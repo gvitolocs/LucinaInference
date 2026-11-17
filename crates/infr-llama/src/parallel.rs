@@ -209,6 +209,7 @@ impl ParallelSeam {
                 None, // constraint
                 None, // req: startup, not a request — env sampling, no gate
                 None, // logits_out
+                None, // pf_logits
             )
         })?;
         let mut slot0 = slot0.ok_or_else(|| anyhow!("warmup did not initialize a KV slot"))?;
@@ -451,6 +452,7 @@ impl ParallelSeam {
             constraint,
             Some(req),
             None, // logits_out
+            None, // pf_logits
         )?;
         Ok(stats)
     }

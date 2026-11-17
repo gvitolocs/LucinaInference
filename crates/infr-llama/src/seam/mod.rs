@@ -28,6 +28,14 @@ pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
 pub(crate) use weights::{MtpRollback, SeamKv};
 
+/// LI-C005 (BENCH-03): the sink the runner's per-chunk batched-prefill logits tap calls ONCE PER
+/// DISPATCH — `(absolute_row_start, n_rows, row_major_vocab_wide_rows)`. Given its own name so the
+/// `clippy::type_complexity` of the raw `&mut dyn FnMut(..)` does not recur at all four seams that
+/// thread it (the runner, the Vulkan session/tap pair, and `SeamModel`). The contract — one dispatch
+/// at a time, rows dropped after the call so the whole window is never resident — is on
+/// [`generate_dense_backend`]'s `pf_logits` parameter.
+pub(crate) type PrefillLogitsSink<'a> = &'a mut dyn FnMut(usize, usize, &[f32]) -> AResult<()>;
+
 /// A LAZILY-dequantized host f32 token-embedding table, threaded through the seam runners in place
 /// of a `&[f32]`.
 ///
@@ -469,6 +477,7 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // logits_out
         None, // h_out
         None, // denoise_req
+        None, // pf_logits
         req,
     );
     if let Some(store) = store.filter(|_| ec.paging.stats) {
@@ -529,6 +538,7 @@ pub(crate) fn generate_dense_vulkan(
         prompt.len() + max_new + 1,
         on_token,
         None, // logits_out
+        None, // pf_logits
     )
 }
 
@@ -549,6 +559,13 @@ pub(crate) fn generate_dense_vulkan(
 /// - `logits_out` is the runner's frontier-row tap: the LAST prompt token's raw logits, taken
 ///   before sampling. `None` for every ordinary generation.
 ///
+/// LI-C005 (BENCH-03) adds a THIRD such tap for the reference-format base dump:
+/// - `pf_logits` is the runner's per-chunk BATCHED-PREFILL tap (see the same-named parameter on
+///   [`generate_dense_backend`]): a sink called once per prefill dispatch with that dispatch's
+///   `(absolute row_start, n_rows, row-major vocab-wide f32 rows)`. `None` for every ordinary
+///   generation, and unlike `logits_out` it is only ever fed by a session started on an EMPTY cache
+///   (the base-dump path), so `row_start` is also the chunk-local position the reference scores.
+///
 /// A caller that needs to know what the session settled on reads it back afterwards — see
 /// [`SeamModel::prefill_logits_vulkan_like_run`](crate::SeamModel::prefill_logits_vulkan_like_run),
 /// which does and prints it.
@@ -565,12 +582,13 @@ pub(crate) fn generate_dense_vulkan_tap(
     want_ctx: usize,
     on_token: impl FnMut(u32),
     logits_out: Option<&mut Vec<f32>>,
+    pf_logits: Option<PrefillLogitsSink<'_>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     generate_dense_vulkan_session(
         vk, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, &mut None, want_ctx,
         None, // constraint
         None, // req: the one-shot runner is a sole sequence — config sampling, no gate
-        logits_out,
+        logits_out, pf_logits,
     )
 }
 
@@ -598,6 +616,10 @@ pub(crate) fn generate_dense_vulkan_session(
     // session this function builds. LAST, so adding it could not reshuffle the `Option`-heavy tail
     // above — the same rule `req`'s doc states.
     logits_out: Option<&mut Vec<f32>>,
+    // [`generate_dense_backend`]'s per-chunk batched-prefill logits tap (LI-C005 / BENCH-03, the
+    // base-file dump). Its own doc names the contract; `None` everywhere but the base-dump session.
+    // After `logits_out`, both are logits taps and neither belongs in the older `Option`-heavy tail.
+    pf_logits: Option<PrefillLogitsSink<'_>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
@@ -621,7 +643,7 @@ pub(crate) fn generate_dense_vulkan_session(
     // from here.
     let out = generate_dense_backend(
         vk, &*bind, g, cfg, ec, token_embd, ple, prompt, max_new, on_token, state, want_ctx,
-        constraint, None, None, logits_out, None, None, req,
+        constraint, None, None, logits_out, None, None, pf_logits, req,
     )?;
     // INFR_PAGER_STATS=1: cumulative hit/miss/eviction counters since this pager was installed
     // (persists across calls on the same session — see `MoePagerSession`). A no-op when no paged
@@ -721,6 +743,25 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     };
     let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet) as u64;
     rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
+}
+
+/// LI-C005 follow-up (BENCH-03): the tap's per-dispatch logits STAGING, in bytes — `rows` rows of
+/// the model's whole vocab, f32.
+///
+/// **Why a helper and not just `rows * vocab * 4` inline:** this is the exact number the base-file
+/// dump path hands to `Backend::alloc` at the FIRST tapped dispatch, and it is what a too-small VRAM
+/// budget refuses with. Naming it once makes the check, the error message, and the unit test share
+/// the same arithmetic; the reference's per-token staging (`tools/perplexity/perplexity.cpp`'s
+/// `save_row` — `[n_vocab]` f32 per scored position) is the same shape, so a discrepancy here is
+/// a discrepancy at the comparer.
+///
+/// **Why NOT a term of `dense_act_reserve_at`:** the tap is one session-specific hook on one path,
+/// not an "activation" the placement sweep should ever see — pricing it there would silently change
+/// the placement of the very run being judged (`run --raw` and the base dump would then settle on
+/// DIFFERENT chunk heights). `dense_act_reserve_at` stays the honest `run --raw` number; the tap
+/// pays for itself out of the residual free VRAM at the first dispatch, or refuses.
+pub fn pf_logits_staging_bytes(rows: usize, vocab: usize) -> usize {
+    rows.saturating_mul(vocab).saturating_mul(4)
 }
 
 /// Activation bytes LAYER-MAJOR prefill holds ON TOP of [`dense_act_reserve_at`]: the residual
@@ -2837,6 +2878,7 @@ fn run_dense_oneshot(
         None, // logits_out
         None, // h_out
         None, // denoise_req
+        None, // pf_logits
         None, // req
     )
 }
@@ -3410,6 +3452,7 @@ pub(crate) fn generate_dense_metal_session(
         None,
         None,
         None,
+        None, // pf_logits
         req,
     )
 }
@@ -3453,6 +3496,7 @@ pub(crate) fn verify_dense_metal2(
         None,
         None,
         None,
+        None, // pf_logits
         None,
     )?;
     Ok((logits, stats.prompt_secs))
@@ -3493,6 +3537,7 @@ pub(crate) fn verify_dense_cpu(
         Some(&mut logits),
         None,
         None,
+        None, // pf_logits
         None,
     )?;
     Ok(logits)
@@ -3534,6 +3579,7 @@ pub(crate) fn verify_dense_cpu_with_h(
         Some(&mut logits),
         Some(&mut h),
         None,
+        None, // pf_logits
         None,
     )?;
     Ok((logits, h))
@@ -3577,6 +3623,7 @@ pub(crate) fn verify_rows_cpu_with_h(
         None,
         Some(&mut h),
         None,
+        None, // pf_logits
         None,
     )?;
     Ok((logits, h))
@@ -3624,6 +3671,7 @@ pub(crate) fn verify_dense_vulkan(
         Some(&mut logits),
         None,
         None,
+        None, // pf_logits
         None,
     )?;
     Ok(logits)
@@ -3673,6 +3721,7 @@ pub(crate) fn verify_rows_vulkan(
         None,
         None,
         None,
+        None, // pf_logits
         None,
     )?;
     Ok(logits)
@@ -4484,6 +4533,37 @@ mod seam_helper_tests {
         // No fixed term: halving the rows must halve the reserve, which a constant would floor.
         let half = super::dense_act_reserve_at(&cfg, ctx, 64);
         assert_eq!(half * 2, got, "the reserve is purely per-row");
+    }
+
+    /// LI-C005 follow-up (BENCH-03): the base-file tap asks the backend for exactly
+    /// `pf_logits_staging_bytes(chunk_rows, vocab)` per dispatch, and that number is what a too-small
+    /// VRAM budget refuses with. Pinned at the model the oracle actually runs (qwen35: vocab
+    /// 248,320) and at the chunk height the placement settles on (256 rows) — 256 x 248,320 x 4 =
+    /// 254,279,680 bytes. The comparison predicate (`bytes <= budget`) is what the runner's refuse
+    /// branch encodes, so an off-by-one here and a silent height-shrink there fail on the same line.
+    #[test]
+    fn pf_logits_staging_is_rows_x_vocab_x_four() {
+        // The reference vocab on the oracle model: 248,320 (qwen35). A llama-3 128,256 was the
+        // guess the design write-up used; the tap runs against a real GGUF, so this pins the real
+        // number. If the model changes, the test changes with it.
+        assert_eq!(super::pf_logits_staging_bytes(256, 248_320), 254_279_680);
+        // 4 bytes per f32, no rounding, no pad.
+        assert_eq!(super::pf_logits_staging_bytes(1, 1), 4);
+        assert_eq!(super::pf_logits_staging_bytes(0, 248_320), 0);
+        // A too-small budget refuses — the same predicate the runner's error branch encodes, so a
+        // regression that lets a 64 MiB cap silently slip back into `ubatch` fails HERE first.
+        let fits = |budget: usize| super::pf_logits_staging_bytes(256, 248_320) <= budget;
+        assert!(fits(254_279_680), "the exact staging fits itself");
+        assert!(!fits(254_279_680 - 1), "one byte short must refuse");
+        assert!(
+            !fits(64 << 20),
+            "the old 64 MiB budget would have refused this dispatch"
+        );
+        // No overflow: a hostile (rows, vocab) saturates instead of wrapping past the check.
+        assert_eq!(
+            super::pf_logits_staging_bytes(usize::MAX, usize::MAX),
+            usize::MAX
+        );
     }
 
     /// The ladder is ONE list. Both readers — `vulkan_moe_binder`'s residency / auto-q8 /
